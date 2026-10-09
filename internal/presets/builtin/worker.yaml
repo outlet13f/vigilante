@@ -1,0 +1,51 @@
+name: worker
+version: 1
+description: 배치·큐 소비 워커(HTTP 없음). 앱 로그 OOM·오류율, 서버 메모리, 선택적으로 컨테이너 재시작
+params:
+  - {name: app_log, required: true, description: 애플리케이션 로그 경로}
+  - {name: error_pattern, default: 'ERROR|Exception', description: 오류로 셀 로그 정규식}
+  - {name: error_rate, default: 5, description: 롤백할 오류 로그 초당 건수}
+  - {name: window, default: 1m, description: OOM 판정 구간}
+  - {name: container, default: "", description: 컨테이너 이름. 비우면 컨테이너 규칙 없음}
+  - {name: max_restarts, default: 2, description: 관측 중 허용 재시작 횟수}
+  - {name: host_probe, default: true, description: 서버 자원(/proc) 수집 여부. Linux가 아니면 false}
+  - {name: mem_available_min_pct, default: 5, description: 롤백할 가용 메모리 하한(%)}
+---
+probes:
+  - id: applog
+    type: log
+    log:
+      path: "[[ .app_log ]]"
+      patterns:
+        oom: 'OutOfMemoryError|Out of memory|Killed process'
+        error: '[[ .error_pattern ]]'
+[[- if .host_probe ]]
+  - id: host
+    type: host
+    interval: 5s
+    timeout: 5s
+[[- end ]]
+[[- if .container ]]
+  - id: ctr
+    type: docker
+    interval: 3s
+    docker: {container: "[[ .container ]]"}
+[[- end ]]
+rules:
+  - name: worker-errors
+    when:
+      any:
+        - {metric: applog.match.oom, agg: sum, window: [[ .window ]], op: ">", value: 0}
+        - {metric: applog.match.error, agg: rate, window: 1m, op: ">", value: [[ .error_rate ]], for: 2}
+[[- if .container ]]
+        - {metric: ctr.restarts, op: ">=", value: [[ .max_restarts ]]}
+        - {metric: ctr.running, op: "==", value: 0, for: 2}
+[[- end ]]
+[[- if .host_probe ]]
+  - name: host-exhaustion
+    when: {metric: host.mem_available_pct, agg: avg, window: 1m, op: "<", value: [[ .mem_available_min_pct ]], for: 3}
+[[- end ]]
+phases:
+  canary: {observation_window: 10m, warmup: 30s, on_inconclusive: hold}
+  rolling: {observation_window: 15m, warmup: 30s, on_inconclusive: hold}
+  full: {observation_window: 15m, warmup: 30s, on_inconclusive: pass}

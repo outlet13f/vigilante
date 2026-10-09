@@ -51,6 +51,7 @@ Usage:
   vigilante circuit  -c FILE status|reset|trip [--reason TEXT] [--server URL]
   vigilante server   -c FILE [--dry-run]
   vigilante agent    -c FILE --target NAME --server URL
+  vigilante presets [list | show NAME[@V] [--set k=v]...] [--dir DIRS]
   vigilante plugins
   vigilante version
 
@@ -143,6 +144,11 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 			return 1, err
 		}
 		fmt.Printf("OK: %d targets, %d services, %d executors, %d traffic controllers\n", len(cfg.Targets), len(cfg.Services), len(cfg.Executors), len(cfg.Traffic))
+		for _, s := range cfg.Services {
+			if s.Preset != "" {
+				fmt.Printf("  %s: preset %s -> %d probes, %d rules\n", s.Name, s.Preset, len(s.Probes), len(s.Rules))
+			}
+		}
 		return 0, nil
 	case "prepare":
 		return cmdPrepare(ctx, args)
@@ -156,6 +162,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdStatus(args)
 	case "mark-good":
 		return cmdMarkGood(args)
+	case "presets":
+		return cmdPresets(args)
 	case "circuit":
 		return cmdCircuit(ctx, args)
 	case "server":
