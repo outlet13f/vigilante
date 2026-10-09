@@ -5,9 +5,9 @@
 | 마일스톤 | 상태 | 비고 |
 |---|---|---|
 | 1단계 프로토타입 | 완료 | 커밋 `d1e6411`. 설계는 docs/01~04 |
-| M0 기반 | 미착수 | 상태 저장소·인증·비밀관리·ITSM 결정 대기 (아래 "결정 필요 사항") |
+| **M0 기반** | **완료** | 결정 확정: PostgreSQL, OIDC + 서비스 계정 토큰, Vault. M0-1 상태 저장소·HA, M0-2 인증·권한, M0-4 감사, M0-3 비밀관리, M0-5 자체 관측성 완료. 커밋 `5df283c`(M0-1), `6e29a18`(M0-2), `dc88133`(M0-4), `31d5c34`(M0-3), `9fd9e74`(M0-5), [PR #3](https://github.com/outlet13f/vigilante/pull/3)로 master에 병합. 범위 차이는 M0 절의 "구현 결과" 참고 |
 | **M1 입력 간소화** | **완료** | 커밋 `2a2ab09`(M1-1), `c6ab1d6`(M1-2), `50806e1`(M1-3), [PR #1](https://github.com/outlet13f/vigilante/pull/1)로 master에 병합(`f877c88`). 범위 차이는 M1 절 참고 |
-| M2 ~ M6 | 미착수 | 일정은 모두 추정 |
+| M2 ~ M6 | 미착수 | 일정은 모두 추정. 다음 후보: M3-1 OpenAPI 명세 초안, M2 설정 분리 |
 
 선행 수정: rollback 규칙이 없는 서비스·단계를 검증에서 거부 (커밋 `3969470`).
 
@@ -105,6 +105,8 @@
 - **SSH 인증서 인증:** Vault SSH CA로 단기 인증서를 발급받아 접속하도록 지원한다. 장기 개인키 배포를 없앨 수 있다.
 - 비밀값은 메모리에만 두고 TTL 캐시를 쓴다. 로그, 저널, support bundle에서는 자동으로 가린다.
 
+> **구현 결과(M0-3):** 별도 `password: {secret: ...}` 객체 대신 기존 키 옆에 `*_ref`(`password_ref`, `token_ref`, `private_key_ref`, `dsn_ref` 등)를 두었다. 형식은 `vault:<mount>/<path>#<key>`, `env:NAME`, `file:/path`이고 `*_env`보다 우선한다. Vault는 token·AppRole·Kubernetes 로그인, 네임스페이스, 사설 CA, 403 시 재로그인을 지원한다. `ssh_ca`는 메모리의 일회용 ed25519 키를 Vault SSH CA로 서명받아 접속하고, 수명의 80%가 지나면 다시 발급한다. 해석한 값은 로그에서 `[REDACTED]`로 가린다. `doctor`가 모든 참조를 실제로 해석하고 SSH CA 서명 권한을 점검한다. CyberArk는 수요 확인 후 같은 참조 형식(`cyberark:`)으로 추가한다.
+
 ### M0-4. 감사·컴플라이언스
 - 저널 이벤트에 `actor`, `source`(cli/api/ui/agent/system), `reason`, `ticket`을 추가한다.
 - **해시 체인:** 각 이벤트가 직전 이벤트 해시를 포함하게 해 변조를 검출한다. `vigilante audit verify`로 체인을 검증한다.
@@ -118,6 +120,8 @@
 - 로그는 JSON 구조화 형식을 선택할 수 있게 하고, `deployment_id`, `trace_id`를 포함한다.
 - `/healthz`(생존)와 `/readyz`(저장소 연결, 리더 여부)를 분리한다. OpenTelemetry 트레이스는 선택 사항이다.
 
+> **구현 결과(M0-5):** 클라이언트 라이브러리 없이 Prometheus 텍스트 형식을 직접 출력한다(의존성 0). 지표 목록은 docs/02 "자체 관측성". 판정 지연은 "실패 판정 → 롤백 시작 기록"(`vigilante_rollback_trigger_seconds`)과 평가 1회 시간(`vigilante_evaluation_seconds`)으로 나눠 잰다. 위반이 `for` 횟수를 채우기까지의 시간은 규칙 설정이 정하므로 따로 재지 않는다. `/metrics`는 기본으로 `viewer@*` 토큰이 필요하다(`server.metrics_public`으로 해제). 로그는 `VIGILANTE_LOG_FORMAT=json`, 요청 로그에 `request_id`(`X-Request-ID` 또는 `traceparent`)를 남긴다. 기존 로그 키 `deployment`는 그대로 두었다. OpenTelemetry 트레이스 내보내기는 M5(수집 샤딩, 노드 간 gRPC)와 함께 검토한다.
+
 ## M1. 입력 간소화 — 완료
 
 **구현 현황.** 아래 계획 중 실제로 구현한 것과 남은 것입니다.
@@ -126,7 +130,7 @@
 |---|---|---|
 | M1-1 입력 자동 채우기 | CI 환경변수에서 ID·버전, 저널에서 이전 버전, `mark-good`, 출처 출력·기록, 롤백 대상 미상 시 관측 전 거부, REST API 동일 동작 | `mark-good` 권한 제한(M0 RBAC) |
 | M1-2 규칙 프리셋 | 내장 4종, `preset_dirs` 조직 프리셋, `name@version` 고정, 항목별 병합, `presets` / `presets show` | 사내 프리셋 저장소 배포 방식(M2 GitOps) |
-| M1-3 doctor | 자격증명·접속·sudo·프로브·로그 형식·실행기·LB 풀·용량 점검, 조치 힌트, `--json`·`--junit` | Vault 경로 점검(M0-3), 서버 정기 실행·지표(M4·M0-5), 실제 sshd `MaxSessions` 조회(현재는 기본값 10과 비교) |
+| M1-3 doctor | 자격증명(Vault 참조·SSH CA 서명 권한 포함)·접속·sudo·프로브·로그 형식·실행기·LB 풀·용량 점검, 조치 힌트, `--json`·`--junit` | 서버 정기 실행·지표(M4·M0-5), 실제 sshd `MaxSessions` 조회(현재는 기본값 10과 비교) |
 
 ### 원래 계획
 

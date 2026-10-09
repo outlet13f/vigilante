@@ -52,10 +52,17 @@ vigilante watch    -c vigilante.yaml --service order-api --phase canary --baseli
 ### 중앙 서버 / 에이전트
 
 ```bash
-VIGILANTE_TOKEN=... vigilante server -c vigilante.yaml                 # REST + 웹훅 + 크래시 재개
+vigilante token create --name ci-order --role deployer --scope service=order-api --expires 2027-06-30
+VIGILANTE_TOKEN=vgl_... vigilante whoami --server https://vigilante:8088
+vigilante server -c vigilante.yaml                                      # REST + 웹훅 + 크래시 재개 (auth·HA 설정 시 적용)
 vigilante watch --server https://vigilante:8088 --service ... --phase canary
 vigilante agent -c vigilante.yaml --target order-bm-01 --server https://vigilante:8088
-vigilante circuit -c vigilante.yaml status|reset|trip
+vigilante circuit -c vigilante.yaml status|reset|trip [--ticket CHG-123]
+vigilante audit verify -c vigilante.yaml                               # 감사 기록 변조 검사 (해시 체인)
+# 서버 관측: GET /healthz(생존) /readyz(준비) /metrics(Prometheus), VIGILANTE_LOG_FORMAT=json
+# 비밀값: credentials의 *_ref = "vault:secret/prod/f5#password" | env:NAME | file:/path
+#         ssh_ca: {mount, role} 이면 Vault SSH CA 단기 인증서로 접속 (docs/02 secrets)
+vigilante audit query  -c vigilante.yaml --action denied --since 2026-10-01
 vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--approve]
 ```
 

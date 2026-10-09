@@ -98,9 +98,13 @@ type Deployment struct {
 	Targets         []string                     `json:"targets"`               // targets running the new version
 	Checkpoints     map[string]map[string]string `json:"checkpoints,omitempty"` // target -> executor checkpoint
 	Breaches        []Breach                     `json:"breaches,omitempty"`
-	Events          []Event                      `json:"events,omitempty"`
-	CreatedAt       time.Time                    `json:"created_at"`
-	UpdatedAt       time.Time                    `json:"updated_at"`
+	// Who acted (auth principal IDs such as user:alice or sa:ci-order).
+	CreatedBy           string    `json:"created_by,omitempty"`
+	RollbackRequestedBy string    `json:"rollback_requested_by,omitempty"`
+	ApprovedBy          string    `json:"approved_by,omitempty"`
+	Events              []Event   `json:"events,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.

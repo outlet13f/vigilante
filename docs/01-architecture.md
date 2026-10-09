@@ -147,11 +147,19 @@
 권장 프로덕션 토폴로지
 
 ```
-   [CI Runner] ──HTTPS──▶ [vigilante server (active)] ──SSH/API──▶ 대상들
-                            │ journal: 공유 스토리지 or 로컬 SSD + 백업
-                            └─ (active/standby는 저널 파일 잠금으로 단일 활성 보장 권장)
-   [대상 호스트 일부] ── vigilante agent ── push ─▶ server
+   [CI Runner] ──HTTPS──▶ [vigilante server 노드 A: 리더] ──SSH/API──▶ 대상들
+          │                 │  ▲ 리더 리스 갱신(TTL/3), 기록은 리더만(펜싱)
+          │                 ▼  │
+          └──HTTPS──▶ [노드 B: 팔로워] ──요청 전달──▶ 노드 A
+                            │
+                     [PostgreSQL: 이벤트 로그 · 리스]   ← 두 노드가 공유
+   [대상 호스트 일부] ── vigilante agent ── push ─▶ 아무 노드 (리더로 전달)
 ```
+
+- 상태(판정·롤백 단계·서킷·락)는 PostgreSQL의 append-only 이벤트 로그와 리스 테이블에 있습니다. 리스 만료는 DB 시계 기준이라 노드 간 시계 차이의 영향을 받지 않습니다.
+- 리더가 죽거나 DB에서 끊기면 리스가 만료된 뒤 다른 노드가 리더가 됩니다. 새 리더는 상태를 다시 읽고 중단된 롤백을 이어서 끝냅니다. 실측: TTL 3초 설정에서 리더 강제 종료 후 4.1초 만에 전환.
+- 리더 자리를 잃은 노드의 기록은 DB가 거부하고(펜싱), 그 노드는 즉시 새 판정·롤백 단계를 멈춥니다.
+- 단일 노드·CI 단발 실행은 기존처럼 `state.backend: file`(JSONL 저널)을 씁니다.
 
 ## 6. 패키지 지도 (코드 위치)
 

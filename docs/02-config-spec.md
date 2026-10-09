@@ -31,6 +31,9 @@ executors:   {...}   # 이름 → 롤백 전략 (A/B/D/범용)
 services:    [...]   # 서비스 = 대상 + 프로브 + 규칙 + 단계 + 롤백 플랜
 safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼럼
 notify:      [...]   # 알림
+auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
+audit:       {...}   # SIEM 전송(syslog)과 보존 기간
+secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 ```
 
 ## `server`
@@ -40,8 +43,65 @@ notify:      [...]   # 알림
 | `listen` | `:8088` | REST API 주소 |
 | `auth_token_env` | — | Bearer 토큰 환경변수. 비우면 인증 비활성(개발용, 경고 로그) |
 | `webhook_secret_env` | — | GitHub HMAC 서명 / GitLab `X-Gitlab-Token` 검증 비밀 |
-| `journal_path` | `vigilante-journal.jsonl` | WAL 저널. **CI 단발 실행 간 서킷/플래핑 이력 공유를 위해 공유 경로 권장**. 같은 디렉토리에 서비스별 롤백 락 파일 생성 |
+| `journal_path` | `vigilante-journal.jsonl` | `state.backend: file`일 때의 WAL 저널. **CI 단발 실행 간 서킷/플래핑 이력 공유를 위해 공유 경로 권장**. 같은 디렉토리에 리스(락) 파일 생성 |
 | `dry_run` | `false` | 모든 변경 액션을 로그로만 출력 (읽기 전용 명령·체크포인트는 실행) |
+| `state.backend` | `file` | `file`(단일 노드·CI) \| `postgres`(여러 노드가 공유, HA 전제) |
+| `state.dsn_ref` / `state.dsn_env` / `state.dsn` | — | PostgreSQL 접속 문자열. 비밀번호가 들어가므로 `dsn_ref`(Vault) 또는 `dsn_env` 권장. 스키마는 시작 시 자동 마이그레이션 |
+| `ha.enabled` | `false` | 여러 `vigilante server` 노드 중 하나만 리더로 동작. `postgres` 필수 |
+| `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달 |
+| `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름 |
+| `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
+| `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
+
+```yaml
+server:
+  listen: ":8088"
+  state: {backend: postgres, dsn_env: VIGILANTE_PG_DSN}
+  ha: {enabled: true, advertise_url: "https://vigilante-1.internal:8088", lease_ttl: 15s}
+```
+
+리더만 판정·롤백을 실행하고 상태를 기록합니다. 리더 자리를 잃은 노드의 기록은 DB에서 거부되므로(펜싱) 두 노드가 동시에 결정을 남기지 않습니다. 새 리더는 공유 상태를 다시 읽고, 진행 중이던 롤백을 완료된 단계부터 이어서 끝냅니다.
+
+### 자체 관측성
+
+세 엔드포인트는 각 노드가 직접 답하며 리더로 전달하지 않습니다.
+
+| 엔드포인트 | 용도 | 응답 |
+|---|---|---|
+| `GET /healthz` | 생존(liveness). 프로세스가 응답하면 200 | 역할, 리더, 서킷, 저장소 |
+| `GET /readyz` | 준비(readiness). 로드밸런서·Kubernetes가 트래픽을 보낼지 판단 | 저장소 Ping 실패 또는 HA에서 리더를 모르면 503. `{"ready":..,"checks":{"store":..,"leader":..}}` |
+| `GET /metrics` | Prometheus 텍스트 형식(0.0.4). 외부 수집기가 가져가기만 함 | 아래 지표 |
+
+| 지표 | 종류 | 레이블 | 의미 |
+|---|---|---|---|
+| `vigilante_rollback_trigger_seconds` | histogram | — | 실패 판정부터 롤백 시작 기록까지(게이트·락·저장 포함) |
+| `vigilante_rollbacks_total` | counter | service, result | `rolled_back`, `failed`, `await_approval`, `blocked`, `handed_over` |
+| `vigilante_rollback_duration_seconds` | histogram | result | 롤백 플랜 실행 시간 |
+| `vigilante_verdicts_total` | counter | service, phase, verdict | 단계 판정 결과 |
+| `vigilante_evaluation_seconds` | histogram | — | 한 번의 규칙 평가 시간 |
+| `vigilante_probe_samples_total` / `vigilante_probe_restarts_total` | counter | type | 수집 샘플 수 / 오류로 재시작한 프로브 수 |
+| `vigilante_agent_samples_total` | counter | — | 에이전트가 보낸 샘플 수 |
+| `vigilante_circuit_state` | gauge | state | 현재 서킷 상태가 1 |
+| `vigilante_leader` / `vigilante_engine_active` | gauge | — | 리더 여부 / 판정·롤백 가능 여부(펜싱되면 0) |
+| `vigilante_deployments` | gauge | state | 상태별 배포 수 |
+| `vigilante_agents_connected` | gauge | — | 30초 안에 하트비트를 보낸 에이전트 수 |
+| `vigilante_store_append_seconds` / `vigilante_store_errors_total` | histogram / counter | backend / reason | 상태 저장 지연 / 실패(`fenced`, `error`) |
+| `vigilante_ssh_connections` / `vigilante_ssh_sessions` / `vigilante_ssh_dials_total` | gauge / gauge / counter | — / — / result | SSH 풀 연결 수, 열린 세션 수, 접속 시도 |
+| `vigilante_api_requests_total` / `vigilante_api_request_seconds` | counter / histogram | method, route, code / route | API 요청 수와 지연 |
+| `vigilante_audit_exported_total` / `vigilante_audit_export_dropped_total` | counter | — | SIEM 전송 / 유실 |
+| `vigilante_build_info`, `process_start_time_seconds`, `go_goroutines`, `go_memstats_heap_alloc_bytes` | gauge | version, go_version | 빌드·프로세스 정보 |
+
+레이블에는 대상 이름이나 배포 ID를 넣지 않습니다. 대상 수천 대에서도 시계열 수가 서비스 수에 비례하게 유지됩니다.
+
+**로그:** `VIGILANTE_LOG_FORMAT=json`이면 한 줄에 JSON 객체 하나로 출력합니다(기본 text). `VIGILANTE_LOG=debug|warn`으로 수준을 바꿉니다. 배포 관련 로그에는 `deployment`, API 요청 로그에는 `request_id`가 붙습니다. `request_id`는 요청의 `X-Request-ID`를 쓰고, 없으면 W3C `traceparent`의 trace id, 그것도 없으면 새로 만들어 응답 헤더로 돌려줍니다. 팔로워가 리더로 전달할 때 같은 값을 넘기므로 두 노드의 로그를 하나의 요청으로 묶을 수 있습니다. 변경 요청과 실패한 요청은 info, 성공한 조회는 debug로 남습니다.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: vigilante
+    authorization: {credentials_file: /etc/prometheus/vigilante-token}   # viewer@* 서비스 계정
+    static_configs: [{targets: ["vigilante-1:8088", "vigilante-2:8088"]}]
+```
 
 ## `agent`
 
@@ -56,10 +116,35 @@ notify:      [...]   # 알림
 
 | `type` | 사용 키 |
 |---|---|
-| `ssh` | `user`, `private_key_file`, `passphrase_env`, `password_env`, `use_ssh_agent`, `known_hosts_file`(기본 `~/.ssh/known_hosts`), `insecure_ignore_host_key` |
-| `basic` | `username_env` (또는 `user`), `password_env` — F5, vCenter, Prism, 웹훅 |
-| `token` | `token_env` — 웹훅 Bearer |
+| `ssh` | `user`, `ssh_ca`(권장), `private_key_ref` 또는 `private_key_file`, `passphrase_ref`/`passphrase_env`, `password_ref`/`password_env`, `use_ssh_agent`, `known_hosts_file`(기본 `~/.ssh/known_hosts`), `insecure_ignore_host_key` |
+| `basic` | `username_ref`/`username_env` (또는 `user`), `password_ref`/`password_env` — F5, vCenter, Prism, 웹훅 |
+| `token` | `token_ref`/`token_env` — 웹훅 Bearer |
 | `aws` | `region`, `profile` — 나머지는 AWS 기본 자격증명 체인(IAM Role 권장) |
+
+`*_ref`는 비밀값 참조입니다. `*_env`보다 우선하며 형식은 세 가지입니다.
+
+| 참조 | 예 | 값의 출처 |
+|---|---|---|
+| `vault:<mount>/<path>#<key>` | `vault:secret/prod/f5#password` | Vault KV v2 (`secrets.vault` 필요) |
+| `env:NAME` | `env:F5_PASSWORD` | 환경변수 |
+| `file:/path` | `file:/run/secrets/f5-password` | 파일 내용(Kubernetes Secret 마운트 등). 끝 줄바꿈 제거 |
+
+### `ssh_ca` — 단기 SSH 인증서
+
+장기 개인키를 대상 서버마다 배포하는 대신, Vault SSH CA가 접속할 때마다 단기 인증서를 발급합니다.
+
+```yaml
+credentials:
+  ssh-deploy:
+    type: ssh
+    user: deploy
+    ssh_ca: {mount: ssh-client-signer, role: vigilante, ttl: 30m}   # principals 기본값: [user]
+```
+
+- vigilante는 메모리에서 일회용 ed25519 키를 만들고 공개키만 Vault `POST <mount>/sign/<role>`로 보내 서명받습니다. 개인키는 디스크에 남지 않습니다.
+- 인증서는 수명의 80%가 지나면 새 키로 다시 발급합니다. 그 전까지 새 연결은 같은 인증서를 씁니다.
+- 대상 서버 sshd는 CA 공개키만 신뢰하면 됩니다(`TrustedUserCAKeys`). 인증서의 principal이 로그인 사용자와 같아야 합니다.
+- `ssh_ca`와 개인키를 함께 지정하면 인증서를 먼저 시도합니다.
 
 ## `targets[]`
 
@@ -244,6 +329,121 @@ safety:
 ```
 
 상세 동작은 [04-safety-circuit-breaker.md](04-safety-circuit-breaker.md).
+
+## `auth` — 인증과 권한
+
+API 호출자는 Bearer 토큰을 보냅니다. 세 종류를 받습니다.
+
+| 토큰 | 용도 | 신원 |
+|---|---|---|
+| 서비스 계정 토큰 (`vgl_…`) | CI 잡, 에이전트 | `sa:<name>`. 설정에는 SHA-256 해시만 저장. `vigilante token create`로 발급 |
+| OIDC JWT | 사람(사내 SSO: Keycloak, Azure AD, Okta 등) | `user:<preferred_username>`. 그룹을 역할에 매핑 |
+| `server.auth_token_env`의 토큰 | 비상용(break-glass) | `token:legacy`, admin. 평소에는 비워 두기를 권장 |
+
+아무것도 설정하지 않으면 인증이 꺼집니다(개발용, 시작 시 경고, 모든 작업이 `anonymous`로 기록).
+
+**역할** (아래로 갈수록 상위 권한 포함)
+
+| 역할 | 할 수 있는 일 |
+|---|---|
+| `viewer` | 배포·서킷·지표 조회 |
+| `deployer` | 배포 생성, 단계 관측 시작, 중단, 기준선 측정, `mark-good` |
+| `operator` | 수동 롤백, 승인 대기 에스컬레이션 승인 |
+| `admin` | 서킷 리셋·차단, 그 외 전부 |
+| `agent` | 에이전트 전용: 샘플 전송, 하트비트만 (다른 역할과 별개) |
+
+**범위(scope)**: `*`(전체, 기본) · `team=<팀>`(서비스의 `team` 값과 일치) · `service=<이름>`. 서킷 리셋처럼 특정 서비스에 속하지 않는 작업은 `*` 범위가 필요합니다. 목록 조회는 권한 있는 서비스만 돌려줍니다.
+
+```yaml
+services:
+  - name: order-api
+    team: payments            # team= 범위가 이 값과 맞춰짐
+    ...
+auth:
+  oidc:
+    issuer: https://sso.example.internal/realms/ops
+    audience: vigilante       # 토큰의 aud(client ID)
+    groups_claim: groups      # 기본 groups
+    username_claim: preferred_username
+  role_bindings:
+    - {group: sre-oncall, role: operator}
+    - {group: platform-admins, role: admin}
+    - {group: payments-dev, role: deployer, scope: team=payments}
+    - {user: alice, role: viewer}
+  service_accounts:
+    - name: ci-order-api
+      token_sha256: fb4afd06a1bdd94f9f3febfaa8b22a2d3fd2db9d10bf0c51ab3a75ba8e9fd8a9
+      expires: 2027-06-30     # 이 날짜까지 유효
+      roles: [{role: deployer, scope: "service=order-api"}]
+    - name: agent-fleet
+      token_sha256: 0f1e...   # (64자 hex)
+      roles: [{role: agent}]
+  four_eyes: true             # 배포 생성자·롤백 요청자는 그 승인 요청을 직접 승인할 수 없음
+```
+
+- 토큰 폐기: 서비스 계정 항목을 지우고 설정을 다시 읽히면 즉시 무효가 됩니다. 만료일을 두는 것을 권장합니다.
+- 확인: `vigilante whoami --server URL` (환경변수 `VIGILANTE_TOKEN`의 신원과 권한 출력).
+- 모든 생성·롤백·승인 기록에 작업자(`created_by`, `rollback_requested_by`, `approved_by`)가 남습니다. 로컬 CLI 실행은 `cli:<OS 사용자>@<호스트>`로 기록됩니다.
+- OIDC를 설정하면 서버 시작 시 발급자(issuer)의 discovery 문서를 가져오므로 서버에서 SSO에 접근할 수 있어야 합니다.
+
+## `audit` — 감사 기록
+
+모든 판정·조치는 상태 저장소(파일 저널 또는 PostgreSQL)에 기록되고, 이 기록이 곧 감사 기록입니다.
+
+- **작업자:** 기록마다 `actor`(예: `user:alice`, `sa:ci-order`, `cli:bob@host`, 자동 조치는 `system`), `source`(api·cli·webhook·system), `action`, 대상 서비스·배포, `reason`이 남습니다.
+- **변경 티켓:** API는 `X-Change-Ticket` 헤더, CLI는 `--ticket`으로 받은 값을 `ticket`에 남깁니다.
+- **권한 거부:** 거부(403)된 요청도 `action: denied`로 남습니다. 반복되는 거부는 권한 탐색 시도의 신호입니다.
+- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. DB 관리자가 SQL로 직접 바꿔도 검출됩니다.
+
+```yaml
+audit:
+  syslog:
+    address: tcp://siem.example.internal:6514   # 또는 udp://...
+    format: rfc5424                              # rfc5424(JSON 본문, 기본) | cef
+  retention: 8760h                               # audit prune의 기본 보존 기간. 자동 삭제는 하지 않음
+```
+
+| 명령 | 하는 일 |
+|---|---|
+| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증. 끊어지면 exit 1 |
+| `vigilante audit verify --file ARCHIVE.jsonl` | 아카이브 파일만 따로 검증 |
+| `vigilante audit query -c FILE [--actor A] [--action denied] [--service S] [--since 2026-10-01]` | 감사 기록 조회 |
+| `vigilante audit export -c FILE --out F.jsonl` | 전체 기록을 체인 그대로 내보내기 |
+| `vigilante audit prune -c FILE --out ARCHIVE.jsonl [--before 2025-10-01 \| --older-than 8760h]` | 보존 기간이 지난 기록을 아카이브로 옮기고 삭제 |
+
+- **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
+- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
+- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+
+## `secrets` — 비밀값 출처
+
+```yaml
+secrets:
+  cache_ttl: 5m                       # 해석한 값을 메모리에 두는 시간 (기본 5m)
+  vault:
+    address: https://vault.example.internal:8200
+    namespace: ops                    # Vault Enterprise 네임스페이스 (선택)
+    ca_file: /etc/vigilante/vault-ca.pem
+    auth: approle                     # token | approle | kubernetes
+    role_id_env: VAULT_ROLE_ID        # approle
+    secret_id_env: VAULT_SECRET_ID    # approle
+    # token_env: VAULT_TOKEN          # token (기본 VAULT_TOKEN)
+    # k8s_role: vigilante             # kubernetes; JWT는 서비스 계정 토큰 파일
+    # auth_mount: approle             # 로그인 경로가 기본값과 다를 때
+```
+
+- **로그인:** `approle`과 `kubernetes`는 처음 쓸 때 로그인하고, 토큰 만료 30초 전에 다시 로그인합니다. 토큰이 먼저 폐기돼 403이 오면 한 번 다시 로그인해 재시도합니다.
+- **보관:** 비밀값은 메모리 캐시에만 둡니다. 설정 파일, 저널, 감사 기록에는 참조 문자열만 남습니다.
+- **로그 가림:** 한 번이라도 해석한 값(6자 이상)은 로그 메시지·속성·오류 문자열에서 `[REDACTED]`로 바뀝니다. `*_env`로 읽은 값도 같습니다.
+- **Vault 정책 예:** 필요한 권한은 KV 읽기와 SSH 서명뿐입니다.
+
+```hcl
+path "secret/data/prod/*"            { capabilities = ["read"] }
+path "ssh-client-signer/sign/vigilante" { capabilities = ["update"] }
+```
+
+- **사전 점검:** `vigilante doctor`가 사용하는 모든 `*_ref`를 실제로 해석하고, `ssh_ca`는 일회용 키로 서명을 받아 봅니다. 정책이 막혀 있으면 롤백 전에 드러납니다.
+- **장애 시:** Vault가 응답하지 않으면 그 자격증명이 필요한 프로브·실행기만 실패합니다. 캐시에 남은 값은 `cache_ttl` 동안 계속 쓰입니다. 롤백 경로가 Vault에 의존하지 않게 하려면 캐시 시간을 관측 창보다 길게 두십시오.
 
 ## `notify[]`
 

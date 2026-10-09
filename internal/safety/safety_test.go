@@ -1,7 +1,10 @@
 package safety
 
 import (
+	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,7 +86,8 @@ func TestGuardLockAndFlapping(t *testing.T) {
 	c := &clock{t: time.Now()}
 	g := NewGuard(config.Flapping{MaxRollbacksPerHour: 2, Cooldown: 5 * time.Minute}, nil)
 	g.Now = c.now
-	g.LockDir = t.TempDir()
+	leases := &memLeases{m: map[string]string{}}
+	g.Leases, g.Owner = leases, "proc-1"
 	rel, err := g.Acquire("order-api")
 	if err != nil {
 		t.Fatal(err)
@@ -91,10 +95,10 @@ func TestGuardLockAndFlapping(t *testing.T) {
 	if _, err := g.Acquire("order-api"); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second acquire: %v", err)
 	}
-	// A second process (fresh Guard, same lock dir) is also excluded.
+	// Another process or server node (fresh Guard, same lease store) is also excluded.
 	g2 := NewGuard(config.Flapping{}, nil)
-	g2.LockDir = g.LockDir
-	if _, err := g2.Acquire("order-api"); !errors.Is(err, ErrLocked) {
+	g2.Leases, g2.Owner = leases, "proc-2"
+	if _, err := g2.Acquire("order-api"); !errors.Is(err, ErrLocked) || !strings.Contains(err.Error(), "proc-1") {
 		t.Fatalf("cross-process acquire: %v", err)
 	}
 	rel()
@@ -133,4 +137,34 @@ func TestDrainBatch(t *testing.T) {
 			t.Errorf("DrainBatch(%d,%d,%d,%+v) = %d want %d", c.pool, c.enabled, c.drain, c.cfg, got, c.want)
 		}
 	}
+}
+
+type memLeases struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (l *memLeases) TryLease(_ context.Context, key, owner string, _ time.Duration) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if cur, ok := l.m[key]; ok && cur != owner {
+		return false, nil
+	}
+	l.m[key] = owner
+	return true, nil
+}
+
+func (l *memLeases) ReleaseLease(_ context.Context, key, owner string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m[key] == owner {
+		delete(l.m, key)
+	}
+	return nil
+}
+
+func (l *memLeases) LeaseHolder(_ context.Context, key string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.m[key], nil
 }

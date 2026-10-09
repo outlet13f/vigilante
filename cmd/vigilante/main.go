@@ -25,13 +25,16 @@ import (
 
 	"vigilante/internal/agent"
 	"vigilante/internal/api"
+	"vigilante/internal/audit"
 	"vigilante/internal/config"
 	"vigilante/internal/executor"
-	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/probe"
 	"vigilante/internal/safety"
+	"vigilante/internal/secrets"
+	"vigilante/internal/store"
+	"vigilante/internal/telemetry"
 )
 
 var version = "0.1.0-dev"
@@ -53,6 +56,10 @@ Usage:
   vigilante agent    -c FILE --target NAME --server URL
   vigilante doctor   -c FILE [--service S] [--previous P] [--json] [--junit FILE]
   vigilante presets [list | show NAME[@V] [--set k=v]...] [--dir DIRS]
+  vigilante token    create --name NAME [--role ROLE] [--scope SCOPE] [--expires YYYY-MM-DD]
+  vigilante whoami   --server URL
+  vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
+                     | query [--actor A] [--action X] [--service S] [--since DATE]
   vigilante plugins
   vigilante version
 
@@ -64,6 +71,7 @@ Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=deb
 `
 
 func main() {
+	telemetry.Version = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -88,12 +96,31 @@ func logger() *slog.Logger {
 	case "warn":
 		lvl = slog.LevelWarn
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if strings.EqualFold(os.Getenv("VIGILANTE_LOG_FORMAT"), "json") {
+		h = slog.NewJSONHandler(os.Stderr, opts) // one object per line, for log shippers
+	}
+	return slog.New(secrets.RedactHandler{Handler: h})
+}
+
+// loadConfig reads vigilante.yaml and installs the secrets resolver it
+// describes, so *_ref values resolve from Vault / env / file afterwards.
+func loadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := secrets.Configure(cfg.Secrets); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 type common struct {
 	fs                                  *flag.FlagSet
 	config, service, ver, prev, id, srv string
+	ticket                              string
 	dryRun                              bool
 }
 
@@ -106,11 +133,12 @@ func newFlags(name string) *common {
 	c.fs.StringVar(&c.id, "id", "", "deployment id (e.g. CI pipeline id)")
 	c.fs.StringVar(&c.srv, "server", "", "delegate to a running orchestrator at URL")
 	c.fs.BoolVar(&c.dryRun, "dry-run", false, "log actions instead of executing them")
+	c.fs.StringVar(&c.ticket, "ticket", "", "change or incident ticket recorded in the audit trail")
 	return c
 }
 
 func (c *common) engine() (*orchestrator.Engine, error) {
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +168,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		if err := c.fs.Parse(args); err != nil {
 			return 1, err
 		}
-		cfg, err := config.Load(c.config)
+		cfg, err := loadConfig(c.config)
 		if err != nil {
 			return 1, err
 		}
@@ -167,6 +195,12 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdPresets(args)
 	case "doctor":
 		return cmdDoctor(ctx, args)
+	case "token":
+		return cmdToken(args)
+	case "audit":
+		return cmdAudit(ctx, args)
+	case "whoami":
+		return cmdWhoami(ctx, args)
 	case "circuit":
 		return cmdCircuit(ctx, args)
 	case "server":
@@ -193,7 +227,9 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
+	cliAudit(e, c, "deployment.prepare", d.Service, d.ID, "")
 	err = e.Prepare(ctx, d)
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
@@ -247,10 +283,12 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
 	}
+	cliAudit(e, c, "phase.start", d.Service, d.ID, *phase)
 	if err := e.Watch(ctx, d, model.Phase(*phase)); err != nil {
 		e.MarkBlocked(d, err)
 		if errors.Is(err, safety.ErrCircuitOpen) {
@@ -353,18 +391,20 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 		if d, err = e.Create(c.id, c.service, c.ver, c.prev); err != nil {
 			return 1, err
 		}
+		e.SetCreatedBy(d, cliActor())
 		annotate(e, d, notes)
 	}
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
 	}
-	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec}
+	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec, Actor: cliActor()}
 	if *targets != "" {
 		opt.Targets = strings.Split(*targets, ",")
 	} else if len(d.Targets) == 0 {
 		svc, _ := e.Cfg.Service(d.Service)
 		opt.Targets = svc.Targets
 	}
+	cliAudit(e, c, map[bool]string{true: "escalation.approve", false: "rollback.manual"}[*approve], d.Service, d.ID, *reason)
 	_ = e.Rollback(ctx, d, opt)
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
@@ -395,6 +435,7 @@ func cmdMarkGood(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	cliAudit(e, c, "mark-good", d.Service, d.ID, c.ver)
 	fmt.Printf("%s %s recorded as known-good (%s); later deployments default --previous to it\n", d.Service, d.Version, d.ID)
 	return 0, nil
 }
@@ -404,11 +445,16 @@ func cmdStatus(args []string) (int, error) {
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}
-	st, err := journal.Replay(cfg.Server.JournalPath)
+	db, err := store.Open(context.Background(), cfg)
+	if err != nil {
+		return 1, err
+	}
+	defer db.Close()
+	st, err := db.Load(context.Background())
 	if err != nil {
 		return 1, err
 	}
@@ -476,8 +522,10 @@ func cmdCircuit(ctx context.Context, args []string) (int, error) {
 	case "status":
 	case "reset":
 		e.Breaker.Reset()
+		cliAudit(e, c, "circuit.reset", "", "", "")
 	case "trip":
 		e.Breaker.Trip(*reason)
+		cliAudit(e, c, "circuit.trip", "", "", *reason)
 	default:
 		return 1, fmt.Errorf("unknown circuit action %q", action)
 	}
@@ -499,15 +547,33 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	defer e.Close()
-	srv := api.New(ctx, e)
-	if srv.Token == "" {
-		e.Log.Warn("API authentication disabled: set server.auth_token_env")
+	srv, err := api.New(ctx, e)
+	if err != nil {
+		return 1, err
 	}
-	go func() {
-		if n := e.Resume(ctx); n > 0 {
-			e.Log.Warn("resumed interrupted rollbacks", "count", n)
+	if srv.Auth.Disabled() {
+		e.Log.Warn("API authentication disabled: configure auth (service accounts / OIDC) or server.auth_token_env")
+	}
+	if sl := e.Cfg.Audit.Syslog; sl != nil {
+		x, err := audit.NewExporter(*sl, e.Log)
+		if err != nil {
+			return 1, err
 		}
-	}()
+		e.OnRecord = x.Send
+		go x.Run(ctx)
+		e.Log.Info("audit records exported", "to", sl.Address, "format", sl.Format)
+	}
+	role := "single node"
+	if e.Cfg.Server.HA.Enabled {
+		startHA(ctx, e, srv)
+		role = "HA node " + e.Cfg.Server.HA.AdvertiseURL
+	} else {
+		go func() {
+			if n := e.Resume(ctx); n > 0 {
+				e.Log.Warn("resumed interrupted rollbacks", "count", n)
+			}
+		}()
+	}
 	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -515,7 +581,7 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 		defer cancel()
 		_ = hs.Shutdown(sctx)
 	}()
-	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "journal", e.Cfg.Server.JournalPath, "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
+	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return 1, err
 	}
@@ -531,7 +597,7 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 	if c.srv == "" {
 		return 1, errors.New("agent: --server is required")
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}

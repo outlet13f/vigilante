@@ -26,6 +26,69 @@ type Config struct {
 	Notify      []Notifier            `yaml:"notify"`
 	// PresetDirs holds organisation presets (*.yaml), relative to this file.
 	PresetDirs []string `yaml:"preset_dirs"`
+	Auth       Auth     `yaml:"auth"`
+	Audit      Audit    `yaml:"audit"`
+	Secrets    Secrets  `yaml:"secrets"`
+}
+
+// Audit configures where audit records go besides the journal itself.
+type Audit struct {
+	Syslog *SyslogExport `yaml:"syslog"`
+	// Retention is the default for `vigilante audit prune` (e.g. 8760h).
+	// Nothing is deleted automatically.
+	Retention time.Duration `yaml:"retention"`
+}
+
+// SyslogExport ships audit records to a SIEM.
+type SyslogExport struct {
+	Address string `yaml:"address"` // tcp://host:port or udp://host:port
+	Format  string `yaml:"format"`  // rfc5424 (default, JSON message) | cef
+}
+
+// Auth configures who may call the API and what they may do.
+//
+// Roles, lowest to highest: viewer (read), deployer (create deployments, run
+// phases, abort, baselines, mark-good), operator (manual rollback, approve),
+// admin (circuit reset/trip and everything else). The agent role may only
+// push samples and heartbeats. A scope limits a grant: "*" (default),
+// "team=<team>" or "service=<name>".
+type Auth struct {
+	OIDC            *OIDC            `yaml:"oidc"`
+	ServiceAccounts []ServiceAccount `yaml:"service_accounts"`
+	RoleBindings    []RoleBinding    `yaml:"role_bindings"`
+	// FourEyes: whoever created a deployment or requested its rollback may
+	// not also approve its gated escalation.
+	FourEyes bool `yaml:"four_eyes"`
+}
+
+// OIDC validates bearer JWTs from the company identity provider.
+type OIDC struct {
+	Issuer        string `yaml:"issuer"`
+	Audience      string `yaml:"audience"`       // expected client ID
+	UsernameClaim string `yaml:"username_claim"` // default preferred_username
+	GroupsClaim   string `yaml:"groups_claim"`   // default groups
+}
+
+// ServiceAccount is a machine identity (CI job, agent fleet). Only the
+// SHA-256 of its token is stored; create one with `vigilante token create`.
+type ServiceAccount struct {
+	Name        string  `yaml:"name"`
+	TokenSHA256 string  `yaml:"token_sha256"`
+	Expires     string  `yaml:"expires"` // YYYY-MM-DD, optional
+	Roles       []Grant `yaml:"roles"`
+}
+
+type Grant struct {
+	Role  string `yaml:"role"`
+	Scope string `yaml:"scope"`
+}
+
+// RoleBinding grants a role to an OIDC group or user.
+type RoleBinding struct {
+	Group string `yaml:"group"`
+	User  string `yaml:"user"`
+	Role  string `yaml:"role"`
+	Scope string `yaml:"scope"`
 }
 
 type Server struct {
@@ -34,6 +97,31 @@ type Server struct {
 	JournalPath   string `yaml:"journal_path"`
 	DryRun        bool   `yaml:"dry_run"`
 	WebhookSecret string `yaml:"webhook_secret_env"`
+	State         State  `yaml:"state"`
+	HA            HA     `yaml:"ha"`
+	// MetricsPublic serves /metrics without authentication (scrapers on a
+	// trusted network). Otherwise a viewer token for all services is needed.
+	MetricsPublic bool `yaml:"metrics_public"`
+}
+
+// State selects where decisions, rollback progress, circuit state and locks
+// are kept. "file" (default) is the JSONL journal at journal_path, for a single
+// node or CI. "postgres" is shared by every node and enables HA.
+type State struct {
+	Backend string `yaml:"backend"` // file | postgres
+	DSN     string `yaml:"dsn"`     // avoid inline passwords; prefer dsn_env
+	DSNEnv  string `yaml:"dsn_env"`
+	DSNRef  string `yaml:"dsn_ref"` // vault:/env:/file: reference
+}
+
+// HA runs several `vigilante server` nodes against one postgres state store:
+// one leader acts, the others forward API calls to it and take over when its
+// lease expires.
+type HA struct {
+	Enabled      bool          `yaml:"enabled"`
+	AdvertiseURL string        `yaml:"advertise_url"` // how other nodes reach this node's API
+	NodeID       string        `yaml:"node_id"`       // default: hostname
+	LeaseTTL     time.Duration `yaml:"lease_ttl"`
 }
 
 // Agent configures the optional push agent (`vigilante agent`).
@@ -61,6 +149,46 @@ type Credential struct {
 	UseAgent          bool   `yaml:"use_ssh_agent"`
 	Region            string `yaml:"region"`
 	Profile           string `yaml:"profile"`
+
+	// Secret references (preferred over *_env): "vault:<mount>/<path>#<key>",
+	// "env:NAME" or "file:/path". Resolved at use, cached in memory only.
+	UsernameRef   string `yaml:"username_ref"`
+	PasswordRef   string `yaml:"password_ref"`
+	TokenRef      string `yaml:"token_ref"`
+	PassphraseRef string `yaml:"passphrase_ref"`
+	PrivateKeyRef string `yaml:"private_key_ref"` // PEM key content
+	// SSHCA: short-lived SSH certificates from Vault's SSH secrets engine
+	// instead of a long-lived private key.
+	SSHCA *SSHCA `yaml:"ssh_ca"`
+}
+
+// SSHCA asks Vault to sign an ephemeral in-memory key for each connection set.
+type SSHCA struct {
+	Mount      string        `yaml:"mount"` // e.g. ssh-client-signer
+	Role       string        `yaml:"role"`
+	TTL        time.Duration `yaml:"ttl"`        // default 30m
+	Principals []string      `yaml:"principals"` // default [user]
+}
+
+// Secrets configures where *_ref values come from.
+type Secrets struct {
+	Vault    *Vault        `yaml:"vault"`
+	CacheTTL time.Duration `yaml:"cache_ttl"` // default 5m
+}
+
+// Vault is a HashiCorp Vault server holding KV v2 secrets and the SSH CA.
+type Vault struct {
+	Address   string `yaml:"address"`
+	Namespace string `yaml:"namespace"` // Vault Enterprise
+	CAFile    string `yaml:"ca_file"`
+	// Auth: token | approle | kubernetes.
+	Auth        string `yaml:"auth"`
+	TokenEnv    string `yaml:"token_env"`     // token auth (default VAULT_TOKEN)
+	RoleIDEnv   string `yaml:"role_id_env"`   // approle
+	SecretIDEnv string `yaml:"secret_id_env"` // approle
+	K8sRole     string `yaml:"k8s_role"`      // kubernetes
+	K8sJWTPath  string `yaml:"k8s_jwt_path"`  // default service account token path
+	AuthMount   string `yaml:"auth_mount"`    // default approle / kubernetes
 }
 
 // Target is one machine or container host the engine observes or controls.
@@ -208,6 +336,8 @@ type WebhookExec struct {
 // Service ties targets, probes, rules, phases and the rollback plan together.
 type Service struct {
 	Name string `yaml:"name"`
+	// Team owns the service; auth scopes "team=<team>" match it.
+	Team string `yaml:"team"`
 	// Preset ("java-web" or pinned "java-web@1") supplies probes, rules,
 	// baseline and phases; Overrides fills its parameters. Probes, rules and
 	// phases written on the service replace the preset's of the same id/name.
@@ -287,6 +417,7 @@ type DBProbe struct {
 	Driver   string `yaml:"driver"` // postgres | mysql
 	DSN      string `yaml:"dsn"`    // template; may reference {{env "X"}}
 	DSNEnv   string `yaml:"dsn_env"`
+	DSNRef   string `yaml:"dsn_ref"` // vault:/env:/file: reference
 	PoolSize int    `yaml:"pool_size"`
 	Query    string `yaml:"query"`
 }

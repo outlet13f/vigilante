@@ -46,7 +46,7 @@
 | S9 | LB 풀 상태 조회 불가 | `Pool()` 오류 | 보수적으로 배치 크기 1 | — |
 | S10 | 롤백 → 재배포 → 롤백 반복 (이전 버전도 불량, 또는 오탐) | 서비스별 롤백 이력 | `max_rollbacks_per_hour` 초과 또는 `cooldown` 이내면 자동 롤백 **차단** → 실패 대상만 격리 → 사람에게 | ROLLBACK_FAILED("flapping guard") |
 | S11 | 같은 서비스에 동시 롤백 (CI 잡 2개, 서버+CLI) | 프로세스 내 락 + 저널 디렉토리의 **락 파일**(O_EXCL, 30분 stale 회수) | 두 번째 요청은 즉시 거부 | — |
-| S12 | 오케스트레이터가 롤백 도중 사망 | 재시작 시 저널 재생: `ROLLING_BACK` 상태 배포 | `Resume()`: 완료된 단계(`rollback.step`)는 건너뛰고 나머지 수행. 모든 단계 멱등. drain만 완료됐던 대상도 enable은 반드시 실행 | 테스트: `TestResumeSkipsCompletedSteps` |
+| S12 | 오케스트레이터가 롤백 도중 사망 또는 DB에서 끊김 | 단일 노드: 재시작 시 저널 재생. HA: 리더 리스 만료 | 완료된 단계(`rollback.step`)는 건너뛰고 나머지 수행. 모든 단계 멱등. HA에서는 다른 노드가 리더가 되어 이어받고, 물러난 노드의 기록은 DB가 거부(펜싱) | 테스트: `TestResumeSkipsCompletedSteps`, `TestHAFailoverFinishesInterruptedRollback` |
 | S13 | 오케스트레이터가 카나리 관측 중 사망 / 네트워크 분단 | 에이전트 하트비트 실패 `failsafe_after` | 에이전트가 **로컬 규칙 평가**. `failsafe: rollback`이면 자기 호스트만 롤백(트래픽 단계 제외), `hold`면 기록·알림만 | 테스트: `TestAgentPushesAndFailsafeRollsBack` |
 | S14 | 관측자 실명 (오케스트레이터→대상 SSH만 불가, 서비스는 정상) | 중앙=위반, 에이전트=정상 | **HOLD** — 롤백하지 않음 (`observer_quorum`) | 네트워크 점검 |
 | S15 | 공유 의존성 장애 (DB 다운) — 신·구 버전 모두 에러 | 대조군도 같은 규칙 위반 | **HOLD** (Environmental) — 롤백해도 복구되지 않으므로 하지 않음 | 의존성 복구 |
@@ -80,10 +80,10 @@ batch       = allowed ≤ 0 ? 드레인 거부(제자리, 1대씩) : min(allowed
 2. 격리된 대상은 LB에서 빠져 있음 → 서비스 영향 최소. 원인 수정 후 `vigilante rollback --id <ID> [--executor <다른 전략>] [--approve]`로 재시도.
 3. 서킷 OPEN이면 원인(롤백 경로 자체 고장: 레지스트리 장애, 스냅샷 누락, 자격증명 만료 등) 해결 후 `vigilante circuit reset`.
 4. 플래핑 차단이면 이전 버전 자체를 의심 — 새 ID로 더 이전 버전을 지정해 수동 롤백: `vigilante rollback --id <NEW> --service S --version <불량> --previous <더 이전 버전>`.
-5. 감사: 저널(`journal_path`)은 모든 판정·단계·서킷 전이를 시간순 JSONL로 보관합니다.
+5. 감사: 모든 판정·단계·서킷 전이와 사람·CI의 조치(작업자, 티켓, 거부된 요청 포함)가 해시 체인으로 묶여 저장됩니다. 사고 조사 전에 `vigilante audit verify`로 기록이 변조되지 않았는지 먼저 확인하고, `vigilante audit query --since <시각>`으로 타임라인을 뽑으십시오.
 
-## 6. 알려진 한계 (프로토타입)
+## 6. 알려진 한계
 
-- 저널은 단일 노드 파일입니다. 오케스트레이터 이중화 시 공유 스토리지 + 단일 활성(리더 선출) 장치가 추가로 필요합니다.
-- 락 파일은 같은 파일시스템을 공유하는 프로세스 사이에서만 배타성을 보장합니다.
+- `state.backend: file`(기본)은 단일 노드용입니다. 리스(락)는 같은 파일시스템을 공유하는 프로세스 사이에서만 배타적입니다. 여러 서버 노드는 `postgres` + `ha`를 쓰십시오.
+- HA 펜싱은 상태 기록을 막습니다. 리더 자리를 잃는 순간 이미 대상에 보낸 명령(진행 중이던 한 단계)은 되돌리지 못하므로, 새 리더가 그 단계를 한 번 더 실행할 수 있습니다. 모든 롤백 단계가 멱등이어야 하는 이유입니다.
 - 에이전트 failsafe 롤백은 LB에 접근하지 않습니다(트래픽 단계 제외). LB 격리가 필요하면 오케스트레이터 복구 후 처리됩니다.

@@ -11,6 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"vigilante/internal/config"
+	"vigilante/internal/secrets"
 	"vigilante/internal/tmpl"
 )
 
@@ -33,7 +34,14 @@ var sqlDrivers = map[string]string{"postgres": "pgx", "mysql": "mysql"}
 
 func newDB(spec config.Probe, env Env) (Probe, error) {
 	dsn := spec.DB.DSN
-	if spec.DB.DSNEnv != "" {
+	switch {
+	case spec.DB.DSNRef != "":
+		v, err := secrets.Resolve(context.Background(), spec.DB.DSNRef)
+		if err != nil {
+			return nil, err
+		}
+		dsn = v
+	case spec.DB.DSNEnv != "":
 		dsn = os.Getenv(spec.DB.DSNEnv)
 		if dsn == "" {
 			return nil, fmt.Errorf("env %s is empty", spec.DB.DSNEnv)

@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"vigilante/internal/config"
+	"vigilante/internal/secrets"
+	"vigilante/internal/secrets/vaulttest"
 	"vigilante/internal/transport"
 )
 
@@ -168,5 +170,35 @@ func TestHint(t *testing.T) {
 		if h := Hint(in); !strings.Contains(h, want) {
 			t.Errorf("Hint(%q) = %q, want it to mention %q", in, h, want)
 		}
+	}
+}
+
+func TestDoctorChecksVaultReferences(t *testing.T) {
+	v := vaulttest.New(t)
+	v.Put("secret/prod/ssh", map[string]any{"passphrase": "key-passphrase"})
+	v.Deny("ssh-client-signer/sign/ops")
+	t.Setenv("VGL_VAULT_TOKEN", v.RootToken)
+	if err := secrets.Configure(config.Secrets{Vault: &config.Vault{Address: v.URL, TokenEnv: "VGL_VAULT_TOKEN"}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secrets.Configure(config.Secrets{}) })
+
+	cfg := testConfig(t, 0)
+	c := cfg.Credentials["ssh-key"]
+	c.PrivateKeyFile = ""
+	c.PassphraseRef = "vault:secret/prod/ssh#passphrase"
+	c.PasswordRef = "vault:secret/prod/ssh#password"
+	c.SSHCA = &config.SSHCA{Mount: "ssh-client-signer", Role: "ops"}
+	cfg.Credentials["ssh-key"] = c
+
+	got := find(t, runDoctor(t, cfg, ""), ScopeCredential, "ssh-key", "자격증명")
+	if got.Status != Fail || !strings.Contains(got.Detail, "secret/prod/ssh#password") || !strings.Contains(got.Detail, "ssh_ca sign") {
+		t.Fatalf("missing key and denied CA role must both be reported: %+v", got)
+	}
+	if strings.Contains(got.Detail, "passphrase") {
+		t.Fatalf("readable reference must not be reported: %+v", got)
+	}
+	if !strings.Contains(got.Hint, "sign/<role>") {
+		t.Fatalf("hint should point at the vault policy: %+v", got)
 	}
 }

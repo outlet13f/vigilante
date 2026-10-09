@@ -1,7 +1,8 @@
 # vigilante.yaml — reference configuration covering every supported layer:
 #   bare-metal / on-prem Linux (SSH), vSphere / Nutanix / KVM VMs, AWS EC2,
 #   standalone Docker/Podman containers, Nginx / HAProxy / Envoy / F5 / AWS ALB.
-# Secrets are never inline: they are read from environment variables or files.
+# Secrets are never inline: they are Vault / env / file references (*_ref) or
+# environment variables (*_env).
 version: v1
 
 server:
@@ -17,16 +18,25 @@ agent:
   failsafe_after: 30s
   failsafe: hold                           # hold | rollback (agent may roll back its own host if the orchestrator is gone)
 
+secrets:
+  cache_ttl: 5m
+  vault:
+    address: https://vault.example.internal:8200
+    auth: approle
+    role_id_env: VAULT_ROLE_ID
+    secret_id_env: VAULT_SECRET_ID
+
 credentials:
   ssh-deploy:
     type: ssh
     user: deploy
-    private_key_file: ~/.ssh/vigilante_ed25519
+    ssh_ca: {mount: ssh-client-signer, role: vigilante, ttl: 30m}   # short-lived certificate per run
+    private_key_file: ~/.ssh/vigilante_ed25519                       # fallback when Vault is unreachable
     known_hosts_file: ~/.ssh/known_hosts
   f5-admin:
     type: basic
-    username_env: F5_USER
-    password_env: F5_PASSWORD
+    user: vigilante-svc
+    password_ref: "vault:secret/prod/f5#password"
   vcenter:
     type: basic
     username_env: VC_USER

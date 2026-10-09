@@ -14,6 +14,7 @@ import (
 	"vigilante/internal/metrics"
 	"vigilante/internal/model"
 	"vigilante/internal/rules"
+	"vigilante/internal/telemetry"
 )
 
 // Phase is the fully resolved input of one observation phase.
@@ -212,7 +213,9 @@ func (e *Engine) Run(ctx context.Context) Outcome {
 		if now.Before(warmupEnd) {
 			continue
 		}
+		evalStart := time.Now()
 		last = e.Evaluate(now)
+		telemetry.Evaluation.Since(evalStart)
 		out.Evals++
 		for _, w := range last.Warn {
 			if k := w.Rule + "|" + w.Target; !seenWarn[k] {

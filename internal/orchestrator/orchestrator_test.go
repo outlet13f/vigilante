@@ -21,6 +21,7 @@ import (
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/safety"
+	"vigilante/internal/store"
 	"vigilante/internal/transport"
 )
 
@@ -173,6 +174,8 @@ type opts struct {
 	escFails   bool
 	journal    string
 	app1, app2 *fakeApp
+	store      store.Store // shared state store (HA tests); default: file journal
+	owner      string
 }
 
 func newHarness(t *testing.T, o opts) *harness {
@@ -226,7 +229,7 @@ func newHarness(t *testing.T, o opts) *harness {
 	if os.Getenv("VIGILANTE_TEST_LOG") != "" {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
-	e, err := New(cfg, Options{Log: log, Runners: func(target string) (transport.Runner, error) {
+	e, err := New(cfg, Options{Log: log, Store: o.store, Owner: o.owner, Runners: func(target string) (transport.Runner, error) {
 		if target == "lb-1" {
 			return h.lb, nil
 		}
@@ -370,8 +373,8 @@ func TestResumeSkipsCompletedSteps(t *testing.T) {
 	d.Targets = []string{"app-1"}
 	h.e.setState(d, model.StateRollingBack, "rollback in progress")
 	// Simulate a crash after the drain and the symlink switch completed.
-	h.e.Journal.Append(journal.Entry{Kind: journal.KindStepDone, DeployID: "r1", Target: "app-1", Step: 0})
-	h.e.Journal.Append(journal.Entry{Kind: journal.KindStepDone, DeployID: "r1", Target: "app-1", Step: 1})
+	h.e.Journal.Append(context.Background(), journal.Entry{Kind: journal.KindStepDone, DeployID: "r1", Target: "app-1", Step: 0})
+	h.e.Journal.Append(context.Background(), journal.Entry{Kind: journal.KindStepDone, DeployID: "r1", Target: "app-1", Step: 1})
 	h.e.Close()
 
 	// The LB still has app-1 drained from the interrupted attempt.
