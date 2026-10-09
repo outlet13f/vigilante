@@ -116,7 +116,7 @@ server:
 `
 	cases := map[string]string{
 		"  ha: {enabled: true, advertise_url: http://n1}\n":                                                   "requires server.state.backend: postgres",
-		"  state: {backend: postgres}\n":                                                                      "postgres needs dsn or dsn_env",
+		"  state: {backend: postgres}\n":                                                                      "postgres needs dsn, dsn_env or dsn_ref",
 		"  state: {backend: etcd}\n":                                                                          "must be file|postgres",
 		"  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true}\n":                                  "advertise_url required",
 		"  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true, advertise_url: u, lease_ttl: 1s}\n": "at least 3s",
@@ -164,5 +164,56 @@ auth:
 	}
 	if _, err := Parse([]byte(base + "  four_eyes: true\n  service_accounts: [{name: ci, token_sha256: " + h + ", expires: 2027-01-31, roles: [{role: deployer, scope: team=payments}]}]\n")); err != nil {
 		t.Fatalf("valid auth block: %v", err)
+	}
+}
+
+func TestSecretsValidation(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x}
+`
+	vault := "secrets: {vault: {address: https://vault:8200}}\n"
+	cases := map[string]string{
+		"credentials: {f5: {type: basic, password_ref: secret/f5}}\n":                        "must be vault:<mount>/<path>#<key>",
+		"credentials: {f5: {type: basic, password_ref: \"vault:secret#pw\"}}\n" + vault:      "must be vault:",
+		"credentials: {f5: {type: basic, password_ref: \"vault:secret/prod/f5\"}}\n" + vault: "must be vault:",
+		"credentials: {f5: {type: basic, password_ref: \"vault:secret/prod/f5#pw\"}}\n":      "secrets.vault: required",
+		"credentials: {k: {type: ssh, user: u, ssh_ca: {mount: ssh}}}\n" + vault:             "mount and role are required",
+		"credentials: {k: {type: basic, ssh_ca: {mount: ssh, role: r}}}\n" + vault:           "only for type ssh",
+		"secrets: {vault: {auth: token}}\n":                                                  "address required",
+		"secrets: {vault: {address: a, auth: approle}}\n":                                    "role_id_env and secret_id_env",
+		"secrets: {vault: {address: a, auth: kubernetes}}\n":                                 "k8s_role",
+		"secrets: {vault: {address: a, auth: ldap}}\n":                                       "token, approle or kubernetes",
+		"server: {state: {backend: postgres, dsn_ref: \"vault:db/creds\"}}\n" + vault:        "server.state.dsn_ref",
+	}
+	for tail, want := range cases {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	ok := base + `credentials:
+  f5: {type: basic, user: admin, password_ref: "vault:secret/prod/f5#password"}
+  k: {type: ssh, user: deploy, ssh_ca: {mount: ssh-client-signer, role: ops, ttl: 15m}}
+  tok: {type: token, token_ref: "file:/run/secrets/token"}
+secrets: {cache_ttl: 2m, vault: {address: https://vault:8200, auth: approle, role_id_env: R, secret_id_env: S}}
+`
+	c, err := Parse([]byte(ok))
+	if err != nil {
+		t.Fatalf("valid secrets block: %v", err)
+	}
+	if c.Credentials["k"].SSHCA.TTL != 15*time.Minute || c.Secrets.CacheTTL != 2*time.Minute {
+		t.Fatalf("parsed: %+v %+v", c.Credentials["k"].SSHCA, c.Secrets)
+	}
+	for ref, want := range map[string]bool{"env:X": true, "env:": false, "file:/a": true, "vault:kv/a/b#k": true, "vault:kv#k": false, "x:y": false} {
+		if ValidRef(ref) != want {
+			t.Errorf("ValidRef(%q) != %v", ref, want)
+		}
 	}
 }

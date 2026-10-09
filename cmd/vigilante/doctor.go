@@ -8,7 +8,6 @@ import (
 	"os"
 	"time"
 
-	"vigilante/internal/config"
 	"vigilante/internal/doctor"
 	"vigilante/internal/transport"
 )
@@ -21,7 +20,7 @@ func cmdDoctor(ctx context.Context, args []string) (int, error) {
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}

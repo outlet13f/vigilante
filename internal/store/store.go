@@ -20,6 +20,7 @@ import (
 
 	"vigilante/internal/config"
 	"vigilante/internal/journal"
+	"vigilante/internal/secrets"
 )
 
 // ErrFenced is returned by Append when the store is fenced to a lease this
@@ -80,7 +81,14 @@ func Open(ctx context.Context, cfg *config.Config) (Store, error) {
 		return OpenFile(cfg.Server.JournalPath)
 	case "postgres":
 		dsn := st.DSN
-		if st.DSNEnv != "" {
+		switch {
+		case st.DSNRef != "":
+			v, err := secrets.Resolve(ctx, st.DSNRef)
+			if err != nil {
+				return nil, fmt.Errorf("server.state: %w", err)
+			}
+			dsn = v
+		case st.DSNEnv != "":
 			dsn = os.Getenv(st.DSNEnv)
 		}
 		if dsn == "" {

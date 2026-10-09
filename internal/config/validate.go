@@ -538,8 +538,8 @@ func (c *Config) Validate() error {
 	switch st := c.Server.State; st.Backend {
 	case "file":
 	case "postgres":
-		if st.DSN == "" && st.DSNEnv == "" {
-			bad("server.state: postgres needs dsn or dsn_env")
+		if st.DSN == "" && st.DSNEnv == "" && st.DSNRef == "" {
+			bad("server.state: postgres needs dsn, dsn_env or dsn_ref")
 		}
 	default:
 		bad("server.state.backend must be file|postgres, got %q", st.Backend)
@@ -556,6 +556,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	c.validateAuth(services, bad)
+	c.validateSecrets(bad)
 	if sl := c.Audit.Syslog; sl != nil {
 		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
 			bad("audit.syslog.address must be tcp://host:port or udp://host:port")
@@ -588,7 +589,7 @@ func validateProbe(p Probe) error {
 		"docker":     p.Docker != nil && p.Docker.Container != "",
 		"log":        p.Log != nil && p.Log.Path != "" && len(p.Log.Patterns) > 0,
 		"access_log": p.AccessLog != nil && p.AccessLog.Path != "",
-		"db":         p.DB != nil && (p.DB.DSN != "" || p.DB.DSNEnv != "") && (p.DB.Driver == "postgres" || p.DB.Driver == "mysql"),
+		"db":         p.DB != nil && (p.DB.DSN != "" || p.DB.DSNEnv != "" || p.DB.DSNRef != "") && (p.DB.Driver == "postgres" || p.DB.Driver == "mysql"),
 	}
 	if !need[p.Type] {
 		return fmt.Errorf("missing or invalid %q settings block", p.Type)
@@ -733,5 +734,82 @@ func (c *Config) validateAuth(services map[string]bool, bad func(string, ...any)
 	}
 	if len(a.RoleBindings) > 0 && a.OIDC == nil {
 		bad("auth.role_bindings: map OIDC groups/users, so auth.oidc is required")
+	}
+}
+
+// ValidRef reports whether s is a secret reference this build understands.
+func ValidRef(s string) bool {
+	switch {
+	case strings.HasPrefix(s, "env:"):
+		return len(s) > 4
+	case strings.HasPrefix(s, "file:"):
+		return len(s) > 5
+	case strings.HasPrefix(s, "vault:"):
+		path, key, ok := strings.Cut(strings.TrimPrefix(s, "vault:"), "#")
+		mount, rest, ok2 := strings.Cut(path, "/")
+		return ok && ok2 && key != "" && mount != "" && rest != ""
+	}
+	return false
+}
+
+func (c *Config) validateSecrets(bad func(string, ...any)) {
+	usesVault := false
+	check := func(where, ref string) {
+		if ref == "" {
+			return
+		}
+		if !ValidRef(ref) {
+			bad("%s: %q must be vault:<mount>/<path>#<key>, env:NAME or file:/path", where, ref)
+		}
+		if strings.HasPrefix(ref, "vault:") {
+			usesVault = true
+		}
+	}
+	for name, cr := range c.Credentials {
+		w := "credentials." + name
+		check(w+".username_ref", cr.UsernameRef)
+		check(w+".password_ref", cr.PasswordRef)
+		check(w+".token_ref", cr.TokenRef)
+		check(w+".passphrase_ref", cr.PassphraseRef)
+		check(w+".private_key_ref", cr.PrivateKeyRef)
+		if cr.SSHCA != nil {
+			usesVault = true
+			if cr.Type != "ssh" {
+				bad("%s.ssh_ca: only for type ssh", w)
+			}
+			if cr.SSHCA.Mount == "" || cr.SSHCA.Role == "" {
+				bad("%s.ssh_ca: mount and role are required", w)
+			}
+		}
+	}
+	check("server.state.dsn_ref", c.Server.State.DSNRef)
+	for _, s := range c.Services {
+		for _, p := range s.Probes {
+			if p.DB != nil {
+				check("service "+s.Name+" probe "+p.ID+" dsn_ref", p.DB.DSNRef)
+			}
+		}
+	}
+	v := c.Secrets.Vault
+	if usesVault && v == nil {
+		bad("secrets.vault: required by vault: references or ssh_ca")
+	}
+	if v != nil {
+		if v.Address == "" {
+			bad("secrets.vault.address required")
+		}
+		switch v.Auth {
+		case "", "token":
+		case "approle":
+			if v.RoleIDEnv == "" || v.SecretIDEnv == "" {
+				bad("secrets.vault: approle needs role_id_env and secret_id_env")
+			}
+		case "kubernetes":
+			if v.K8sRole == "" {
+				bad("secrets.vault: kubernetes auth needs k8s_role")
+			}
+		default:
+			bad("secrets.vault.auth must be token, approle or kubernetes")
+		}
 	}
 }

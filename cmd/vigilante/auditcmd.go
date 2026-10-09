@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"vigilante/internal/audit"
-	"vigilante/internal/config"
 	"vigilante/internal/journal"
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/store"
@@ -44,7 +43,7 @@ func cmdAudit(ctx context.Context, args []string) (int, error) {
 		r, err := audit.VerifyFile(*file)
 		return reportVerify(r, err, *file)
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}

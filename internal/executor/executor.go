@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"vigilante/internal/config"
+	"vigilante/internal/secrets"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -169,21 +170,29 @@ func basicAuth(creds map[string]config.Credential, name string) (user, pass stri
 	if !ok {
 		return "", "", fmt.Errorf("unknown credential %q", name)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	user = c.User
-	if c.UsernameEnv != "" {
-		user = os.Getenv(c.UsernameEnv)
+	if c.UsernameRef != "" || c.UsernameEnv != "" {
+		if user, err = secrets.Value(ctx, c.UsernameRef, c.UsernameEnv); err != nil {
+			return "", "", err
+		}
 	}
-	if c.PasswordEnv != "" {
-		pass = os.Getenv(c.PasswordEnv)
+	if pass, err = secrets.Value(ctx, c.PasswordRef, c.PasswordEnv); err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
 
 func bearer(creds map[string]config.Credential, name string) string {
-	if c, ok := creds[name]; ok && c.TokenEnv != "" {
-		return os.Getenv(c.TokenEnv)
+	c, ok := creds[name]
+	if !ok {
+		return ""
 	}
-	return ""
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	v, _ := secrets.Value(ctx, c.TokenRef, c.TokenEnv)
+	return v
 }
 
 // Finding is one read-only pre-flight check result (`vigilante doctor`).

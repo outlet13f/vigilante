@@ -7,6 +7,8 @@ package doctor
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -18,9 +20,12 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"vigilante/internal/config"
 	"vigilante/internal/executor"
 	"vigilante/internal/probe"
+	"vigilante/internal/secrets"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -96,7 +101,7 @@ func Run(ctx context.Context, cfg *config.Config, opt Options) ([]Check, error) 
 	var jobs []func(context.Context) []Check
 
 	targets := d.involvedTargets(services)
-	jobs = append(jobs, func(context.Context) []Check { return d.credentials(targets, services) })
+	jobs = append(jobs, func(ctx context.Context) []Check { return d.credentials(ctx, targets, services) })
 	for _, tn := range targets {
 		tn := tn
 		jobs = append(jobs, func(ctx context.Context) []Check { return d.target(ctx, tn) })
@@ -208,7 +213,7 @@ func (d *run) involvedTargets(services []*config.Service) []string {
 	return out
 }
 
-func (d *run) credentials(targets []string, services []*config.Service) []Check {
+func (d *run) credentials(ctx context.Context, targets []string, services []*config.Service) []Check {
 	used := map[string]bool{}
 	for _, tn := range targets {
 		if t, ok := d.cfg.Target(tn); ok && t.Connection.Credential != "" {
@@ -247,6 +252,19 @@ func (d *run) credentials(targets []string, services []*config.Service) []Check 
 				problems = append(problems, "환경변수 "+env+" 비어 있음")
 			}
 		}
+		for _, ref := range []string{c.UsernameRef, c.PasswordRef, c.TokenRef, c.PassphraseRef, c.PrivateKeyRef} {
+			if ref == "" {
+				continue
+			}
+			if _, err := secrets.Resolve(ctx, ref); err != nil {
+				problems = append(problems, err.Error())
+			}
+		}
+		if c.SSHCA != nil {
+			if err := checkSSHCA(ctx, *c.SSHCA, c.User); err != nil {
+				problems = append(problems, err.Error())
+			}
+		}
 		if c.PrivateKeyFile != "" {
 			if _, err := os.Stat(expandHome(c.PrivateKeyFile)); err != nil {
 				problems = append(problems, "키 파일 "+c.PrivateKeyFile+" 없음")
@@ -263,12 +281,27 @@ func (d *run) credentials(targets []string, services []*config.Service) []Check 
 		}
 		if len(problems) > 0 {
 			out = append(out, Check{Scope: ScopeCredential, Subject: n, Name: "자격증명 값", Status: Fail, Detail: strings.Join(problems, ", "),
-				Hint: "비밀값은 설정 파일이 아니라 실행 환경(CI 시크릿, 서비스 환경파일)에 넣어야 합니다"})
+				Hint: "비밀값은 설정 파일이 아니라 Vault(*_ref) 또는 실행 환경(CI 시크릿, 서비스 환경파일)에 넣어야 합니다. Vault 오류면 정책이 해당 경로 read(SSH CA는 sign/<role> update)를 허용하는지 확인하세요"})
 		} else {
 			out = append(out, Check{Scope: ScopeCredential, Subject: n, Name: "자격증명 값", Status: OK, Detail: c.Type})
 		}
 	}
 	return out
+}
+
+// checkSSHCA signs a throwaway key: proves the Vault policy allows the role
+// without touching any target.
+func checkSSHCA(ctx context.Context, ca config.SSHCA, user string) error {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	s, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return err
+	}
+	_, err = secrets.SignSSHKey(ctx, ca, user, s.PublicKey())
+	return err
 }
 
 func credOf(v *config.VSphereExec) string {

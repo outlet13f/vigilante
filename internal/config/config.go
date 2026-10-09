@@ -28,6 +28,7 @@ type Config struct {
 	PresetDirs []string `yaml:"preset_dirs"`
 	Auth       Auth     `yaml:"auth"`
 	Audit      Audit    `yaml:"audit"`
+	Secrets    Secrets  `yaml:"secrets"`
 }
 
 // Audit configures where audit records go besides the journal itself.
@@ -107,6 +108,7 @@ type State struct {
 	Backend string `yaml:"backend"` // file | postgres
 	DSN     string `yaml:"dsn"`     // avoid inline passwords; prefer dsn_env
 	DSNEnv  string `yaml:"dsn_env"`
+	DSNRef  string `yaml:"dsn_ref"` // vault:/env:/file: reference
 }
 
 // HA runs several `vigilante server` nodes against one postgres state store:
@@ -144,6 +146,46 @@ type Credential struct {
 	UseAgent          bool   `yaml:"use_ssh_agent"`
 	Region            string `yaml:"region"`
 	Profile           string `yaml:"profile"`
+
+	// Secret references (preferred over *_env): "vault:<mount>/<path>#<key>",
+	// "env:NAME" or "file:/path". Resolved at use, cached in memory only.
+	UsernameRef   string `yaml:"username_ref"`
+	PasswordRef   string `yaml:"password_ref"`
+	TokenRef      string `yaml:"token_ref"`
+	PassphraseRef string `yaml:"passphrase_ref"`
+	PrivateKeyRef string `yaml:"private_key_ref"` // PEM key content
+	// SSHCA: short-lived SSH certificates from Vault's SSH secrets engine
+	// instead of a long-lived private key.
+	SSHCA *SSHCA `yaml:"ssh_ca"`
+}
+
+// SSHCA asks Vault to sign an ephemeral in-memory key for each connection set.
+type SSHCA struct {
+	Mount      string        `yaml:"mount"` // e.g. ssh-client-signer
+	Role       string        `yaml:"role"`
+	TTL        time.Duration `yaml:"ttl"`        // default 30m
+	Principals []string      `yaml:"principals"` // default [user]
+}
+
+// Secrets configures where *_ref values come from.
+type Secrets struct {
+	Vault    *Vault        `yaml:"vault"`
+	CacheTTL time.Duration `yaml:"cache_ttl"` // default 5m
+}
+
+// Vault is a HashiCorp Vault server holding KV v2 secrets and the SSH CA.
+type Vault struct {
+	Address   string `yaml:"address"`
+	Namespace string `yaml:"namespace"` // Vault Enterprise
+	CAFile    string `yaml:"ca_file"`
+	// Auth: token | approle | kubernetes.
+	Auth        string `yaml:"auth"`
+	TokenEnv    string `yaml:"token_env"`     // token auth (default VAULT_TOKEN)
+	RoleIDEnv   string `yaml:"role_id_env"`   // approle
+	SecretIDEnv string `yaml:"secret_id_env"` // approle
+	K8sRole     string `yaml:"k8s_role"`      // kubernetes
+	K8sJWTPath  string `yaml:"k8s_jwt_path"`  // default service account token path
+	AuthMount   string `yaml:"auth_mount"`    // default approle / kubernetes
 }
 
 // Target is one machine or container host the engine observes or controls.
@@ -372,6 +414,7 @@ type DBProbe struct {
 	Driver   string `yaml:"driver"` // postgres | mysql
 	DSN      string `yaml:"dsn"`    // template; may reference {{env "X"}}
 	DSNEnv   string `yaml:"dsn_env"`
+	DSNRef   string `yaml:"dsn_ref"` // vault:/env:/file: reference
 	PoolSize int    `yaml:"pool_size"`
 	Query    string `yaml:"query"`
 }

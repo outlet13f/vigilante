@@ -33,6 +33,7 @@ safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼�
 notify:      [...]   # 알림
 auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
 audit:       {...}   # SIEM 전송(syslog)과 보존 기간
+secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 ```
 
 ## `server`
@@ -45,7 +46,7 @@ audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 | `journal_path` | `vigilante-journal.jsonl` | `state.backend: file`일 때의 WAL 저널. **CI 단발 실행 간 서킷/플래핑 이력 공유를 위해 공유 경로 권장**. 같은 디렉토리에 리스(락) 파일 생성 |
 | `dry_run` | `false` | 모든 변경 액션을 로그로만 출력 (읽기 전용 명령·체크포인트는 실행) |
 | `state.backend` | `file` | `file`(단일 노드·CI) \| `postgres`(여러 노드가 공유, HA 전제) |
-| `state.dsn_env` / `state.dsn` | — | PostgreSQL 접속 문자열. 비밀번호가 들어가므로 `dsn_env` 권장. 스키마는 시작 시 자동 마이그레이션 |
+| `state.dsn_ref` / `state.dsn_env` / `state.dsn` | — | PostgreSQL 접속 문자열. 비밀번호가 들어가므로 `dsn_ref`(Vault) 또는 `dsn_env` 권장. 스키마는 시작 시 자동 마이그레이션 |
 | `ha.enabled` | `false` | 여러 `vigilante server` 노드 중 하나만 리더로 동작. `postgres` 필수 |
 | `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달 |
 | `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름 |
@@ -73,10 +74,35 @@ server:
 
 | `type` | 사용 키 |
 |---|---|
-| `ssh` | `user`, `private_key_file`, `passphrase_env`, `password_env`, `use_ssh_agent`, `known_hosts_file`(기본 `~/.ssh/known_hosts`), `insecure_ignore_host_key` |
-| `basic` | `username_env` (또는 `user`), `password_env` — F5, vCenter, Prism, 웹훅 |
-| `token` | `token_env` — 웹훅 Bearer |
+| `ssh` | `user`, `ssh_ca`(권장), `private_key_ref` 또는 `private_key_file`, `passphrase_ref`/`passphrase_env`, `password_ref`/`password_env`, `use_ssh_agent`, `known_hosts_file`(기본 `~/.ssh/known_hosts`), `insecure_ignore_host_key` |
+| `basic` | `username_ref`/`username_env` (또는 `user`), `password_ref`/`password_env` — F5, vCenter, Prism, 웹훅 |
+| `token` | `token_ref`/`token_env` — 웹훅 Bearer |
 | `aws` | `region`, `profile` — 나머지는 AWS 기본 자격증명 체인(IAM Role 권장) |
+
+`*_ref`는 비밀값 참조입니다. `*_env`보다 우선하며 형식은 세 가지입니다.
+
+| 참조 | 예 | 값의 출처 |
+|---|---|---|
+| `vault:<mount>/<path>#<key>` | `vault:secret/prod/f5#password` | Vault KV v2 (`secrets.vault` 필요) |
+| `env:NAME` | `env:F5_PASSWORD` | 환경변수 |
+| `file:/path` | `file:/run/secrets/f5-password` | 파일 내용(Kubernetes Secret 마운트 등). 끝 줄바꿈 제거 |
+
+### `ssh_ca` — 단기 SSH 인증서
+
+장기 개인키를 대상 서버마다 배포하는 대신, Vault SSH CA가 접속할 때마다 단기 인증서를 발급합니다.
+
+```yaml
+credentials:
+  ssh-deploy:
+    type: ssh
+    user: deploy
+    ssh_ca: {mount: ssh-client-signer, role: vigilante, ttl: 30m}   # principals 기본값: [user]
+```
+
+- vigilante는 메모리에서 일회용 ed25519 키를 만들고 공개키만 Vault `POST <mount>/sign/<role>`로 보내 서명받습니다. 개인키는 디스크에 남지 않습니다.
+- 인증서는 수명의 80%가 지나면 새 키로 다시 발급합니다. 그 전까지 새 연결은 같은 인증서를 씁니다.
+- 대상 서버 sshd는 CA 공개키만 신뢰하면 됩니다(`TrustedUserCAKeys`). 인증서의 principal이 로그인 사용자와 같아야 합니다.
+- `ssh_ca`와 개인키를 함께 지정하면 인증서를 먼저 시도합니다.
 
 ## `targets[]`
 
@@ -346,6 +372,36 @@ audit:
 - **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
 - **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
 - **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+
+## `secrets` — 비밀값 출처
+
+```yaml
+secrets:
+  cache_ttl: 5m                       # 해석한 값을 메모리에 두는 시간 (기본 5m)
+  vault:
+    address: https://vault.example.internal:8200
+    namespace: ops                    # Vault Enterprise 네임스페이스 (선택)
+    ca_file: /etc/vigilante/vault-ca.pem
+    auth: approle                     # token | approle | kubernetes
+    role_id_env: VAULT_ROLE_ID        # approle
+    secret_id_env: VAULT_SECRET_ID    # approle
+    # token_env: VAULT_TOKEN          # token (기본 VAULT_TOKEN)
+    # k8s_role: vigilante             # kubernetes; JWT는 서비스 계정 토큰 파일
+    # auth_mount: approle             # 로그인 경로가 기본값과 다를 때
+```
+
+- **로그인:** `approle`과 `kubernetes`는 처음 쓸 때 로그인하고, 토큰 만료 30초 전에 다시 로그인합니다. 토큰이 먼저 폐기돼 403이 오면 한 번 다시 로그인해 재시도합니다.
+- **보관:** 비밀값은 메모리 캐시에만 둡니다. 설정 파일, 저널, 감사 기록에는 참조 문자열만 남습니다.
+- **로그 가림:** 한 번이라도 해석한 값(6자 이상)은 로그 메시지·속성·오류 문자열에서 `[REDACTED]`로 바뀝니다. `*_env`로 읽은 값도 같습니다.
+- **Vault 정책 예:** 필요한 권한은 KV 읽기와 SSH 서명뿐입니다.
+
+```hcl
+path "secret/data/prod/*"            { capabilities = ["read"] }
+path "ssh-client-signer/sign/vigilante" { capabilities = ["update"] }
+```
+
+- **사전 점검:** `vigilante doctor`가 사용하는 모든 `*_ref`를 실제로 해석하고, `ssh_ca`는 일회용 키로 서명을 받아 봅니다. 정책이 막혀 있으면 롤백 전에 드러납니다.
+- **장애 시:** Vault가 응답하지 않으면 그 자격증명이 필요한 프로브·실행기만 실패합니다. 캐시에 남은 값은 `cache_ttl` 동안 계속 쓰입니다. 롤백 경로가 Vault에 의존하지 않게 하려면 캐시 시간을 관측 창보다 길게 두십시오.
 
 ## `notify[]`
 

@@ -5,7 +5,7 @@
 | 마일스톤 | 상태 | 비고 |
 |---|---|---|
 | 1단계 프로토타입 | 완료 | 커밋 `d1e6411`. 설계는 docs/01~04 |
-| M0 기반 | **진행 중** | 결정 확정: PostgreSQL, OIDC + 서비스 계정 토큰, Vault. **M0-1 상태 저장소·HA**, **M0-2 인증·권한**, **M0-4 감사** 완료. 다음 M0-3 비밀관리 |
+| M0 기반 | **진행 중** | 결정 확정: PostgreSQL, OIDC + 서비스 계정 토큰, Vault. **M0-1 상태 저장소·HA**, **M0-2 인증·권한**, **M0-4 감사**, **M0-3 비밀관리** 완료. 다음 M0-5 자체 관측성 |
 | **M1 입력 간소화** | **완료** | 커밋 `2a2ab09`(M1-1), `c6ab1d6`(M1-2), `50806e1`(M1-3), [PR #1](https://github.com/outlet13f/vigilante/pull/1)로 master에 병합(`f877c88`). 범위 차이는 M1 절 참고 |
 | M2 ~ M6 | 미착수 | 일정은 모두 추정 |
 
@@ -105,6 +105,8 @@
 - **SSH 인증서 인증:** Vault SSH CA로 단기 인증서를 발급받아 접속하도록 지원한다. 장기 개인키 배포를 없앨 수 있다.
 - 비밀값은 메모리에만 두고 TTL 캐시를 쓴다. 로그, 저널, support bundle에서는 자동으로 가린다.
 
+> **구현 결과(M0-3):** 별도 `password: {secret: ...}` 객체 대신 기존 키 옆에 `*_ref`(`password_ref`, `token_ref`, `private_key_ref`, `dsn_ref` 등)를 두었다. 형식은 `vault:<mount>/<path>#<key>`, `env:NAME`, `file:/path`이고 `*_env`보다 우선한다. Vault는 token·AppRole·Kubernetes 로그인, 네임스페이스, 사설 CA, 403 시 재로그인을 지원한다. `ssh_ca`는 메모리의 일회용 ed25519 키를 Vault SSH CA로 서명받아 접속하고, 수명의 80%가 지나면 다시 발급한다. 해석한 값은 로그에서 `[REDACTED]`로 가린다. `doctor`가 모든 참조를 실제로 해석하고 SSH CA 서명 권한을 점검한다. CyberArk는 수요 확인 후 같은 참조 형식(`cyberark:`)으로 추가한다.
+
 ### M0-4. 감사·컴플라이언스
 - 저널 이벤트에 `actor`, `source`(cli/api/ui/agent/system), `reason`, `ticket`을 추가한다.
 - **해시 체인:** 각 이벤트가 직전 이벤트 해시를 포함하게 해 변조를 검출한다. `vigilante audit verify`로 체인을 검증한다.
@@ -126,7 +128,7 @@
 |---|---|---|
 | M1-1 입력 자동 채우기 | CI 환경변수에서 ID·버전, 저널에서 이전 버전, `mark-good`, 출처 출력·기록, 롤백 대상 미상 시 관측 전 거부, REST API 동일 동작 | `mark-good` 권한 제한(M0 RBAC) |
 | M1-2 규칙 프리셋 | 내장 4종, `preset_dirs` 조직 프리셋, `name@version` 고정, 항목별 병합, `presets` / `presets show` | 사내 프리셋 저장소 배포 방식(M2 GitOps) |
-| M1-3 doctor | 자격증명·접속·sudo·프로브·로그 형식·실행기·LB 풀·용량 점검, 조치 힌트, `--json`·`--junit` | Vault 경로 점검(M0-3), 서버 정기 실행·지표(M4·M0-5), 실제 sshd `MaxSessions` 조회(현재는 기본값 10과 비교) |
+| M1-3 doctor | 자격증명(Vault 참조·SSH CA 서명 권한 포함)·접속·sudo·프로브·로그 형식·실행기·LB 풀·용량 점검, 조치 힌트, `--json`·`--junit` | 서버 정기 실행·지표(M4·M0-5), 실제 sshd `MaxSessions` 조회(현재는 기본값 10과 비교) |
 
 ### 원래 계획
 

@@ -12,19 +12,30 @@ import (
 	"sync"
 	"time"
 
+	"crypto/ed25519"
+	"crypto/rand"
+
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"vigilante/internal/config"
+	"vigilante/internal/secrets"
 )
 
 // Manager hands out Runners per target and pools SSH connections so that a
 // hundred probes on one host share a single TCP/SSH session.
 type Manager struct {
-	cfg *config.Config
-	mu  sync.Mutex
-	ssh map[string]*sshConn
+	cfg   *config.Config
+	mu    sync.Mutex
+	ssh   map[string]*sshConn
+	certs map[string]*caCert // credential name -> current SSH certificate
+}
+
+// caCert is an ephemeral key with a Vault-signed certificate.
+type caCert struct {
+	signer ssh.Signer
+	until  time.Time
 }
 
 func NewManager(cfg *config.Config) *Manager {
@@ -124,17 +135,41 @@ func (m *Manager) client(ctx context.Context, t *config.Target) (*ssh.Client, er
 
 func (m *Manager) clientConfig(t *config.Target) (*ssh.ClientConfig, error) {
 	cred := m.cfg.Credentials[t.Connection.Credential]
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	var auths []ssh.AuthMethod
-	if cred.PrivateKeyFile != "" {
-		key, err := os.ReadFile(expandHome(cred.PrivateKeyFile))
+	if cred.SSHCA != nil {
+		signer, err := m.caSigner(ctx, t.Connection.Credential, cred)
+		if err != nil {
+			return nil, err
+		}
+		auths = append(auths, ssh.PublicKeys(signer))
+	}
+	var keyPEM []byte
+	switch {
+	case cred.PrivateKeyRef != "":
+		v, err := secrets.Resolve(ctx, cred.PrivateKeyRef)
+		if err != nil {
+			return nil, err
+		}
+		keyPEM = []byte(v)
+	case cred.PrivateKeyFile != "":
+		b, err := os.ReadFile(expandHome(cred.PrivateKeyFile))
 		if err != nil {
 			return nil, fmt.Errorf("read private key: %w", err)
 		}
+		keyPEM = b
+	}
+	if keyPEM != nil {
+		pass, err := secrets.Value(ctx, cred.PassphraseRef, cred.PassphraseEnv)
+		if err != nil {
+			return nil, err
+		}
 		var signer ssh.Signer
-		if cred.PassphraseEnv != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(os.Getenv(cred.PassphraseEnv)))
+		if pass != "" {
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyPEM, []byte(pass))
 		} else {
-			signer, err = ssh.ParsePrivateKey(key)
+			signer, err = ssh.ParsePrivateKey(keyPEM)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("parse private key: %w", err)
@@ -148,8 +183,12 @@ func (m *Manager) clientConfig(t *config.Target) (*ssh.ClientConfig, error) {
 			}
 		}
 	}
-	if cred.PasswordEnv != "" {
-		auths = append(auths, ssh.Password(os.Getenv(cred.PasswordEnv)))
+	if cred.PasswordRef != "" || cred.PasswordEnv != "" {
+		pw, err := secrets.Value(ctx, cred.PasswordRef, cred.PasswordEnv)
+		if err != nil {
+			return nil, err
+		}
+		auths = append(auths, ssh.Password(pw))
 	}
 	if len(auths) == 0 {
 		return nil, fmt.Errorf("credential %q: no usable ssh auth method", t.Connection.Credential)
@@ -170,6 +209,46 @@ func (m *Manager) clientConfig(t *config.Target) (*ssh.ClientConfig, error) {
 		hostKey = cb
 	}
 	return &ssh.ClientConfig{User: cred.User, Auth: auths, HostKeyCallback: hostKey, Timeout: t.Connection.Timeout}, nil
+}
+
+// caSigner returns a cached certificate signer for the credential, asking
+// Vault to sign a fresh ephemeral ed25519 key when the current certificate
+// has used up 80% of its lifetime. No long-lived key exists on disk.
+func (m *Manager) caSigner(ctx context.Context, name string, cred config.Credential) (ssh.Signer, error) {
+	m.mu.Lock()
+	if c, ok := m.certs[name]; ok && time.Now().Before(c.until) {
+		m.mu.Unlock()
+		return c.signer, nil
+	}
+	m.mu.Unlock()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	keySigner, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := secrets.SignSSHKey(ctx, *cred.SSHCA, cred.User, keySigner.PublicKey())
+	if err != nil {
+		return nil, err
+	}
+	certSigner, err := ssh.NewCertSigner(cert, keySigner)
+	if err != nil {
+		return nil, err
+	}
+	start, end := time.Unix(int64(cert.ValidAfter), 0), time.Unix(int64(cert.ValidBefore), 0)
+	if cert.ValidAfter == 0 || cert.ValidBefore == ssh.CertTimeInfinity {
+		start, end = time.Now(), time.Now().Add(30*time.Minute)
+	}
+	until := start.Add(end.Sub(start) * 8 / 10)
+	m.mu.Lock()
+	if m.certs == nil {
+		m.certs = map[string]*caCert{}
+	}
+	m.certs[name] = &caCert{signer: certSigner, until: until}
+	m.mu.Unlock()
+	return certSigner, nil
 }
 
 func expandHome(p string) string {

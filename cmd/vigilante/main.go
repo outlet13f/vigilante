@@ -32,6 +32,7 @@ import (
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/probe"
 	"vigilante/internal/safety"
+	"vigilante/internal/secrets"
 	"vigilante/internal/store"
 )
 
@@ -93,7 +94,20 @@ func logger() *slog.Logger {
 	case "warn":
 		lvl = slog.LevelWarn
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	return slog.New(secrets.RedactHandler{Handler: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})})
+}
+
+// loadConfig reads vigilante.yaml and installs the secrets resolver it
+// describes, so *_ref values resolve from Vault / env / file afterwards.
+func loadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := secrets.Configure(cfg.Secrets); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 type common struct {
@@ -117,7 +131,7 @@ func newFlags(name string) *common {
 }
 
 func (c *common) engine() (*orchestrator.Engine, error) {
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +161,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		if err := c.fs.Parse(args); err != nil {
 			return 1, err
 		}
-		cfg, err := config.Load(c.config)
+		cfg, err := loadConfig(c.config)
 		if err != nil {
 			return 1, err
 		}
@@ -424,7 +438,7 @@ func cmdStatus(args []string) (int, error) {
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}
@@ -576,7 +590,7 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 	if c.srv == "" {
 		return 1, errors.New("agent: --server is required")
 	}
-	cfg, err := config.Load(c.config)
+	cfg, err := loadConfig(c.config)
 	if err != nil {
 		return 1, err
 	}
