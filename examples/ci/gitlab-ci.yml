@@ -27,7 +27,12 @@ stages: [validate, canary, full]
 validate:
   stage: validate
   image: registry.example.internal/tools/vigilante:0.1
-  script: [vigilante validate -c deploy/vigilante.yaml]
+  script:
+    - vigilante validate -c deploy/vigilante.yaml
+    - vigilante doctor -c deploy/vigilante.yaml --service "$SVC" --junit doctor.xml
+  artifacts:
+    when: always
+    reports: {junit: doctor.xml}
 
 canary:
   stage: canary

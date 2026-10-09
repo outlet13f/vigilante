@@ -30,6 +30,10 @@ APP_PID=$!
 trap 'kill $APP_PID 2>/dev/null' EXIT
 for _ in $(seq 1 50); do curl -fs "$APP_URL/health" >/dev/null && break; sleep 0.2; done
 
+say "pre-flight: vigilante doctor (access, logs, rollback path)"
+"$VIG" doctor -c "$CFG" 2>/dev/null | sed 's/^/   /'
+expect 0 "${PIPESTATUS[0]}" "pre-flight checks pass"
+
 say "0. register v1 as the known-good version (once, before the first pipeline run)"
 "$VIG" mark-good -c "$CFG" --service demo --version v1 2>/dev/null | sed 's/^/   /'
 

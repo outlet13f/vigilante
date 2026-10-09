@@ -51,6 +51,7 @@ Usage:
   vigilante circuit  -c FILE status|reset|trip [--reason TEXT] [--server URL]
   vigilante server   -c FILE [--dry-run]
   vigilante agent    -c FILE --target NAME --server URL
+  vigilante doctor   -c FILE [--service S] [--previous P] [--json] [--junit FILE]
   vigilante presets [list | show NAME[@V] [--set k=v]...] [--dir DIRS]
   vigilante plugins
   vigilante version
@@ -164,6 +165,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdMarkGood(args)
 	case "presets":
 		return cmdPresets(args)
+	case "doctor":
+		return cmdDoctor(ctx, args)
 	case "circuit":
 		return cmdCircuit(ctx, args)
 	case "server":

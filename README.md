@@ -26,6 +26,8 @@
 go build -o bin/vigilante ./cmd/vigilante          # CGO 불필요, 정적 바이너리
 bin/vigilante plugins                              # 등록된 프로브/실행기/트래픽 제어기
 bin/vigilante validate -c examples/config/vigilante.yaml
+bin/vigilante presets                              # 내장 규칙 프리셋과 파라미터
+bin/vigilante doctor -c vigilante.yaml             # 배포 전 읽기 전용 점검: 접속·sudo·로그 형식·이전 릴리스·LB 풀
 
 # 로컬 E2E 데모 (Linux/macOS/Git Bash): 불량 배포 자동 롤백 → 롤백 경로 고장 → 서킷 OPEN → 리셋 → 정상 배포
 ./examples/demo/run-demo.sh
@@ -58,7 +60,7 @@ vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--app
 
 ## 검증 현황
 
-- `go vet ./...`, `go test ./...` — 10개 패키지 테스트 통과 (vSphere는 govmomi `vcsim` 시뮬레이터, 그 외 외부 API는 httptest/mock)
+- `go vet ./...`, `go test ./...` — 14개 패키지 테스트 통과 (vSphere는 govmomi `vcsim` 시뮬레이터, 그 외 외부 API는 httptest/mock)
 - `examples/demo/run-demo.sh` — 실제 프로세스로 5개 시나리오 통과 (불량 v2 배포 후 약 4초 만에 탐지·롤백)
 - 정적 크로스 빌드: linux/amd64, linux/arm64, linux/ppc64le, windows/amd64 (`CGO_ENABLED=0`)
 

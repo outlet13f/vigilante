@@ -173,3 +173,13 @@ func isWholeDisk(dev string) bool {
 	}
 	return false
 }
+
+// Check reads /proc once (doctor, probe.verify).
+func (p *hostProbe) Check(ctx context.Context) error {
+	out, err := p.env.Runner.Run(ctx, hostCmd, nil)
+	if err != nil {
+		return err
+	}
+	_, _, err = parseHost(out, p.devices)
+	return err
+}

@@ -13,7 +13,14 @@ pipeline {
     VIG = 'vigilante -c /etc/vigilante/vigilante.yaml'
   }
   stages {
-    stage('Validate rollback config') { steps { sh "${VIG} validate" } }
+    stage('Validate rollback config') {
+      steps {
+        sh "${VIG} validate"
+        // Read-only pre-flight: SSH/sudo, logs, previous release, LB membership.
+        sh "${VIG} doctor --service ${SVC} --junit doctor.xml"
+      }
+      post { always { junit allowEmptyResults: true, testResults: 'doctor.xml' } }
+    }
     stage('Checkpoint + baseline') {
       steps {
         sh "${VIG} prepare  --service ${SVC}"
