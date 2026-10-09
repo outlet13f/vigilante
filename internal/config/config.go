@@ -24,6 +24,8 @@ type Config struct {
 	Services    []Service             `yaml:"services"`
 	Safety      Safety                `yaml:"safety"`
 	Notify      []Notifier            `yaml:"notify"`
+	// BaseDir is the directory of the config file (preset_dirs resolve against it).
+	BaseDir string `yaml:"-"`
 	// PresetDirs holds organisation presets (*.yaml), relative to this file.
 	PresetDirs []string `yaml:"preset_dirs"`
 	Auth       Auth     `yaml:"auth"`
@@ -551,6 +553,7 @@ func parse(raw []byte, baseDir string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+	c.BaseDir = baseDir
 	if err := c.expandPresets(baseDir); err != nil {
 		return nil, err
 	}

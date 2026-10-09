@@ -29,6 +29,8 @@ const (
 	KindStepDone      = "rollback.step"  // target finished plan step N
 	KindAudit         = "audit"          // who did what (API/CLI actions, denials)
 	KindAnchor        = "anchor"         // chain start after pruning: Hash = last pruned entry's hash
+	KindOperation     = "operation"      // API long-running operation snapshot
+	KindIdempotency   = "idempotency"    // response remembered for an Idempotency-Key
 )
 
 type Entry struct {
@@ -37,6 +39,8 @@ type Entry struct {
 	Service    string               `json:"service,omitempty"`
 	Deployment *model.Deployment    `json:"deployment,omitempty"`
 	Circuit    *safety.CircuitState `json:"circuit,omitempty"`
+	Operation  *model.Operation     `json:"operation,omitempty"`
+	Idem       *model.IdemRecord    `json:"idempotency,omitempty"`
 	DeployID   string               `json:"deployment_id,omitempty"`
 	Target     string               `json:"target,omitempty"`
 	Step       int                  `json:"step,omitempty"`
@@ -180,7 +184,9 @@ type State struct {
 	Circuit     *safety.CircuitState
 	Rollbacks   map[string][]time.Time    // service -> rollback start times
 	StepsDone   map[string]map[string]int // deployment -> target -> highest completed step index + 1
-	Corrupt     int                       // unparsable lines skipped (e.g. torn final write)
+	Operations  map[string]*model.Operation
+	Idempotency map[string]*model.IdemRecord // by IdemRecord.Key
+	Corrupt     int                          // unparsable lines skipped (e.g. torn final write)
 }
 
 // InFlight returns deployments whose rollback had started but not finished.
@@ -239,6 +245,28 @@ func Compact(pruned []Entry, cutoff time.Time) []Entry {
 			}
 		}
 	}
+	// Operations still running, and idempotency records young enough that a
+	// client may still retry.
+	opIDs := make([]string, 0, len(st.Operations))
+	for id := range st.Operations {
+		opIDs = append(opIDs, id)
+	}
+	sort.Strings(opIDs)
+	for _, id := range opIDs {
+		if op := st.Operations[id]; op.Status == model.OpRunning {
+			out = append(out, Entry{Kind: KindOperation, Time: op.CreatedAt, Operation: op})
+		}
+	}
+	keys := make([]string, 0, len(st.Idempotency))
+	for k := range st.Idempotency {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if r := st.Idempotency[k]; cutoff.Sub(r.CreatedAt) < model.IdemTTL {
+			out = append(out, Entry{Kind: KindIdempotency, Time: r.CreatedAt, Idem: r})
+		}
+	}
 	return out
 }
 
@@ -248,6 +276,8 @@ func NewState() *State {
 		Deployments: map[string]*model.Deployment{},
 		Rollbacks:   map[string][]time.Time{},
 		StepsDone:   map[string]map[string]int{},
+		Operations:  map[string]*model.Operation{},
+		Idempotency: map[string]*model.IdemRecord{},
 	}
 }
 
@@ -261,6 +291,14 @@ func (st *State) Apply(e Entry) {
 		}
 	case KindCircuit:
 		st.Circuit = e.Circuit
+	case KindOperation:
+		if e.Operation != nil {
+			st.Operations[e.Operation.ID] = e.Operation
+		}
+	case KindIdempotency:
+		if e.Idem != nil {
+			st.Idempotency[e.Idem.Key] = e.Idem
+		}
 	case KindRollbackStart:
 		st.Rollbacks[e.Service] = append(st.Rollbacks[e.Service], e.Time)
 	case KindAnchor:

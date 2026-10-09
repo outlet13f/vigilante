@@ -76,6 +76,9 @@ type Engine struct {
 	cancels     map[string]context.CancelFunc
 	lastEval    map[string]decision.Evaluation
 	inflight    []*model.Deployment
+	operations  map[string]*model.Operation
+	liveOps     map[string]bool // operations this node is running
+	idem        map[string]*model.IdemRecord
 }
 
 // ErrInactive is returned when this node may not act (HA follower or demoted leader).
@@ -148,6 +151,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 	guard.Leases, guard.Owner = e.Journal, e.owner
 	e.mu.Lock()
 	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
+	e.operations, e.idem = st.Operations, st.Idempotency
 	e.Breaker, e.Guard = breaker, guard
 	e.mu.Unlock()
 	return nil

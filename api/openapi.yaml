@@ -1,0 +1,1047 @@
+openapi: 3.1.0
+info:
+  title: Vigilante API
+  version: 2.0.0
+  summary: Deployment health gate and automatic rollback orchestrator.
+  description: |
+    The Vigilante API is the only interface of the server: the CLI remote mode,
+    the operations console and on-host agents use it like any integration.
+
+    **Versions.** `/v2` is the public contract. Minor releases only add
+    (fields, resources, optional parameters); a breaking change gets a new
+    major version. Retired endpoints carry `Deprecation` and `Sunset` headers
+    for at least six months. `/v1` remains for existing CI integrations.
+
+    **Errors.** Every v2 error is `application/problem+json` (RFC 9457) with a
+    stable machine-readable `code` and the `request_id` to quote to operators.
+
+    **Retries.** Send an `Idempotency-Key` header on every POST. A retry with
+    the same key and the same body returns the first response (marked
+    `Idempotent-Replayed: true`) instead of starting a second rollback. Keys
+    are kept for 24 hours per caller.
+
+    **Long-running work.** Observing a phase, rolling back, approving an
+    escalation and capturing a baseline answer `202 Accepted` with an
+    `Operation` and a `Location` header. Poll the operation until its
+    `status` is no longer `running`.
+
+    **Paging.** Lists return `{items, next_cursor}`. Pass `next_cursor` back as
+    `cursor` until it is null. Cursors are opaque.
+
+    **Time and IDs.** Timestamps are RFC 3339 in UTC. IDs are opaque strings.
+  contact:
+    name: Vigilante maintainers
+    url: https://github.com/outlet13f/vigilante
+  license:
+    name: Proprietary (internal use)
+    identifier: LicenseRef-Internal
+servers:
+  - url: https://vigilante.example.internal:8088
+    description: Any node of the cluster; followers forward to the leader.
+security:
+  - bearerAuth: []
+tags:
+  - name: deployments
+    description: Releases being watched, and the actions taken on them.
+  - name: operations
+    description: Progress of accepted long-running requests.
+  - name: services
+    description: Services, their targets and presets (read from configuration).
+  - name: safety
+    description: The global circuit breaker (emergency stop).
+  - name: audit
+    description: Who did what, with a tamper-evident hash chain.
+  - name: identity
+    description: The caller as the server sees it.
+  - name: system
+    description: Health, readiness and metrics of the node.
+  - name: v1
+    description: Version 1 endpoints kept for existing CI integrations.
+
+paths:
+  /v2/me:
+    get:
+      tags: [identity]
+      operationId: getMe
+      summary: Describe the caller
+      responses:
+        '200':
+          description: The authenticated principal and its grants.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Principal'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+
+  /v2/deployments:
+    get:
+      tags: [deployments]
+      operationId: listDeployments
+      summary: List deployments
+      description: Newest first. Only deployments of services the caller may read are listed.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - name: service
+          in: query
+          schema: {type: string}
+        - name: state
+          in: query
+          schema: {$ref: '#/components/schemas/DeploymentState'}
+      responses:
+        '200':
+          description: One page of deployments.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeploymentPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+    post:
+      tags: [deployments]
+      operationId: createDeployment
+      summary: Register a deployment
+      description: |
+        Registers a release before (or right after) it is rolled out. When
+        `previous_version` is omitted the service's last good version is used;
+        without one the request is rejected, because a rollback target is required.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeploymentCreate'}
+      responses:
+        '200':
+          description: A deployment with this `id`, service and version already exists; it is returned unchanged.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Deployment'}
+        '201':
+          description: Created.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Deployment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/deployments/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    get:
+      tags: [deployments]
+      operationId: getDeployment
+      summary: Get a deployment
+      parameters:
+        - {$ref: '#/components/parameters/IfNoneMatch'}
+      responses:
+        '200':
+          description: The deployment with its timeline, breaches and last evaluation.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Deployment'}
+        '304': {description: Not modified since the ETag in If-None-Match.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v2/deployments/{id}/observations:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    post:
+      tags: [deployments]
+      operationId: startObservation
+      summary: Observe a phase
+      description: |
+        Starts watching one phase. A failing phase is rolled back automatically;
+        the operation result carries the final state and the CI exit code.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/IfMatch'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ObservationRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/deployments/{id}/rollbacks:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    post:
+      tags: [deployments]
+      operationId: startRollback
+      summary: Roll back now
+      description: |
+        Operator decision. Cancels a running observation and runs the rollback
+        plan. Bypasses the flapping guard and the circuit breaker but still
+        takes the per-service lock.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/IfMatch'}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RollbackRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/deployments/{id}/approvals:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    post:
+      tags: [deployments]
+      operationId: approveEscalation
+      summary: Approve a gated escalation
+      description: |
+        Allowed only while the deployment is `AWAITING_APPROVAL`. With four-eyes
+        enabled the approver must differ from whoever created the deployment or
+        requested its rollback.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/IfMatch'}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ApprovalRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '412': {$ref: '#/components/responses/PreconditionFailed'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/deployments/{id}/abort:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    post:
+      tags: [deployments]
+      operationId: abortObservation
+      summary: Stop observing
+      description: Cancels a running observation. A rollback already running is not interrupted.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '200':
+          description: The deployment after the abort request.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Deployment'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/operations:
+    get:
+      tags: [operations]
+      operationId: listOperations
+      summary: List operations
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - name: deployment_id
+          in: query
+          schema: {type: string}
+        - name: status
+          in: query
+          schema: {$ref: '#/components/schemas/OperationStatus'}
+      responses:
+        '200':
+          description: One page of operations, newest first.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OperationPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+
+  /v2/operations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [operations]
+      operationId: getOperation
+      summary: Get an operation
+      parameters:
+        - {$ref: '#/components/parameters/IfNoneMatch'}
+      responses:
+        '200':
+          description: The operation.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Operation'}
+        '304': {description: Not modified since the ETag in If-None-Match.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v2/services:
+    get:
+      tags: [services]
+      operationId: listServices
+      summary: List services
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - name: team
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: One page of services the caller may read, by name.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServicePage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+
+  /v2/services/{name}:
+    parameters:
+      - {$ref: '#/components/parameters/ServiceName'}
+    get:
+      tags: [services]
+      operationId: getService
+      summary: Get a service
+      responses:
+        '200':
+          description: The service.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Service'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v2/services/{name}/baselines:
+    parameters:
+      - {$ref: '#/components/parameters/ServiceName'}
+    post:
+      tags: [services]
+      operationId: captureBaseline
+      summary: Capture a baseline
+      description: Observes the running (old) version for the window and keeps the result as the comparison baseline.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BaselineRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/services/{name}/last-good:
+    parameters:
+      - {$ref: '#/components/parameters/ServiceName'}
+    put:
+      tags: [services]
+      operationId: setLastGood
+      summary: Register the known-good version
+      description: The version rollbacks return to when a deployment does not name `previous_version`.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LastGoodRequest'}
+      responses:
+        '200':
+          description: Registered.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LastGood'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    get:
+      tags: [services]
+      operationId: getLastGood
+      summary: Get the known-good version
+      responses:
+        '200':
+          description: The last good version.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LastGood'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v2/targets:
+    get:
+      tags: [services]
+      operationId: listTargets
+      summary: List targets
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page of targets belonging to services the caller may read.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TargetPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+
+  /v2/targets/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [services]
+      operationId: getTarget
+      summary: Get a target
+      responses:
+        '200':
+          description: The target.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Target'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v2/presets:
+    get:
+      tags: [services]
+      operationId: listPresets
+      summary: List rule presets
+      responses:
+        '200':
+          description: Built-in and organisation presets.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Preset'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+
+  /v2/circuit:
+    get:
+      tags: [safety]
+      operationId: getCircuit
+      summary: Circuit breaker state
+      responses:
+        '200':
+          description: Current state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Circuit'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /v2/circuit/reset:
+    post:
+      tags: [safety]
+      operationId: resetCircuit
+      summary: Close the circuit
+      description: Admin only. Re-enables automatic rollbacks and the deployment gate after investigation.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CircuitRequest'}
+      responses:
+        '200':
+          description: State after the reset.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Circuit'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/circuit/trip:
+    post:
+      tags: [safety]
+      operationId: tripCircuit
+      summary: Open the circuit (kill switch)
+      description: Admin only. Freezes every automatic destructive action and closes the deployment gate.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CircuitRequest'}
+      responses:
+        '200':
+          description: State after the trip.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Circuit'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/audit-events:
+    get:
+      tags: [audit]
+      operationId: listAuditEvents
+      summary: Query the audit trail
+      description: Oldest first. Needs `viewer` on every service (`*`), because entries span services.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - name: since
+          in: query
+          schema: {type: string, format: date-time}
+        - name: until
+          in: query
+          schema: {type: string, format: date-time}
+        - name: actor
+          in: query
+          schema: {type: string}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: service
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: One page of audit events.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditEventPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /healthz:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness
+      security: []
+      responses:
+        '200':
+          description: The process is serving.
+          content:
+            application/json:
+              schema: {type: object}
+  /readyz:
+    get:
+      tags: [system]
+      operationId: ready
+      summary: Readiness
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+        '503':
+          description: Not ready (state store unreachable, or no HA leader known).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+  /metrics:
+    get:
+      tags: [system]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: Needs `viewer` on `*` unless `server.metrics_public` is set.
+      responses:
+        '200':
+          description: Text exposition format 0.0.4.
+          content:
+            text/plain:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  # ---------------------------------------------------------------- v1 (legacy)
+  /v1/whoami:
+    get: {tags: [v1], operationId: v1Whoami, summary: Describe the caller, responses: {'200': {description: OK}}}
+  /v1/audit:
+    get: {tags: [v1], operationId: v1Audit, summary: Query the audit trail (JSON or CSV), responses: {'200': {description: OK}}}
+  /v1/deployments:
+    get: {tags: [v1], operationId: v1ListDeployments, summary: List deployments, responses: {'200': {description: OK}}}
+    post: {tags: [v1], operationId: v1CreateDeployment, summary: Create a deployment (optionally start a phase), responses: {'201': {description: Created}}}
+  /v1/deployments/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {tags: [v1], operationId: v1GetDeployment, summary: Get a deployment with its exit code, responses: {'200': {description: OK}}}
+  /v1/deployments/{id}/phases/{phase}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}}
+      - {name: phase, in: path, required: true, schema: {type: string}}
+      - {name: wait, in: query, description: 'true = long-poll until a verdict', schema: {type: boolean}}
+    post: {tags: [v1], operationId: v1StartPhase, summary: Observe a phase, responses: {'202': {description: Accepted}}}
+  /v1/deployments/{id}/rollback:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    post: {tags: [v1], operationId: v1Rollback, summary: Manual rollback, responses: {'202': {description: Accepted}}}
+  /v1/deployments/{id}/approve:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    post: {tags: [v1], operationId: v1Approve, summary: Approve a gated escalation, responses: {'202': {description: Accepted}}}
+  /v1/deployments/{id}/abort:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    post: {tags: [v1], operationId: v1Abort, summary: Stop observing, responses: {'200': {description: OK}}}
+  /v1/baselines/{service}:
+    parameters: [{name: service, in: path, required: true, schema: {type: string}}]
+    post: {tags: [v1], operationId: v1Baseline, summary: Capture a baseline (blocking), responses: {'200': {description: OK}}}
+  /v1/circuit:
+    get: {tags: [v1], operationId: v1Circuit, summary: Circuit breaker state, responses: {'200': {description: OK}}}
+  /v1/circuit/reset:
+    post: {tags: [v1], operationId: v1CircuitReset, summary: Close the circuit, responses: {'200': {description: OK}}}
+  /v1/circuit/trip:
+    post: {tags: [v1], operationId: v1CircuitTrip, summary: Open the circuit, responses: {'200': {description: OK}}}
+  /v1/samples:
+    post: {tags: [v1], operationId: v1Samples, summary: Agent sample push, responses: {'204': {description: Stored}}}
+  /v1/agents/{target}/heartbeat:
+    parameters: [{name: target, in: path, required: true, schema: {type: string}}]
+    get: {tags: [v1], operationId: v1Heartbeat, summary: Agent heartbeat and active deployment, responses: {'200': {description: OK}}}
+  /v1/webhooks/{provider}:
+    parameters: [{name: provider, in: path, required: true, schema: {type: string, enum: [github, gitlab, jenkins]}}]
+    post: {tags: [v1], operationId: v1Webhook, summary: CI webhook (signature or token authenticated), security: [], responses: {'201': {description: Created}}}
+  /v1/targets/{target}/metrics:
+    parameters: [{name: target, in: path, required: true, schema: {type: string}}]
+    get: {tags: [v1], operationId: v1TargetMetrics, summary: Recent samples of a target, responses: {'200': {description: OK}}}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A service-account token (`vgl_…`), or an OIDC access token from the
+        corporate identity provider.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: {type: integer, minimum: 1, maximum: 500, default: 50}
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page.
+      schema: {type: string}
+    DeploymentID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    ServiceName:
+      name: name
+      in: path
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Unique per logical request (e.g. a UUID). Retries reuse it.
+      schema: {type: string, minLength: 1, maxLength: 255}
+    IfMatch:
+      name: If-Match
+      in: header
+      description: Act only if the deployment still has this ETag.
+      schema: {type: string}
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      schema: {type: string}
+
+  headers:
+    Location:
+      description: URL of the created resource or accepted operation.
+      schema: {type: string}
+    ETag:
+      description: Version tag of the representation.
+      schema: {type: string}
+
+  responses:
+    Accepted:
+      description: Accepted; poll the operation.
+      headers:
+        Location: {$ref: '#/components/headers/Location'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Operation'}
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthenticated:
+      description: Missing or invalid credentials.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: The caller's roles do not allow this on this service.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: No such resource.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: The resource is in a state that does not allow this (or the same Idempotency-Key is still being processed).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    PreconditionFailed:
+      description: If-Match did not match the current ETag.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unprocessable:
+      description: Well-formed but invalid (validation, or an Idempotency-Key reused with a different request).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, description: 'URI identifying the problem type.'}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          enum: [bad_request, validation_failed, unauthenticated, forbidden, not_found, conflict,
+                 precondition_failed, idempotency_key_reused, idempotency_key_in_flight,
+                 not_leader, rate_limited, internal]
+        request_id: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            required: [message]
+            properties:
+              field: {type: string}
+              message: {type: string}
+
+    Principal:
+      type: object
+      required: [id, kind, grants]
+      properties:
+        id: {type: string, examples: ['user:alice', 'sa:ci-order']}
+        kind: {type: string, enum: [user, service, legacy, webhook, anonymous]}
+        groups: {type: [array, 'null'], items: {type: string}}
+        grants:
+          type: array
+          items: {type: string, examples: ['deployer@team=payments']}
+
+    DeploymentState:
+      type: string
+      enum: [PENDING, BASELINE, OBSERVING, PROMOTED, SUCCEEDED, HELD, ROLLING_BACK, ROLLED_BACK,
+             ROLLBACK_FAILED, AWAITING_APPROVAL, ABORTED]
+    Verdict:
+      type: string
+      enum: [PENDING, PASS, FAIL, HOLD, INCONCLUSIVE]
+    Phase:
+      type: string
+      enum: [canary, rolling, full]
+
+    DeploymentCreate:
+      type: object
+      required: [service, version]
+      additionalProperties: false
+      properties:
+        id: {type: string, description: 'Optional client-chosen ID (e.g. the CI run). Generated when omitted.', maxLength: 128}
+        service: {type: string}
+        version: {type: string}
+        previous_version: {type: string, description: 'Rollback target. Defaults to the last good version.'}
+        prepare: {type: boolean, default: false, description: 'Record executor checkpoints (current release, image, snapshot) now.'}
+
+    Deployment:
+      type: object
+      required: [id, service, version, previous_version, state, verdict, exit_code, created_at, updated_at]
+      properties:
+        id: {type: string}
+        service: {type: string}
+        version: {type: string}
+        previous_version: {type: string}
+        phase: {type: string}
+        state: {$ref: '#/components/schemas/DeploymentState'}
+        verdict: {$ref: '#/components/schemas/Verdict'}
+        reason: {type: string}
+        exit_code:
+          type: integer
+          description: 'CI contract: 0 passed, 1 error, 2 rolled back, 3 rollback failed or approval needed, 4 held.'
+          enum: [0, 1, 2, 3, 4]
+        targets: {type: [array, 'null'], items: {type: string}}
+        breaches: {type: array, items: {$ref: '#/components/schemas/Breach'}}
+        events: {type: array, items: {$ref: '#/components/schemas/Event'}}
+        created_by: {type: string}
+        rollback_requested_by: {type: string}
+        approved_by: {type: string}
+        last_evaluation: {$ref: '#/components/schemas/Evaluation'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Breach:
+      type: object
+      required: [rule, target, action]
+      properties:
+        rule: {type: string}
+        target: {type: string}
+        detail: {type: string}
+        action: {type: string}
+        environmental: {type: boolean}
+        value: {type: number}
+    Event:
+      type: object
+      required: [time, kind, message]
+      properties:
+        time: {type: string, format: date-time}
+        kind: {type: string}
+        message: {type: string}
+    Evaluation:
+      type: object
+      properties:
+        time: {type: string, format: date-time}
+        failing: {type: integer}
+        holding: {type: integer}
+        warning: {type: integer}
+        known: {type: integer}
+        unknown: {type: integer}
+    DeploymentPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Deployment'}}
+        next_cursor: {type: [string, 'null']}
+
+    ObservationRequest:
+      type: object
+      required: [phase]
+      additionalProperties: false
+      properties:
+        phase: {$ref: '#/components/schemas/Phase'}
+    RollbackRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: {type: string, maxLength: 1000}
+        executor: {type: string, description: 'Override the primary executor.'}
+        targets: {type: array, items: {type: string}, description: 'Override the target set.'}
+    ApprovalRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        comment: {type: string, maxLength: 1000}
+
+    OperationStatus:
+      type: string
+      enum: [running, completed, failed]
+    Operation:
+      type: object
+      required: [id, kind, status, service, created_at]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [observation, rollback, approval, baseline]}
+        status: {$ref: '#/components/schemas/OperationStatus'}
+        service: {type: string}
+        deployment_id: {type: string}
+        phase: {type: string}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        result:
+          type: object
+          description: Where the deployment stood when the operation ended.
+          properties:
+            state: {$ref: '#/components/schemas/DeploymentState'}
+            verdict: {$ref: '#/components/schemas/Verdict'}
+            exit_code: {type: integer}
+            reason: {type: string}
+            baseline_samples: {type: integer}
+        error: {type: string, description: 'Why the operation could not run (status failed).'}
+    OperationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Operation'}}
+        next_cursor: {type: [string, 'null']}
+
+    Service:
+      type: object
+      required: [name, targets, phases, rules, executor]
+      properties:
+        name: {type: string}
+        team: {type: string}
+        preset: {type: string}
+        targets: {type: array, items: {type: string}}
+        control_targets: {type: array, items: {type: string}}
+        phases: {type: array, items: {type: string}}
+        rules:
+          type: array
+          items:
+            type: object
+            required: [name, action]
+            properties:
+              name: {type: string}
+              action: {type: string, enum: [rollback, notify, hold]}
+        executor: {type: string}
+        traffic: {type: string}
+        last_good_version: {type: string}
+    ServicePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Service'}}
+        next_cursor: {type: [string, 'null']}
+    BaselineRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        window: {type: string, description: 'Go duration such as 5m. Defaults to the service baseline window.', pattern: '^[0-9]+(ms|s|m|h)([0-9]+(ms|s|m))*$'}
+    LastGoodRequest:
+      type: object
+      required: [version]
+      additionalProperties: false
+      properties:
+        version: {type: string}
+        reason: {type: string, maxLength: 1000}
+    LastGood:
+      type: object
+      required: [service, version]
+      properties:
+        service: {type: string}
+        version: {type: string}
+        deployment_id: {type: string}
+
+    Target:
+      type: object
+      required: [name, kind, connection]
+      properties:
+        name: {type: string}
+        kind: {type: string}
+        address: {type: string}
+        labels: {type: object, additionalProperties: {type: string}}
+        connection: {type: string, enum: [ssh, local, none]}
+        services: {type: array, items: {type: string}}
+    TargetPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Target'}}
+        next_cursor: {type: [string, 'null']}
+
+    Preset:
+      type: object
+      required: [name, version, ref, source]
+      properties:
+        name: {type: string}
+        version: {type: integer}
+        ref: {type: string, examples: ['java-web@1']}
+        description: {type: string}
+        source: {type: string, description: '"builtin" or the organisation preset file.'}
+        params:
+          type: array
+          items:
+            type: object
+            required: [name, required]
+            properties:
+              name: {type: string}
+              required: {type: boolean}
+              default: {}
+              description: {type: string}
+
+    Circuit:
+      type: object
+      required: [state]
+      properties:
+        state: {type: string, enum: [CLOSED, OPEN, HALF_OPEN]}
+        reason: {type: string}
+        opened_at: {type: string, format: date-time}
+        recent_failures: {type: integer}
+    CircuitRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: {type: string, minLength: 1, maxLength: 1000}
+
+    AuditEvent:
+      type: object
+      required: [seq, time, kind]
+      properties:
+        seq: {type: integer, description: 'Position in the store.'}
+        time: {type: string, format: date-time}
+        kind: {type: string}
+        actor: {type: string}
+        source: {type: string}
+        action: {type: string}
+        service: {type: string}
+        deployment_id: {type: string}
+        state: {type: string}
+        reason: {type: string}
+        ticket: {type: string}
+        hash: {type: string}
+        prev: {type: string}
+    AuditEventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/AuditEvent'}}
+        next_cursor: {type: [string, 'null']}
+
+    Readiness:
+      type: object
+      required: [ready, checks]
+      properties:
+        ready: {type: boolean}
+        checks: {type: object, additionalProperties: {type: string}}

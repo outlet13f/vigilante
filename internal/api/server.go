@@ -59,10 +59,11 @@ type Server struct {
 	// every API call to the leader. nil = single node.
 	HA Leadership
 
-	ctx     context.Context
-	mu      sync.Mutex
-	agents  map[string]time.Time
-	proxies map[string]*httputil.ReverseProxy
+	ctx      context.Context
+	mu       sync.Mutex
+	agents   map[string]time.Time
+	proxies  map[string]*httputil.ReverseProxy
+	inflight map[string]bool // idempotency keys being processed
 }
 
 // Leadership is what the API needs from the HA elector.
@@ -127,6 +128,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/agents/{target}/heartbeat", s.authn(s.heartbeat))
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
 	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.authn(s.targetMetrics))
+	s.routesV2(mux)
 	return s.instrument(s.forwardToLeader(mux))
 }
 
@@ -141,7 +143,7 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 		node, addr := s.HA.Leader()
 		if addr == "" || r.Header.Get(forwardedHeader) != "" {
 			w.Header().Set("Retry-After", "2")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no leader available yet; retry shortly"})
+			s.fail(w, r, http.StatusServiceUnavailable, "not_leader", errors.New("no leader available yet; retry shortly"))
 			return
 		}
 		s.mu.Lock()
@@ -150,13 +152,13 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 			target, err := url.Parse(addr)
 			if err != nil {
 				s.mu.Unlock()
-				writeErr(w, http.StatusBadGateway, fmt.Errorf("leader %s advertises an invalid URL %q", node, addr))
+				s.fail(w, r, http.StatusBadGateway, "not_leader", fmt.Errorf("leader %s advertises an invalid URL %q", node, addr))
 				return
 			}
 			p = httputil.NewSingleHostReverseProxy(target)
-			p.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 				w.Header().Set("Retry-After", "2")
-				writeErr(w, http.StatusBadGateway, fmt.Errorf("leader %s unreachable: %w", node, err))
+				s.fail(w, r, http.StatusBadGateway, "not_leader", fmt.Errorf("leader %s unreachable: %w", node, err))
 			}
 			s.proxies[addr] = p
 		}
@@ -172,7 +174,7 @@ func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 		p, err := s.Auth.Authenticate(r)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vigilante"`)
-			writeErr(w, http.StatusUnauthorized, err)
+			s.fail(w, r, http.StatusUnauthorized, "unauthenticated", err)
 			return
 		}
 		h(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
@@ -208,7 +210,7 @@ func (s *Server) allow(w http.ResponseWriter, r *http.Request, a auth.Action, sv
 	}
 	err := fmt.Errorf("forbidden: %s needs role %s on %s", principalID(p), auth.Required(a), describe(svc))
 	s.denied(r, svc.Name, err)
-	writeErr(w, http.StatusForbidden, err)
+	s.fail(w, r, http.StatusForbidden, "forbidden", err)
 	return p, false
 }
 
@@ -222,7 +224,7 @@ func (s *Server) allowAny(w http.ResponseWriter, r *http.Request, a auth.Action,
 	}
 	err := fmt.Errorf("forbidden: %s needs role %s on a service using %s", principalID(p), auth.Required(a), what)
 	s.denied(r, "", err)
-	writeErr(w, http.StatusForbidden, err)
+	s.fail(w, r, http.StatusForbidden, "forbidden", err)
 	return false
 }
 
@@ -477,17 +479,25 @@ func (s *Server) getDeployment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
+// checkLaunch reports why a phase may not start now.
+func checkLaunch(d *model.Deployment) error {
+	if d.State == model.StateObserving || d.State == model.StateRollingBack {
+		return fmt.Errorf("deployment %s is %s", d.ID, d.State)
+	}
+	if d.State.Terminal() && d.State != model.StateSucceeded {
+		return fmt.Errorf("deployment %s is already %s", d.ID, d.State)
+	}
+	return nil
+}
+
 func (s *Server) launch(d *model.Deployment, phase model.Phase) error {
 	switch phase {
 	case model.PhaseCanary, model.PhaseRolling, model.PhaseFull:
 	default:
 		return fmt.Errorf("unknown phase %q", phase)
 	}
-	if d.State == model.StateObserving || d.State == model.StateRollingBack {
-		return fmt.Errorf("deployment %s is %s", d.ID, d.State)
-	}
-	if d.State.Terminal() && d.State != model.StateSucceeded {
-		return fmt.Errorf("deployment %s is already %s", d.ID, d.State)
+	if err := checkLaunch(d); err != nil {
+		return err
 	}
 	go func() {
 		if err := s.E.Watch(s.ctx, d, phase); err != nil {
