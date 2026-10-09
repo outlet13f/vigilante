@@ -3,7 +3,6 @@
 variables:
   VIGILANTE_SERVER: https://vigilante.example.internal
   SVC: pay-api
-  PREV: $LAST_GOOD_VERSION
 
 stages: [validate, canary, full]
 
@@ -13,8 +12,9 @@ stages: [validate, canary, full]
     - deploy-pay.sh "$DEPLOY_HOSTS" "$CI_COMMIT_SHORT_SHA"
     - |
       set +e
-      vigilante watch --server "$VIGILANTE_SERVER" --id "gl-$CI_PIPELINE_ID" \
-        --service "$SVC" --version "$CI_COMMIT_SHORT_SHA" --previous "$PREV" --phase "$PHASE"
+      # ID (gl-$CI_PIPELINE_ID) and version (tag or short SHA) come from GitLab;
+      # the server fills --previous from the service's last successful deployment.
+      vigilante watch --server "$VIGILANTE_SERVER" --service "$SVC" --phase "$PHASE"
       rc=$?
       case $rc in
         0) echo "PASS";;

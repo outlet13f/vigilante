@@ -127,3 +127,14 @@ func TestParseWebhookIgnoresNonSuccess(t *testing.T) {
 		t.Fatalf("%+v %v", req, err)
 	}
 }
+
+func TestCreateFillsPreviousFromLastGood(t *testing.T) {
+	s, hs := newTestServer(t)
+	if _, err := s.E.MarkGood("svc", "v7", ""); err != nil {
+		t.Fatal(err)
+	}
+	r, d := call(t, "POST", hs.URL+"/v1/deployments", "tok", `{"id":"d9","service":"svc","version":"v8"}`, nil)
+	if r.StatusCode != 201 || d["previous_version"] != "v7" {
+		t.Fatalf("create: %d %v", r.StatusCode, d["previous_version"])
+	}
+}

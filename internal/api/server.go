@@ -150,9 +150,19 @@ func (s *Server) create(ctx context.Context, req createReq) (*model.Deployment, 
 	if req.Service == "" || req.Version == "" {
 		return nil, errors.New("service and version are required")
 	}
+	var note string
+	if req.PreviousVersion == "" && (req.ID == "" || s.E.Live(req.ID) == nil) {
+		if v, from, ok := s.E.LastGoodVersion(req.Service); ok {
+			req.PreviousVersion = v
+			note = fmt.Sprintf("auto-filled previous=%s (last good deployment %s)", v, from)
+		}
+	}
 	d, err := s.E.Create(req.ID, req.Service, req.Version, req.PreviousVersion)
 	if err != nil {
 		return nil, err
+	}
+	if note != "" {
+		s.E.Annotate(d, "input", note)
 	}
 	if req.Prepare {
 		if err := s.E.Prepare(ctx, d); err != nil {

@@ -11,22 +11,19 @@ jobs:
       VIGILANTE_TOKEN: ${{ secrets.VIGILANTE_TOKEN }}
       VIG_SERVER: https://vigilante.example.internal
       SVC: web
-      NEW: ${{ github.sha }}
-      PREV: ${{ vars.WEB_LAST_GOOD }}
+      NEW: ${{ github.sha }}   # for deploy.sh; vigilante reads GITHUB_SHA and GITHUB_RUN_ID itself
     steps:
       - uses: actions/checkout@v4
       - name: Canary (web-ec2-a)
         run: |
           ./deploy.sh web-ec2-a "$NEW"
-          vigilante watch --server "$VIG_SERVER" --id "gh-${{ github.run_id }}" \
-            --service "$SVC" --version "$NEW" --previous "$PREV" --phase canary
+          vigilante watch --server "$VIG_SERVER" --service "$SVC" --phase canary
       - name: Full
         run: |
           ./deploy.sh all "$NEW"
-          vigilante watch --server "$VIG_SERVER" --id "gh-${{ github.run_id }}" \
-            --service "$SVC" --version "$NEW" --previous "$PREV" --phase full
+          vigilante watch --server "$VIG_SERVER" --service "$SVC" --phase full
       - name: Explain failure
         if: failure()
         run: |
           curl -fsS -H "Authorization: Bearer $VIGILANTE_TOKEN" \
-            "$VIG_SERVER/v1/deployments/gh-${{ github.run_id }}" | jq '.deployment | {state, reason, breaches}'
+            "$VIG_SERVER/v1/deployments/gh-${{ github.run_id }}-${{ github.run_attempt }}" | jq '.deployment | {state, reason, breaches}'

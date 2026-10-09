@@ -42,8 +42,9 @@ Usage:
   vigilante validate -c FILE
   vigilante prepare  -c FILE --service S --version V --previous P [--id ID]
   vigilante baseline -c FILE --service S [--window 5m] [--out baseline.json]
-  vigilante watch    -c FILE --service S --version V --previous P --phase canary|rolling|full
-                     [--id ID] [--baseline FILE] [--dry-run] [--server URL]
+  vigilante watch    -c FILE --service S --phase canary|rolling|full
+                     [--version V] [--previous P] [--id ID] [--baseline FILE] [--dry-run] [--server URL]
+  vigilante mark-good -c FILE --service S --version V [--reason TEXT]
   vigilante rollback -c FILE (--id ID | --service S --version V --previous P [--targets a,b])
                      [--executor NAME] [--approve] [--reason TEXT] [--dry-run]
   vigilante status   -c FILE [--id ID]
@@ -52,6 +53,10 @@ Usage:
   vigilante agent    -c FILE --target NAME --server URL
   vigilante plugins
   vigilante version
+
+--id and --version default to the CI run (Jenkins, GitLab CI, GitHub Actions,
+VIGILANTE_DEPLOYMENT_ID / VIGILANTE_VERSION, or git describe); --previous defaults
+to the service's last successful deployment (see mark-good).
 
 Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=debug|info|warn
 `
@@ -149,6 +154,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdRollback(ctx, args)
 	case "status":
 		return cmdStatus(args)
+	case "mark-good":
+		return cmdMarkGood(args)
 	case "circuit":
 		return cmdCircuit(ctx, args)
 	case "server":
@@ -170,10 +177,12 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	defer e.Close()
+	notes := autoFill(c, e)
 	d, err := e.Create(c.id, c.service, c.ver, c.prev)
 	if err != nil {
 		return 1, err
 	}
+	annotate(e, d, notes)
 	err = e.Prepare(ctx, d)
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
@@ -222,12 +231,14 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	if err := e.LoadBaselineFile(*baseline); err != nil {
 		return 1, err
 	}
+	notes := autoFill(c, e)
 	d, err := e.Create(c.id, c.service, c.ver, c.prev)
 	if err != nil {
 		return 1, err
 	}
-	if d.PreviousVersion == "" && c.prev != "" {
-		d.PreviousVersion = c.prev
+	annotate(e, d, notes)
+	if err := requireRollbackTarget(d); err != nil {
+		return 1, err
 	}
 	if err := e.Watch(ctx, d, model.Phase(*phase)); err != nil {
 		e.MarkBlocked(d, err)
@@ -271,6 +282,7 @@ func apiCall(ctx context.Context, server, method, path string, body any, out any
 }
 
 func watchRemote(ctx context.Context, c *common, phase string) (int, error) {
+	autoFill(c, nil)
 	var d model.Deployment
 	err := apiCall(ctx, c.srv, http.MethodPost, "/v1/deployments", map[string]any{
 		"id": c.id, "service": c.service, "version": c.ver, "previous_version": c.prev, "phase": phase,
@@ -317,15 +329,23 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 	}
 	defer e.Close()
 	var d *model.Deployment
+	if c.id == "" && c.service == "" {
+		autoFill(c, e) // inside a pipeline: roll back this run's deployment
+	}
 	if c.id != "" {
 		if d = e.Live(c.id); d == nil && c.service == "" {
 			return 1, fmt.Errorf("deployment %q not found in journal", c.id)
 		}
 	}
 	if d == nil {
+		notes := autoFill(c, e)
 		if d, err = e.Create(c.id, c.service, c.ver, c.prev); err != nil {
 			return 1, err
 		}
+		annotate(e, d, notes)
+	}
+	if err := requireRollbackTarget(d); err != nil {
+		return 1, err
 	}
 	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec}
 	if *targets != "" {
@@ -338,6 +358,34 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
 	return model.ExitCode(cp), nil
+}
+
+func annotate(e *orchestrator.Engine, d *model.Deployment, notes []string) {
+	if len(notes) > 0 {
+		e.Annotate(d, "input", "auto-filled "+strings.Join(notes, ", "))
+	}
+}
+
+func cmdMarkGood(args []string) (int, error) {
+	c := newFlags("mark-good")
+	reason := c.fs.String("reason", "", "why this version is known-good")
+	if err := c.fs.Parse(args); err != nil {
+		return 1, err
+	}
+	if c.service == "" || c.ver == "" {
+		return 1, errors.New("mark-good: --service and --version are required")
+	}
+	e, err := c.engine()
+	if err != nil {
+		return 1, err
+	}
+	defer e.Close()
+	d, err := e.MarkGood(c.service, c.ver, *reason)
+	if err != nil {
+		return 1, err
+	}
+	fmt.Printf("%s %s recorded as known-good (%s); later deployments default --previous to it\n", d.Service, d.Version, d.ID)
+	return 0, nil
 }
 
 func cmdStatus(args []string) (int, error) {
