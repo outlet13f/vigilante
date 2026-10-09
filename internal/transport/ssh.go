@@ -21,6 +21,7 @@ import (
 
 	"vigilante/internal/config"
 	"vigilante/internal/secrets"
+	"vigilante/internal/telemetry"
 )
 
 // Manager hands out Runners per target and pools SSH connections so that a
@@ -64,6 +65,7 @@ func (m *Manager) Close() {
 	for k, c := range m.ssh {
 		c.client.Close()
 		delete(m.ssh, k)
+		telemetry.SSHConnections.Add(-1)
 	}
 }
 
@@ -83,10 +85,30 @@ func (m *Manager) client(ctx context.Context, t *config.Target) (*ssh.Client, er
 		if cur, ok := m.ssh[t.Name]; ok && cur == c {
 			c.client.Close()
 			delete(m.ssh, t.Name)
+			telemetry.SSHConnections.Add(-1)
 		}
 	}
 	m.mu.Unlock()
 
+	cl, err := m.dial(ctx, t)
+	if err != nil {
+		telemetry.SSHDials.Inc("error")
+		return nil, err
+	}
+	telemetry.SSHDials.Inc("ok")
+	m.mu.Lock()
+	if existing, ok := m.ssh[t.Name]; ok { // lost a race; keep the first
+		m.mu.Unlock()
+		cl.Close()
+		return existing.client, nil
+	}
+	m.ssh[t.Name] = &sshConn{client: cl}
+	m.mu.Unlock()
+	telemetry.SSHConnections.Add(1)
+	return cl, nil
+}
+
+func (m *Manager) dial(ctx context.Context, t *config.Target) (*ssh.Client, error) {
 	cc, err := m.clientConfig(t)
 	if err != nil {
 		return nil, err
@@ -122,14 +144,6 @@ func (m *Manager) client(ctx context.Context, t *config.Target) (*ssh.Client, er
 		}
 		cl = ssh.NewClient(c, chans, reqs)
 	}
-	m.mu.Lock()
-	if existing, ok := m.ssh[t.Name]; ok { // lost a race; keep the first
-		m.mu.Unlock()
-		cl.Close()
-		return existing.client, nil
-	}
-	m.ssh[t.Name] = &sshConn{client: cl}
-	m.mu.Unlock()
 	return cl, nil
 }
 
@@ -275,20 +289,28 @@ func (s *SSH) wrap(cmd string) string {
 	return cmd
 }
 
-func (s *SSH) session(ctx context.Context) (*ssh.Session, error) {
+// session opens a session; the caller must call done() when finished.
+func (s *SSH) session(ctx context.Context) (sess *ssh.Session, done func(), err error) {
 	cl, err := s.m.client(ctx, s.target)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return cl.NewSession()
+	if sess, err = cl.NewSession(); err != nil {
+		return nil, nil, err
+	}
+	telemetry.SSHSessions.Add(1)
+	return sess, func() {
+		sess.Close()
+		telemetry.SSHSessions.Add(-1)
+	}, nil
 }
 
 func (s *SSH) Run(ctx context.Context, cmd string, stdin io.Reader) (string, error) {
-	sess, err := s.session(ctx)
+	sess, release, err := s.session(ctx)
 	if err != nil {
 		return "", err
 	}
-	defer sess.Close()
+	defer release()
 	var out, errb strings.Builder
 	sess.Stdout, sess.Stderr, sess.Stdin = &out, &errb, stdin
 	done := make(chan error, 1)
@@ -306,11 +328,11 @@ func (s *SSH) Run(ctx context.Context, cmd string, stdin io.Reader) (string, err
 }
 
 func (s *SSH) Stream(ctx context.Context, cmd string, onLine func(string)) error {
-	sess, err := s.session(ctx)
+	sess, release, err := s.session(ctx)
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
+	defer release()
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
 		return err

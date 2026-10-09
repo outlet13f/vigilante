@@ -5,7 +5,7 @@
 | 마일스톤 | 상태 | 비고 |
 |---|---|---|
 | 1단계 프로토타입 | 완료 | 커밋 `d1e6411`. 설계는 docs/01~04 |
-| M0 기반 | **진행 중** | 결정 확정: PostgreSQL, OIDC + 서비스 계정 토큰, Vault. **M0-1 상태 저장소·HA**, **M0-2 인증·권한**, **M0-4 감사**, **M0-3 비밀관리** 완료. 다음 M0-5 자체 관측성 |
+| **M0 기반** | **완료** | 결정 확정: PostgreSQL, OIDC + 서비스 계정 토큰, Vault. M0-1 상태 저장소·HA, M0-2 인증·권한, M0-4 감사, M0-3 비밀관리, M0-5 자체 관측성 완료. [PR #3](https://github.com/outlet13f/vigilante/pull/3). 범위 차이는 M0 절의 "구현 결과" 참고 |
 | **M1 입력 간소화** | **완료** | 커밋 `2a2ab09`(M1-1), `c6ab1d6`(M1-2), `50806e1`(M1-3), [PR #1](https://github.com/outlet13f/vigilante/pull/1)로 master에 병합(`f877c88`). 범위 차이는 M1 절 참고 |
 | M2 ~ M6 | 미착수 | 일정은 모두 추정 |
 
@@ -119,6 +119,8 @@
   - 지표: 판정 지연, 프로브 오류율, 수집 샘플 수, 롤백 성공·실패, 서킷 상태, 리더 여부, 저장소 지연, SSH 세션 수.
 - 로그는 JSON 구조화 형식을 선택할 수 있게 하고, `deployment_id`, `trace_id`를 포함한다.
 - `/healthz`(생존)와 `/readyz`(저장소 연결, 리더 여부)를 분리한다. OpenTelemetry 트레이스는 선택 사항이다.
+
+> **구현 결과(M0-5):** 클라이언트 라이브러리 없이 Prometheus 텍스트 형식을 직접 출력한다(의존성 0). 지표 목록은 docs/02 "자체 관측성". 판정 지연은 "실패 판정 → 롤백 시작 기록"(`vigilante_rollback_trigger_seconds`)과 평가 1회 시간(`vigilante_evaluation_seconds`)으로 나눠 잰다. 위반이 `for` 횟수를 채우기까지의 시간은 규칙 설정이 정하므로 따로 재지 않는다. `/metrics`는 기본으로 `viewer@*` 토큰이 필요하다(`server.metrics_public`으로 해제). 로그는 `VIGILANTE_LOG_FORMAT=json`, 요청 로그에 `request_id`(`X-Request-ID` 또는 `traceparent`)를 남긴다. 기존 로그 키 `deployment`는 그대로 두었다. OpenTelemetry 트레이스 내보내기는 M5(수집 샤딩, 노드 간 gRPC)와 함께 검토한다.
 
 ## M1. 입력 간소화 — 완료
 

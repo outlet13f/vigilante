@@ -46,6 +46,7 @@ import (
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
+	"vigilante/internal/telemetry"
 )
 
 type Server struct {
@@ -107,6 +108,8 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"ok": true, "role": role, "leader": leader, "active": s.E.Active(),
 			"circuit": s.E.Breaker.State().State, "dry_run": s.E.DryRun, "store": s.E.Journal.Describe()})
 	})
+	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.HandleFunc("GET /metrics", s.metricsHandler())
 	mux.HandleFunc("GET /v1/whoami", s.authn(s.whoami))
 	mux.HandleFunc("GET /v1/audit", s.authn(s.auditQuery))
 	mux.HandleFunc("POST /v1/deployments", s.authn(s.createDeployment))
@@ -124,14 +127,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/agents/{target}/heartbeat", s.authn(s.heartbeat))
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
 	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.authn(s.targetMetrics))
-	return s.forwardToLeader(mux)
+	return s.instrument(s.forwardToLeader(mux))
 }
 
-// forwardToLeader sends every API call except /healthz to the HA leader when
+// forwardToLeader sends every API call except /healthz, /readyz and /metrics to the HA leader when
 // this node is a follower, so clients may talk to any node.
 func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.HA == nil || s.HA.IsLeader() || r.URL.Path == "/healthz" {
+		if s.HA == nil || s.HA.IsLeader() || local[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -607,6 +610,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		}
 		s.E.Store.Add(sm)
 	}
+	telemetry.AgentSamples.Add(float64(len(samples)))
 	w.WriteHeader(http.StatusNoContent)
 }
 

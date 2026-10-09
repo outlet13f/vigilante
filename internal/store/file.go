@@ -198,6 +198,11 @@ func tailHash(path string) (string, error) {
 // Fence is a no-op: a file store has a single writer by construction.
 func (f *fileStore) Fence(string, string) {}
 
+func (f *fileStore) Ping(context.Context) error {
+	_, err := os.Stat(f.path)
+	return err
+}
+
 func (f *fileStore) Close() error { return f.j.Close() }
 
 type leaseFile struct {

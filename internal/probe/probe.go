@@ -15,6 +15,7 @@ import (
 
 	"vigilante/internal/config"
 	"vigilante/internal/model"
+	"vigilante/internal/telemetry"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -138,6 +139,7 @@ func (c *Collector) supervise(ctx context.Context, j Job) {
 		if ctx.Err() != nil {
 			return // a check cut short by shutdown is not a failure of the target
 		}
+		telemetry.ProbeSamples.Inc(j.Spec.Type)
 		c.Sink(model.Sample{Target: j.Target.Name, Metric: j.Spec.ID + "." + metric, Value: v, Time: time.Now(), Source: source})
 	}
 	backoff := time.Second
@@ -155,6 +157,7 @@ func (c *Collector) supervise(ctx context.Context, j Job) {
 		}
 		// A dead probe is itself a signal: rules can use "<id>.probe_error".
 		emit("probe_error", 1)
+		telemetry.ProbeRestarts.Inc(j.Spec.Type)
 		log.Warn("probe stopped, restarting", "err", err, "backoff", backoff)
 		select {
 		case <-ctx.Done():

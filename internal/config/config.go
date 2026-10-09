@@ -99,6 +99,9 @@ type Server struct {
 	WebhookSecret string `yaml:"webhook_secret_env"`
 	State         State  `yaml:"state"`
 	HA            HA     `yaml:"ha"`
+	// MetricsPublic serves /metrics without authentication (scrapers on a
+	// trusted network). Otherwise a viewer token for all services is needed.
+	MetricsPublic bool `yaml:"metrics_public"`
 }
 
 // State selects where decisions, rollback progress, circuit state and locks

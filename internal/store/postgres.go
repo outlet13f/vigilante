@@ -104,6 +104,8 @@ func (p *pgStore) Close() error {
 	return nil
 }
 
+func (p *pgStore) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+
 func (p *pgStore) Fence(key, owner string) {
 	p.mu.Lock()
 	p.fenceKey, p.fenceOwner = key, owner

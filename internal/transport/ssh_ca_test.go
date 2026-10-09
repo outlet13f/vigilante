@@ -16,6 +16,7 @@ import (
 	"vigilante/internal/config"
 	"vigilante/internal/secrets"
 	"vigilante/internal/secrets/vaulttest"
+	"vigilante/internal/telemetry"
 )
 
 // startSSHD runs an SSH server that accepts only user certificates signed by
@@ -131,6 +132,13 @@ func TestSSHWithVaultCertificate(t *testing.T) {
 	}
 	if v.Signs != 2 {
 		t.Fatalf("expired certificate must be re-signed, signs=%d", v.Signs)
+	}
+	if telemetry.SSHDials.Value("ok") < 3 || telemetry.SSHSessions.Value() != 0 || telemetry.SSHConnections.Value() != 1 {
+		t.Fatalf("ssh telemetry: dials=%v sessions=%v conns=%v", telemetry.SSHDials.Value("ok"), telemetry.SSHSessions.Value(), telemetry.SSHConnections.Value())
+	}
+	m.Close()
+	if telemetry.SSHConnections.Value() != 0 {
+		t.Fatalf("closed pool still counted: %v", telemetry.SSHConnections.Value())
 	}
 }
 

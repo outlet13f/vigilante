@@ -50,6 +50,8 @@ type Store interface {
 	// Fence makes Append fail with ErrFenced unless owner holds key.
 	// An empty key turns fencing off.
 	Fence(key, owner string)
+	// Ping checks the backend is reachable (readiness).
+	Ping(ctx context.Context) error
 	Describe() string
 	Close() error
 }

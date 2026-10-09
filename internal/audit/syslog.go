@@ -15,6 +15,7 @@ import (
 	"vigilante/internal/config"
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
+	"vigilante/internal/telemetry"
 )
 
 // Exporter ships audit-relevant journal entries to a SIEM over syslog
@@ -70,6 +71,7 @@ func (x *Exporter) Send(e journal.Entry) {
 	case x.ch <- e:
 	default:
 		x.Dropped.Add(1)
+		telemetry.AuditDropped.Inc()
 	}
 }
 
@@ -115,9 +117,11 @@ func (x *Exporter) Run(ctx context.Context) {
 					continue
 				}
 				x.Dropped.Add(1)
+				telemetry.AuditDropped.Inc()
 				break
 			}
 			x.Sent.Add(1)
+			telemetry.AuditExported.Inc()
 			break
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"vigilante/internal/config"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
+	"vigilante/internal/store"
 )
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
@@ -330,3 +332,104 @@ func TestAuditTrailOverAPI(t *testing.T) {
 		t.Fatalf("csv export:\n%s", body)
 	}
 }
+
+func body(t *testing.T, method, url, token string, hdr map[string]string) (*http.Response, string) {
+	req, _ := http.NewRequest(method, url, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, string(b)
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	viewerTok, viewer := sa(t, "prom", "viewer", "*")
+	teamTok, team := sa(t, "team", "viewer", "team=payments")
+	s, hs := newTestServerWith(t, "auth:\n  service_accounts:\n"+viewer+team)
+
+	if r, _ := body(t, "GET", hs.URL+"/metrics", "", nil); r.StatusCode != 401 {
+		t.Fatalf("metrics need a token by default: %d", r.StatusCode)
+	}
+	if r, _ := body(t, "GET", hs.URL+"/metrics", teamTok, nil); r.StatusCode != 403 {
+		t.Fatalf("metrics span all services, team-scoped viewer must be refused: %d", r.StatusCode)
+	}
+	call(t, "POST", hs.URL+"/v1/deployments", "tok", `{"id":"m1","service":"svc","version":"v2","previous_version":"v1"}`, nil)
+	call(t, "GET", hs.URL+"/v1/deployments/nope", "tok", "", nil)
+	r, out := body(t, "GET", hs.URL+"/metrics", viewerTok, nil)
+	if r.StatusCode != 200 || !strings.HasPrefix(r.Header.Get("Content-Type"), "text/plain; version=0.0.4") {
+		t.Fatalf("metrics: %d %s", r.StatusCode, r.Header.Get("Content-Type"))
+	}
+	for _, want := range []string{
+		`vigilante_api_requests_total{method="POST",route="/v1/deployments",code="201"}`,
+		`vigilante_api_requests_total{method="GET",route="/v1/deployments/{id}",code="404"}`,
+		`vigilante_circuit_state{state="closed"} 1`,
+		`vigilante_circuit_state{state="open"} 0`,
+		`vigilante_deployments{state="PENDING"} 1`,
+		"vigilante_leader 1\n",
+		"vigilante_engine_active 1\n",
+		`vigilante_build_info{go_version="`,
+		"# TYPE vigilante_store_append_seconds histogram",
+		`vigilante_store_append_seconds_count{backend="file"}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+
+	s.E.Cfg.Server.MetricsPublic = true
+	hs2 := httptest.NewServer(s.Handler())
+	defer hs2.Close()
+	if r, _ := body(t, "GET", hs2.URL+"/metrics", "", nil); r.StatusCode != 200 {
+		t.Fatalf("metrics_public: %d", r.StatusCode)
+	}
+}
+
+func TestReadyzAndRequestID(t *testing.T) {
+	s, hs := newTestServer(t)
+	r, out := call(t, "GET", hs.URL+"/readyz", "", "", nil)
+	if r.StatusCode != 200 || out["ready"] != true {
+		t.Fatalf("single node with a reachable store is ready: %d %v", r.StatusCode, out)
+	}
+	s.HA = fakeLeadership{} // follower that knows no leader
+	r, out = call(t, "GET", hs.URL+"/readyz", "", "", nil)
+	if r.StatusCode != 503 || out["checks"].(map[string]any)["leader"] != "none" {
+		t.Fatalf("follower without a leader is not ready: %d %v", r.StatusCode, out)
+	}
+	s.HA = fakeLeadership{addr: "http://leader"}
+	if r, out = call(t, "GET", hs.URL+"/readyz", "", "", nil); r.StatusCode != 200 || out["checks"].(map[string]any)["leader"] != "node-x" {
+		t.Fatalf("follower with a leader is ready (served locally, not forwarded): %d %v", r.StatusCode, out)
+	}
+	s.HA = nil
+
+	r, _ = call(t, "GET", hs.URL+"/healthz", "", "", map[string]string{"X-Request-ID": "ci-run-42"})
+	if r.Header.Get("X-Request-ID") != "ci-run-42" {
+		t.Fatalf("caller's request id is echoed: %q", r.Header.Get("X-Request-ID"))
+	}
+	r, _ = call(t, "GET", hs.URL+"/healthz", "", "", map[string]string{"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})
+	if r.Header.Get("X-Request-ID") != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("W3C trace id is reused: %q", r.Header.Get("X-Request-ID"))
+	}
+	r, _ = call(t, "GET", hs.URL+"/healthz", "", "", map[string]string{"X-Request-ID": "bad id; rm -rf"})
+	if id := r.Header.Get("X-Request-ID"); len(id) != 16 {
+		t.Fatalf("unsafe ids are replaced: %q", id)
+	}
+
+	healthy := s.E.Journal
+	s.E.Journal = downStore{healthy}
+	defer func() { s.E.Journal = healthy }()
+	if r, out = call(t, "GET", hs.URL+"/readyz", "", "", nil); r.StatusCode != 503 || out["checks"].(map[string]any)["store"] != "unreachable" {
+		t.Fatalf("missing journal makes the node unready: %d %v", r.StatusCode, out)
+	}
+}
+
+type downStore struct{ store.Store }
+
+func (downStore) Ping(context.Context) error { return errors.New("connection refused") }

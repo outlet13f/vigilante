@@ -51,6 +51,7 @@ secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 | `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달 |
 | `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름 |
 | `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
+| `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
 
 ```yaml
 server:
@@ -60,6 +61,47 @@ server:
 ```
 
 리더만 판정·롤백을 실행하고 상태를 기록합니다. 리더 자리를 잃은 노드의 기록은 DB에서 거부되므로(펜싱) 두 노드가 동시에 결정을 남기지 않습니다. 새 리더는 공유 상태를 다시 읽고, 진행 중이던 롤백을 완료된 단계부터 이어서 끝냅니다.
+
+### 자체 관측성
+
+세 엔드포인트는 각 노드가 직접 답하며 리더로 전달하지 않습니다.
+
+| 엔드포인트 | 용도 | 응답 |
+|---|---|---|
+| `GET /healthz` | 생존(liveness). 프로세스가 응답하면 200 | 역할, 리더, 서킷, 저장소 |
+| `GET /readyz` | 준비(readiness). 로드밸런서·Kubernetes가 트래픽을 보낼지 판단 | 저장소 Ping 실패 또는 HA에서 리더를 모르면 503. `{"ready":..,"checks":{"store":..,"leader":..}}` |
+| `GET /metrics` | Prometheus 텍스트 형식(0.0.4). 외부 수집기가 가져가기만 함 | 아래 지표 |
+
+| 지표 | 종류 | 레이블 | 의미 |
+|---|---|---|---|
+| `vigilante_rollback_trigger_seconds` | histogram | — | 실패 판정부터 롤백 시작 기록까지(게이트·락·저장 포함) |
+| `vigilante_rollbacks_total` | counter | service, result | `rolled_back`, `failed`, `await_approval`, `blocked`, `handed_over` |
+| `vigilante_rollback_duration_seconds` | histogram | result | 롤백 플랜 실행 시간 |
+| `vigilante_verdicts_total` | counter | service, phase, verdict | 단계 판정 결과 |
+| `vigilante_evaluation_seconds` | histogram | — | 한 번의 규칙 평가 시간 |
+| `vigilante_probe_samples_total` / `vigilante_probe_restarts_total` | counter | type | 수집 샘플 수 / 오류로 재시작한 프로브 수 |
+| `vigilante_agent_samples_total` | counter | — | 에이전트가 보낸 샘플 수 |
+| `vigilante_circuit_state` | gauge | state | 현재 서킷 상태가 1 |
+| `vigilante_leader` / `vigilante_engine_active` | gauge | — | 리더 여부 / 판정·롤백 가능 여부(펜싱되면 0) |
+| `vigilante_deployments` | gauge | state | 상태별 배포 수 |
+| `vigilante_agents_connected` | gauge | — | 30초 안에 하트비트를 보낸 에이전트 수 |
+| `vigilante_store_append_seconds` / `vigilante_store_errors_total` | histogram / counter | backend / reason | 상태 저장 지연 / 실패(`fenced`, `error`) |
+| `vigilante_ssh_connections` / `vigilante_ssh_sessions` / `vigilante_ssh_dials_total` | gauge / gauge / counter | — / — / result | SSH 풀 연결 수, 열린 세션 수, 접속 시도 |
+| `vigilante_api_requests_total` / `vigilante_api_request_seconds` | counter / histogram | method, route, code / route | API 요청 수와 지연 |
+| `vigilante_audit_exported_total` / `vigilante_audit_export_dropped_total` | counter | — | SIEM 전송 / 유실 |
+| `vigilante_build_info`, `process_start_time_seconds`, `go_goroutines`, `go_memstats_heap_alloc_bytes` | gauge | version, go_version | 빌드·프로세스 정보 |
+
+레이블에는 대상 이름이나 배포 ID를 넣지 않습니다. 대상 수천 대에서도 시계열 수가 서비스 수에 비례하게 유지됩니다.
+
+**로그:** `VIGILANTE_LOG_FORMAT=json`이면 한 줄에 JSON 객체 하나로 출력합니다(기본 text). `VIGILANTE_LOG=debug|warn`으로 수준을 바꿉니다. 배포 관련 로그에는 `deployment`, API 요청 로그에는 `request_id`가 붙습니다. `request_id`는 요청의 `X-Request-ID`를 쓰고, 없으면 W3C `traceparent`의 trace id, 그것도 없으면 새로 만들어 응답 헤더로 돌려줍니다. 팔로워가 리더로 전달할 때 같은 값을 넘기므로 두 노드의 로그를 하나의 요청으로 묶을 수 있습니다. 변경 요청과 실패한 요청은 info, 성공한 조회는 debug로 남습니다.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: vigilante
+    authorization: {credentials_file: /etc/prometheus/vigilante-token}   # viewer@* 서비스 계정
+    static_configs: [{targets: ["vigilante-1:8088", "vigilante-2:8088"]}]
+```
 
 ## `agent`
 

@@ -16,6 +16,7 @@ import (
 	"vigilante/internal/notify"
 	"vigilante/internal/probe"
 	"vigilante/internal/safety"
+	"vigilante/internal/telemetry"
 )
 
 type RollbackOptions struct {
@@ -29,6 +30,8 @@ type RollbackOptions struct {
 	Targets  []string // override the target set
 	// Actor is who asked (auth principal ID); empty for automatic rollbacks.
 	Actor string
+	// DetectedAt is when the failing evaluation happened (automatic rollbacks).
+	DetectedAt time.Time
 }
 
 // ErrNeedsApproval marks a target whose remaining recovery path requires a human OK.
@@ -111,6 +114,14 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 	now := time.Now()
 	e.Guard.Record(svc.Name, now)
 	e.record(journal.Entry{Kind: journal.KindRollbackStart, Service: svc.Name, DeployID: d.ID, Time: now})
+	if !opt.DetectedAt.IsZero() {
+		telemetry.RollbackTrigger.Since(opt.DetectedAt)
+	}
+	result := "failed"
+	defer func() {
+		telemetry.Rollbacks.Inc(svc.Name, result)
+		telemetry.RollbackDuration.Since(now, result)
+	}()
 	reason := opt.Reason
 	if reason == "" {
 		reason = "manual rollback"
@@ -124,10 +135,12 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 		// Leadership moved mid-rollback. The new leader replays the recorded
 		// steps and finishes; this node must not report a failure it did not have.
 		e.Log.Warn("rollback handed over to the new leader", "deployment", d.ID)
+		result = "handed_over"
 		return ErrInactive
 	}
 
 	if len(failures) == 0 {
+		result = "rolled_back"
 		e.Breaker.Success()
 		e.setState(d, model.StateRolledBack, fmt.Sprintf("%d target(s) restored to %s", len(targets), d.PreviousVersion))
 		e.Notify.Send(ctx, notify.Message{Level: notify.Warning, Title: fmt.Sprintf("Rollback complete: %s back on %s", d.Service, d.PreviousVersion), Text: reason, Deployment: d})
@@ -144,6 +157,7 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 	}
 	summary := strings.Join(msgs, "; ")
 	if onlyApproval {
+		result = "await_approval"
 		e.setState(d, model.StateAwaitApproval, summary)
 		e.Notify.Send(ctx, notify.Message{Level: notify.Critical, Title: fmt.Sprintf("%s rollback needs approval", d.Service), Text: summary, Deployment: d})
 		return errors.New(summary)
@@ -176,6 +190,7 @@ func (e *Engine) blocked(ctx context.Context, d *model.Deployment, svc *config.S
 		}
 		isolated = e.isolate(ctx, tc, members)
 	}
+	telemetry.Rollbacks.Inc(svc.Name, "blocked")
 	reason := fmt.Sprintf("automatic rollback blocked: %v; isolation: %s", cause, isolated)
 	e.setState(d, model.StateRollbackFailed, reason)
 	e.Notify.Send(ctx, notify.Message{Level: notify.Critical, Title: fmt.Sprintf("%s: rollback blocked by safety guard", d.Service), Text: reason, Deployment: d})

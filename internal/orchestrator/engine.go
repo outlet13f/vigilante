@@ -29,6 +29,7 @@ import (
 	"vigilante/internal/rules"
 	"vigilante/internal/safety"
 	"vigilante/internal/store"
+	"vigilante/internal/telemetry"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -189,18 +190,26 @@ func (e *Engine) record(en journal.Entry) {
 	if en.Actor == "" {
 		en.Actor, en.Source = "system", "system"
 	}
+	backend := e.Cfg.Server.State.Backend
+	if backend == "" {
+		backend = "file"
+	}
+	started := time.Now()
 	err := e.Journal.Append(context.Background(), en)
+	telemetry.StoreAppend.Since(started, backend)
 	if err == nil && e.OnRecord != nil {
 		e.OnRecord(en)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrFenced) {
+			telemetry.StoreErrors.Inc("fenced")
 			if e.active.Load() {
 				e.Log.Error("leadership lost: state writes are fenced, standing down")
 			}
 			e.SetActive(false)
 			return
 		}
+		telemetry.StoreErrors.Inc("error")
 		e.Log.Error("state write failed", "err", err, "store", e.Journal.Describe())
 	}
 }
@@ -571,6 +580,7 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	e.mu.Lock()
 	d.Verdict, d.Breaches = out.Verdict, out.Breaches
 	e.mu.Unlock()
+	telemetry.Verdicts.Inc(svc.Name, string(phase), string(out.Verdict))
 
 	if ctx.Err() != nil && out.Verdict == model.VerdictHold {
 		e.setState(d, model.StateAborted, out.Reason)
@@ -588,7 +598,7 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 		e.Notify.Send(ctx, notify.Message{Level: notify.Warning, Title: fmt.Sprintf("%s %s HELD — human decision needed", d.Service, phase), Text: out.Reason, Deployment: d})
 	case model.VerdictFail:
 		e.event(d, "verdict", "FAIL: "+out.Reason)
-		e.Rollback(context.WithoutCancel(ctx), d, RollbackOptions{Reason: out.Reason})
+		e.Rollback(context.WithoutCancel(ctx), d, RollbackOptions{Reason: out.Reason, DetectedAt: out.EndedAt})
 	}
 	return nil
 }

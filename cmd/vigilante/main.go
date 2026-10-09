@@ -34,6 +34,7 @@ import (
 	"vigilante/internal/safety"
 	"vigilante/internal/secrets"
 	"vigilante/internal/store"
+	"vigilante/internal/telemetry"
 )
 
 var version = "0.1.0-dev"
@@ -70,6 +71,7 @@ Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=deb
 `
 
 func main() {
+	telemetry.Version = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -94,7 +96,12 @@ func logger() *slog.Logger {
 	case "warn":
 		lvl = slog.LevelWarn
 	}
-	return slog.New(secrets.RedactHandler{Handler: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})})
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if strings.EqualFold(os.Getenv("VIGILANTE_LOG_FORMAT"), "json") {
+		h = slog.NewJSONHandler(os.Stderr, opts) // one object per line, for log shippers
+	}
+	return slog.New(secrets.RedactHandler{Handler: h})
 }
 
 // loadConfig reads vigilante.yaml and installs the secrets resolver it
