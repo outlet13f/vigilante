@@ -80,7 +80,7 @@ batch       = allowed ≤ 0 ? 드레인 거부(제자리, 1대씩) : min(allowed
 2. 격리된 대상은 LB에서 빠져 있음 → 서비스 영향 최소. 원인 수정 후 `vigilante rollback --id <ID> [--executor <다른 전략>] [--approve]`로 재시도.
 3. 서킷 OPEN이면 원인(롤백 경로 자체 고장: 레지스트리 장애, 스냅샷 누락, 자격증명 만료 등) 해결 후 `vigilante circuit reset`.
 4. 플래핑 차단이면 이전 버전 자체를 의심 — 새 ID로 더 이전 버전을 지정해 수동 롤백: `vigilante rollback --id <NEW> --service S --version <불량> --previous <더 이전 버전>`.
-5. 감사: 저널(`journal_path`)은 모든 판정·단계·서킷 전이를 시간순 JSONL로 보관합니다.
+5. 감사: 모든 판정·단계·서킷 전이와 사람·CI의 조치(작업자, 티켓, 거부된 요청 포함)가 해시 체인으로 묶여 저장됩니다. 사고 조사 전에 `vigilante audit verify`로 기록이 변조되지 않았는지 먼저 확인하고, `vigilante audit query --since <시각>`으로 타임라인을 뽑으십시오.
 
 ## 6. 알려진 한계
 

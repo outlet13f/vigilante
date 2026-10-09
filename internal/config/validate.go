@@ -556,6 +556,14 @@ func (c *Config) Validate() error {
 		}
 	}
 	c.validateAuth(services, bad)
+	if sl := c.Audit.Syslog; sl != nil {
+		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
+			bad("audit.syslog.address must be tcp://host:port or udp://host:port")
+		}
+		if sl.Format != "" && sl.Format != "rfc5424" && sl.Format != "cef" {
+			bad("audit.syslog.format must be rfc5424 or cef")
+		}
+	}
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
 		bad("agent.failsafe must be hold|rollback")
 	}

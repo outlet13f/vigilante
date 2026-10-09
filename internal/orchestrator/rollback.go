@@ -88,6 +88,9 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 			return e.blocked(ctx, d, svc, err)
 		}
 	}
+	if !opt.Manual {
+		e.Audit(journal.Entry{Actor: "system", Source: "system", Action: "rollback.auto", Service: d.Service, DeployID: d.ID, Reason: opt.Reason})
+	}
 	if opt.Actor != "" {
 		e.mu.Lock()
 		if opt.Approved {

@@ -15,6 +15,7 @@
 //	POST /v1/webhooks/{provider}               github | gitlab | jenkins | generic
 //	GET  /v1/targets/{target}/metrics          latest values per metric (debug)
 //	GET  /v1/whoami                            the caller's identity and grants
+//	GET  /v1/audit?since&until&actor&service&action&kind&limit&format=csv   audit records
 //	GET  /healthz
 //
 // Every route but /healthz and signed webhooks requires a bearer token (see
@@ -26,6 +27,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,7 +41,9 @@ import (
 	"sync"
 	"time"
 
+	"vigilante/internal/audit"
 	"vigilante/internal/auth"
+	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 )
@@ -104,6 +108,7 @@ func (s *Server) Handler() http.Handler {
 			"circuit": s.E.Breaker.State().State, "dry_run": s.E.DryRun, "store": s.E.Journal.Describe()})
 	})
 	mux.HandleFunc("GET /v1/whoami", s.authn(s.whoami))
+	mux.HandleFunc("GET /v1/audit", s.authn(s.auditQuery))
 	mux.HandleFunc("POST /v1/deployments", s.authn(s.createDeployment))
 	mux.HandleFunc("GET /v1/deployments", s.authn(s.listDeployments))
 	mux.HandleFunc("GET /v1/deployments/{id}", s.authn(s.getDeployment))
@@ -198,7 +203,9 @@ func (s *Server) allow(w http.ResponseWriter, r *http.Request, a auth.Action, sv
 	if p != nil && p.Can(a, svc) {
 		return p, true
 	}
-	writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role %s on %s", principalID(p), auth.Required(a), describe(svc)))
+	err := fmt.Errorf("forbidden: %s needs role %s on %s", principalID(p), auth.Required(a), describe(svc))
+	s.denied(r, svc.Name, err)
+	writeErr(w, http.StatusForbidden, err)
 	return p, false
 }
 
@@ -210,8 +217,83 @@ func (s *Server) allowAny(w http.ResponseWriter, r *http.Request, a auth.Action,
 			return true
 		}
 	}
-	writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role %s on a service using %s", principalID(p), auth.Required(a), what))
+	err := fmt.Errorf("forbidden: %s needs role %s on a service using %s", principalID(p), auth.Required(a), what)
+	s.denied(r, "", err)
+	writeErr(w, http.StatusForbidden, err)
 	return false
+}
+
+// audit records an API action by the caller. X-Change-Ticket, when sent,
+// links the record to a change or incident ticket.
+func (s *Server) audit(r *http.Request, action, service, deployID, reason string) {
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: action,
+		Service: service, DeployID: deployID, Reason: reason, Ticket: r.Header.Get("X-Change-Ticket")})
+}
+
+// denied records a refused request; repeated denials are how probing shows up.
+func (s *Server) denied(r *http.Request, service string, err error) {
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: "denied",
+		Service: service, DeployID: r.PathValue("id"), Reason: r.Method + " " + r.URL.Path + ": " + err.Error(),
+		Ticket: r.Header.Get("X-Change-Ticket")})
+}
+
+// auditQuery returns audit records. Audit spans every service, so it needs a
+// viewer grant with scope *.
+func (s *Server) auditQuery(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.allow(w, r, auth.ActRead, auth.Service{}); !ok {
+		return
+	}
+	q := r.URL.Query()
+	f := audit.Filter{Actor: q.Get("actor"), Service: q.Get("service"), Action: q.Get("action"), Limit: 1000}
+	for _, k := range []struct {
+		name string
+		dst  *time.Time
+	}{{"since", &f.Since}, {"until", &f.Until}} {
+		if v := q.Get(k.name); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeErr(w, 400, fmt.Errorf("%s: use RFC 3339, e.g. 2026-10-01T00:00:00Z", k.name))
+				return
+			}
+			*k.dst = t
+		}
+	}
+	if v := q.Get("kind"); v != "" {
+		f.Kinds = map[string]bool{}
+		for _, k := range strings.Split(v, ",") {
+			f.Kinds[k] = true
+		}
+	}
+	if v := q.Get("limit"); v != "" {
+		if _, err := fmt.Sscan(v, &f.Limit); err != nil || f.Limit < 1 || f.Limit > 100000 {
+			writeErr(w, 400, errors.New("limit must be 1..100000"))
+			return
+		}
+	}
+	entries, err := audit.Query(r.Context(), s.E.Journal, f)
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if q.Get("format") == "csv" {
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="vigilante-audit.csv"`)
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"time", "kind", "actor", "source", "action", "service", "deployment_id", "state", "reason", "ticket", "hash"})
+		for _, e := range entries {
+			svc, dep, state := e.Service, e.DeployID, ""
+			if e.Deployment != nil {
+				svc, dep, state = e.Deployment.Service, e.Deployment.ID, string(e.Deployment.State)
+			}
+			if e.Circuit != nil {
+				state = string(e.Circuit.State)
+			}
+			_ = cw.Write([]string{e.Time.UTC().Format(time.RFC3339Nano), e.Kind, e.Actor, e.Source, e.Action, svc, dep, state, e.Reason, e.Ticket, e.Hash})
+		}
+		cw.Flush()
+		return
+	}
+	writeJSON(w, 200, entries)
 }
 
 func principalID(p *auth.Principal) string {
@@ -276,6 +358,7 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	s.audit(r, "deployment.create", d.Service, d.ID, fmt.Sprintf("%s %s -> %s", d.Service, d.PreviousVersion, d.Version))
 	writeJSON(w, 201, d)
 }
 
@@ -340,6 +423,7 @@ func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.audit(r, "deployment.abort", d.Service, d.ID, "")
 	writeJSON(w, 200, map[string]bool{"aborted": s.E.Abort(d.ID)})
 }
 
@@ -358,6 +442,7 @@ func (s *Server) circuitReset(w http.ResponseWriter, r *http.Request) {
 	}
 	s.E.Breaker.Reset()
 	s.E.Log.Warn("circuit reset", "by", p.ID)
+	s.audit(r, "circuit.reset", "", "", r.URL.Query().Get("reason"))
 	writeJSON(w, 200, s.E.Breaker.State())
 }
 
@@ -371,6 +456,7 @@ func (s *Server) circuitTrip(w http.ResponseWriter, r *http.Request) {
 		reason = "kill switch via API"
 	}
 	s.E.Breaker.Trip(reason + " (by " + p.ID + ")")
+	s.audit(r, "circuit.trip", "", "", reason)
 	writeJSON(w, 200, s.E.Breaker.State())
 }
 
@@ -418,6 +504,7 @@ func (s *Server) startPhase(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, err)
 		return
 	}
+	s.audit(r, "phase.start", d.Service, d.ID, r.PathValue("phase"))
 	if r.URL.Query().Get("wait") == "true" {
 		// Long-poll for CI jobs that prefer one blocking call.
 		for {
@@ -455,6 +542,7 @@ func (s *Server) manualRollback(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "manual rollback via API"
 	}
+	s.audit(r, "rollback.manual", d.Service, d.ID, reason)
 	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
 	writeJSON(w, 202, map[string]string{"status": "rollback started"})
 }
@@ -472,6 +560,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must approve", p.ID))
 		return
 	}
+	s.audit(r, "escalation.approve", d.Service, d.ID, "")
 	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
 	writeJSON(w, 202, map[string]string{"status": "approved; escalation running"})
 }
@@ -488,6 +577,7 @@ func (s *Server) captureBaseline(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.audit(r, "baseline.capture", r.PathValue("service"), "", window.String())
 	snap, err := s.E.CaptureBaseline(r.Context(), r.PathValue("service"), window)
 	if err != nil {
 		writeErr(w, 422, err)
@@ -591,6 +681,8 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	s.E.Audit(journal.Entry{Actor: p.ID, Source: "webhook", Action: "deployment.create", Service: d.Service, DeployID: d.ID,
+		Reason: fmt.Sprintf("%s %s -> %s", d.Service, d.PreviousVersion, d.Version)})
 	writeJSON(w, 201, d)
 }
 

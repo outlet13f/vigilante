@@ -32,6 +32,7 @@ services:    [...]   # 서비스 = 대상 + 프로브 + 규칙 + 단계 + 롤백
 safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼럼
 notify:      [...]   # 알림
 auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
+audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 ```
 
 ## `server`
@@ -316,6 +317,35 @@ auth:
 - 확인: `vigilante whoami --server URL` (환경변수 `VIGILANTE_TOKEN`의 신원과 권한 출력).
 - 모든 생성·롤백·승인 기록에 작업자(`created_by`, `rollback_requested_by`, `approved_by`)가 남습니다. 로컬 CLI 실행은 `cli:<OS 사용자>@<호스트>`로 기록됩니다.
 - OIDC를 설정하면 서버 시작 시 발급자(issuer)의 discovery 문서를 가져오므로 서버에서 SSO에 접근할 수 있어야 합니다.
+
+## `audit` — 감사 기록
+
+모든 판정·조치는 상태 저장소(파일 저널 또는 PostgreSQL)에 기록되고, 이 기록이 곧 감사 기록입니다.
+
+- **작업자:** 기록마다 `actor`(예: `user:alice`, `sa:ci-order`, `cli:bob@host`, 자동 조치는 `system`), `source`(api·cli·webhook·system), `action`, 대상 서비스·배포, `reason`이 남습니다.
+- **변경 티켓:** API는 `X-Change-Ticket` 헤더, CLI는 `--ticket`으로 받은 값을 `ticket`에 남깁니다.
+- **권한 거부:** 거부(403)된 요청도 `action: denied`로 남습니다. 반복되는 거부는 권한 탐색 시도의 신호입니다.
+- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. DB 관리자가 SQL로 직접 바꿔도 검출됩니다.
+
+```yaml
+audit:
+  syslog:
+    address: tcp://siem.example.internal:6514   # 또는 udp://...
+    format: rfc5424                              # rfc5424(JSON 본문, 기본) | cef
+  retention: 8760h                               # audit prune의 기본 보존 기간. 자동 삭제는 하지 않음
+```
+
+| 명령 | 하는 일 |
+|---|---|
+| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증. 끊어지면 exit 1 |
+| `vigilante audit verify --file ARCHIVE.jsonl` | 아카이브 파일만 따로 검증 |
+| `vigilante audit query -c FILE [--actor A] [--action denied] [--service S] [--since 2026-10-01]` | 감사 기록 조회 |
+| `vigilante audit export -c FILE --out F.jsonl` | 전체 기록을 체인 그대로 내보내기 |
+| `vigilante audit prune -c FILE --out ARCHIVE.jsonl [--before 2025-10-01 \| --older-than 8760h]` | 보존 기간이 지난 기록을 아카이브로 옮기고 삭제 |
+
+- **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
+- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
+- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
 
 ## `notify[]`
 

@@ -11,8 +11,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -29,6 +31,14 @@ type Store interface {
 	Append(ctx context.Context, e journal.Entry) error
 	// Load replays every event into a fresh state.
 	Load(ctx context.Context) (*journal.State, error)
+	// Scan visits every stored entry in order with its position (sequence
+	// number or line), for audit verification and queries.
+	Scan(ctx context.Context, fn func(pos int64, e journal.Entry) error) error
+	// Prune removes entries older than before: they are written to archive
+	// first (as JSONL, still verifiable on their own), then replaced by one
+	// anchor entry that carries the state they built and the hash the
+	// remaining chain links to. Returns how many entries were removed.
+	Prune(ctx context.Context, before time.Time, archive io.Writer) (int, error)
 	// TryLease acquires key for owner, or renews it if owner already holds
 	// it. It returns false while another owner holds an unexpired lease.
 	TryLease(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
@@ -41,6 +51,26 @@ type Store interface {
 	Fence(key, owner string)
 	Describe() string
 	Close() error
+}
+
+// anchorFor builds the anchor that replaces a pruned prefix.
+func anchorFor(pruned []journal.Entry, before time.Time) journal.Entry {
+	last := pruned[len(pruned)-1]
+	return journal.Entry{
+		Kind: journal.KindAnchor, Time: time.Now(), Hash: last.Hash, Actor: "system", Source: "cli", Action: "audit.prune",
+		Message:   fmt.Sprintf("pruned %d entries older than %s; chain continues from %s", len(pruned), before.Format(time.RFC3339), last.Hash),
+		Compacted: journal.Compact(pruned, before),
+	}
+}
+
+func writeArchive(w io.Writer, entries []journal.Entry) error {
+	enc := json.NewEncoder(w)
+	for _, e := range entries {
+		if err := enc.Encode(e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Open returns the backend configured in server.state.

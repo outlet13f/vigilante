@@ -27,6 +27,21 @@ type Config struct {
 	// PresetDirs holds organisation presets (*.yaml), relative to this file.
 	PresetDirs []string `yaml:"preset_dirs"`
 	Auth       Auth     `yaml:"auth"`
+	Audit      Audit    `yaml:"audit"`
+}
+
+// Audit configures where audit records go besides the journal itself.
+type Audit struct {
+	Syslog *SyslogExport `yaml:"syslog"`
+	// Retention is the default for `vigilante audit prune` (e.g. 8760h).
+	// Nothing is deleted automatically.
+	Retention time.Duration `yaml:"retention"`
+}
+
+// SyslogExport ships audit records to a SIEM.
+type SyslogExport struct {
+	Address string `yaml:"address"` // tcp://host:port or udp://host:port
+	Format  string `yaml:"format"`  // rfc5424 (default, JSON message) | cef
 }
 
 // Auth configures who may call the API and what they may do.

@@ -56,6 +56,9 @@ type Engine struct {
 	Log     *slog.Logger
 	DryRun  bool
 
+	// OnRecord sees every entry after it is durably stored (SIEM export).
+	OnRecord func(journal.Entry)
+
 	transport   *transport.Manager
 	runners     func(string) (transport.Runner, error)
 	trafficHTTP *http.Client
@@ -167,10 +170,30 @@ func (e *Engine) Active() bool { return e.active.Load() }
 // Owner is this process's identity in lease records.
 func (e *Engine) Owner() string { return e.owner }
 
+// Audit records who did what. Callers fill Actor, Source, Action and the
+// subject (Service / DeployID); the store chains it like every other entry.
+func (e *Engine) Audit(en journal.Entry) {
+	en.Kind = journal.KindAudit
+	if en.Time.IsZero() {
+		en.Time = time.Now()
+	}
+	e.record(en)
+}
+
 // record appends to the store. A fenced write means another node is leader
 // now: this node stops acting at once.
 func (e *Engine) record(en journal.Entry) {
-	if err := e.Journal.Append(context.Background(), en); err != nil {
+	if en.Time.IsZero() {
+		en.Time = time.Now()
+	}
+	if en.Actor == "" {
+		en.Actor, en.Source = "system", "system"
+	}
+	err := e.Journal.Append(context.Background(), en)
+	if err == nil && e.OnRecord != nil {
+		e.OnRecord(en)
+	}
+	if err != nil {
 		if errors.Is(err, store.ErrFenced) {
 			if e.active.Load() {
 				e.Log.Error("leadership lost: state writes are fenced, standing down")

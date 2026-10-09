@@ -25,6 +25,7 @@ import (
 
 	"vigilante/internal/agent"
 	"vigilante/internal/api"
+	"vigilante/internal/audit"
 	"vigilante/internal/config"
 	"vigilante/internal/executor"
 	"vigilante/internal/model"
@@ -55,6 +56,8 @@ Usage:
   vigilante presets [list | show NAME[@V] [--set k=v]...] [--dir DIRS]
   vigilante token    create --name NAME [--role ROLE] [--scope SCOPE] [--expires YYYY-MM-DD]
   vigilante whoami   --server URL
+  vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
+                     | query [--actor A] [--action X] [--service S] [--since DATE]
   vigilante plugins
   vigilante version
 
@@ -96,6 +99,7 @@ func logger() *slog.Logger {
 type common struct {
 	fs                                  *flag.FlagSet
 	config, service, ver, prev, id, srv string
+	ticket                              string
 	dryRun                              bool
 }
 
@@ -108,6 +112,7 @@ func newFlags(name string) *common {
 	c.fs.StringVar(&c.id, "id", "", "deployment id (e.g. CI pipeline id)")
 	c.fs.StringVar(&c.srv, "server", "", "delegate to a running orchestrator at URL")
 	c.fs.BoolVar(&c.dryRun, "dry-run", false, "log actions instead of executing them")
+	c.fs.StringVar(&c.ticket, "ticket", "", "change or incident ticket recorded in the audit trail")
 	return c
 }
 
@@ -171,6 +176,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdDoctor(ctx, args)
 	case "token":
 		return cmdToken(args)
+	case "audit":
+		return cmdAudit(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":
@@ -201,6 +208,7 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	}
 	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
+	cliAudit(e, c, "deployment.prepare", d.Service, d.ID, "")
 	err = e.Prepare(ctx, d)
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
@@ -259,6 +267,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
 	}
+	cliAudit(e, c, "phase.start", d.Service, d.ID, *phase)
 	if err := e.Watch(ctx, d, model.Phase(*phase)); err != nil {
 		e.MarkBlocked(d, err)
 		if errors.Is(err, safety.ErrCircuitOpen) {
@@ -374,6 +383,7 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 		svc, _ := e.Cfg.Service(d.Service)
 		opt.Targets = svc.Targets
 	}
+	cliAudit(e, c, map[bool]string{true: "escalation.approve", false: "rollback.manual"}[*approve], d.Service, d.ID, *reason)
 	_ = e.Rollback(ctx, d, opt)
 	cp, _ := e.Deployment(d.ID)
 	printJSON(cp)
@@ -404,6 +414,7 @@ func cmdMarkGood(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	cliAudit(e, c, "mark-good", d.Service, d.ID, c.ver)
 	fmt.Printf("%s %s recorded as known-good (%s); later deployments default --previous to it\n", d.Service, d.Version, d.ID)
 	return 0, nil
 }
@@ -490,8 +501,10 @@ func cmdCircuit(ctx context.Context, args []string) (int, error) {
 	case "status":
 	case "reset":
 		e.Breaker.Reset()
+		cliAudit(e, c, "circuit.reset", "", "", "")
 	case "trip":
 		e.Breaker.Trip(*reason)
+		cliAudit(e, c, "circuit.trip", "", "", *reason)
 	default:
 		return 1, fmt.Errorf("unknown circuit action %q", action)
 	}
@@ -519,6 +532,15 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	}
 	if srv.Auth.Disabled() {
 		e.Log.Warn("API authentication disabled: configure auth (service accounts / OIDC) or server.auth_token_env")
+	}
+	if sl := e.Cfg.Audit.Syslog; sl != nil {
+		x, err := audit.NewExporter(*sl, e.Log)
+		if err != nil {
+			return 1, err
+		}
+		e.OnRecord = x.Send
+		go x.Run(ctx)
+		e.Log.Info("audit records exported", "to", sl.Address, "format", sl.Format)
 	}
 	role := "single node"
 	if e.Cfg.Server.HA.Enabled {

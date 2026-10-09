@@ -57,7 +57,9 @@ VIGILANTE_TOKEN=vgl_... vigilante whoami --server https://vigilante:8088
 vigilante server -c vigilante.yaml                                      # REST + 웹훅 + 크래시 재개 (auth·HA 설정 시 적용)
 vigilante watch --server https://vigilante:8088 --service ... --phase canary
 vigilante agent -c vigilante.yaml --target order-bm-01 --server https://vigilante:8088
-vigilante circuit -c vigilante.yaml status|reset|trip
+vigilante circuit -c vigilante.yaml status|reset|trip [--ticket CHG-123]
+vigilante audit verify -c vigilante.yaml                               # 감사 기록 변조 검사 (해시 체인)
+vigilante audit query  -c vigilante.yaml --action denied --since 2026-10-01
 vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--approve]
 ```
 

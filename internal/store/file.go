@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,9 +36,164 @@ func OpenFile(path string) (Store, error) {
 
 func (f *fileStore) Describe() string { return "file:" + f.path }
 
-func (f *fileStore) Append(_ context.Context, e journal.Entry) error { return f.j.Append(e) }
+// Append seals the entry onto the hash chain. Several processes (CI jobs)
+// may share one journal file, so appends are serialised with a lock file and
+// the chain head is re-read from the file's tail each time.
+func (f *fileStore) Append(_ context.Context, e journal.Entry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	unlock, err := f.lockAppend()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	head, err := tailHash(f.path)
+	if err != nil {
+		return err
+	}
+	if e.Time.IsZero() {
+		e.Time = time.Now()
+	}
+	e.Chain(head)
+	return f.j.Append(e)
+}
 
 func (f *fileStore) Load(context.Context) (*journal.State, error) { return journal.Replay(f.path) }
+
+func (f *fileStore) Scan(_ context.Context, fn func(pos int64, e journal.Entry) error) error {
+	fh, err := os.Open(f.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer fh.Close()
+	sc := bufio.NewScanner(fh)
+	sc.Buffer(make([]byte, 1<<20), 16<<20)
+	var line int64
+	for sc.Scan() {
+		line++
+		var e journal.Entry
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			return fmt.Errorf("line %d: unreadable entry: %w", line, err)
+		}
+		if err := fn(line, e); err != nil {
+			return err
+		}
+	}
+	return sc.Err()
+}
+
+// Prune rewrites the journal: the pruned prefix goes to archive, an anchor
+// replaces it. The journal is rewritten under the append lock and replaced
+// atomically; run it while no server is using this file.
+func (f *fileStore) Prune(ctx context.Context, before time.Time, archive io.Writer) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	unlock, err := f.lockAppend()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	var all []journal.Entry
+	if err := f.Scan(ctx, func(_ int64, e journal.Entry) error { all = append(all, e); return nil }); err != nil {
+		return 0, err
+	}
+	cut := 0
+	for cut < len(all) && all[cut].Time.Before(before) {
+		cut++
+	}
+	if cut == 0 {
+		return 0, nil
+	}
+	if err := writeArchive(archive, all[:cut]); err != nil {
+		return 0, err
+	}
+	rest := append([]journal.Entry{anchorFor(all[:cut], before)}, all[cut:]...)
+	tmp := f.path + ".prune.tmp"
+	fh, err := os.Create(tmp)
+	if err != nil {
+		return 0, err
+	}
+	if err := writeArchive(fh, rest); err != nil {
+		fh.Close()
+		return 0, err
+	}
+	if err := fh.Close(); err != nil {
+		return 0, err
+	}
+	if err := f.j.Close(); err != nil { // Windows cannot replace an open file
+		return 0, err
+	}
+	if err := os.Rename(tmp, f.path); err != nil {
+		return 0, err
+	}
+	if f.j, err = journal.Open(f.path); err != nil {
+		return 0, err
+	}
+	return cut, nil
+}
+
+// lockAppend takes an exclusive lock file for one append (stale after 10s).
+func (f *fileStore) lockAppend() (func(), error) {
+	path := f.path + ".lock"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		fh, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			fh.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) > 10*time.Second {
+			os.Remove(path) // left by a crashed process
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("journal %s is locked by another process", f.path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// tailHash returns the hash of the last entry in the file ("" if none).
+func tailHash(path string) (string, error) {
+	fh, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	if err != nil {
+		return "", err
+	}
+	// Entries are single lines well under 1 MiB; read the last chunk.
+	size := st.Size()
+	chunk := int64(1 << 20)
+	if size < chunk {
+		chunk = size
+	}
+	buf := make([]byte, chunk)
+	if _, err := fh.ReadAt(buf, size-chunk); err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e struct {
+			Hash string `json:"hash"`
+		}
+		if json.Unmarshal([]byte(lines[i]), &e) == nil {
+			return e.Hash, nil // "" for a legacy (pre-chain) entry: the chain starts fresh
+		}
+	}
+	return "", nil
+}
 
 // Fence is a no-op: a file store has a single writer by construction.
 func (f *fileStore) Fence(string, string) {}

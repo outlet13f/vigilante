@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"vigilante/internal/auth"
 	"vigilante/internal/config"
@@ -269,5 +270,63 @@ func TestFourEyesApproval(t *testing.T) {
 	}
 	if r, _ := call(t, "POST", hs.URL+"/v1/deployments/d1/approve", bob, "", nil); r.StatusCode != 202 {
 		t.Fatalf("second operator approval: %d", r.StatusCode)
+	}
+	// The approved rollback runs in the background; let it finish writing.
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		if d, _ := s.E.Deployment("d1"); d.State.Terminal() {
+			if d.ApprovedBy != "sa:bob-bot" {
+				t.Fatalf("approver not recorded: %q", d.ApprovedBy)
+			}
+			return
+		}
+	}
+	t.Fatal("approved rollback did not finish")
+}
+
+func TestAuditTrailOverAPI(t *testing.T) {
+	deployer, y1 := sa(t, "ci-svc", "deployer", "service=svc")
+	scopedViewer, y2 := sa(t, "team-dash", "viewer", "team=payments")
+	auditor, y3 := sa(t, "auditor", "viewer", "*")
+	_, hs := newTestServerWith(t, "auth:\n  service_accounts:\n"+y1+y2+y3)
+
+	hdr := map[string]string{"X-Change-Ticket": "CHG-1234"}
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments", deployer, `{"id":"d1","service":"svc","version":"v2","previous_version":"v1"}`, hdr); r.StatusCode != 201 {
+		t.Fatalf("create: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/circuit/reset", deployer, "", nil); r.StatusCode != 403 {
+		t.Fatalf("expected denial: %d", r.StatusCode)
+	}
+	// Audit spans all services: a team-scoped viewer may not read it.
+	if r, _ := call(t, "GET", hs.URL+"/v1/audit", scopedViewer, "", nil); r.StatusCode != 403 {
+		t.Fatalf("scoped viewer read audit: %d", r.StatusCode)
+	}
+	req, _ := http.NewRequest("GET", hs.URL+"/v1/audit?kind=audit", nil)
+	req.Header.Set("Authorization", "Bearer "+auditor)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	json.NewDecoder(resp.Body).Decode(&entries)
+	resp.Body.Close()
+	var created, denied bool
+	for _, e := range entries {
+		switch e["action"] {
+		case "deployment.create":
+			created = created || e["actor"] == "sa:ci-svc" && e["ticket"] == "CHG-1234" && e["hash"] != ""
+		case "denied":
+			denied = denied || e["actor"] == "sa:ci-svc" && strings.Contains(e["reason"].(string), "/v1/circuit/reset")
+		}
+	}
+	if !created || !denied {
+		t.Fatalf("audit entries missing (created=%v denied=%v): %v", created, denied, entries)
+	}
+	req, _ = http.NewRequest("GET", hs.URL+"/v1/audit?format=csv&action=denied", nil)
+	req.Header.Set("Authorization", "Bearer "+auditor)
+	resp, _ = http.DefaultClient.Do(req)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.HasPrefix(string(body), "time,kind,actor,source,action") || !strings.Contains(string(body), "sa:team-dash") {
+		t.Fatalf("csv export:\n%s", body)
 	}
 }
