@@ -4,12 +4,11 @@
 package safety
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -156,23 +155,38 @@ func (b *Breaker) State() CircuitState {
 	return st
 }
 
-// Guard enforces one rollback per service at a time (in-process and, via lock
-// files, across concurrent CI jobs) plus flapping / cooldown limits.
+// Leases is the part of the state store a Guard needs (store.Store has it).
+type Leases interface {
+	TryLease(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
+	ReleaseLease(ctx context.Context, key, owner string) error
+	LeaseHolder(ctx context.Context, key string) (string, error)
+}
+
+// Guard enforces one rollback per service at a time (in-process, and through
+// state-store leases across processes and server nodes) plus flapping and
+// cooldown limits.
 type Guard struct {
 	mu      sync.Mutex
 	cfg     config.Flapping
 	locks   map[string]bool
 	history map[string][]time.Time
-	LockDir string        // "" disables cross-process locks
-	Stale   time.Duration // lock files older than this are considered abandoned
-	Now     func() time.Time
+	// Leases makes the lock visible to other processes; nil = in-process only.
+	Leases Leases
+	// Owner identifies this process in lease records.
+	Owner string
+	// TTL bounds how long a crashed holder blocks the service; the lease is
+	// renewed every TTL/3 while held, so long rollbacks keep it.
+	TTL time.Duration
+	Now func() time.Time
 }
 
 func NewGuard(cfg config.Flapping, history map[string][]time.Time) *Guard {
 	if history == nil {
 		history = map[string][]time.Time{}
 	}
-	return &Guard{cfg: cfg, locks: map[string]bool{}, history: history, Stale: 30 * time.Minute, Now: time.Now}
+	host, _ := os.Hostname()
+	return &Guard{cfg: cfg, locks: map[string]bool{}, history: history,
+		Owner: fmt.Sprintf("%s/%d", host, os.Getpid()), TTL: 2 * time.Minute, Now: time.Now}
 }
 
 func (g *Guard) Acquire(service string) (release func(), err error) {
@@ -181,51 +195,59 @@ func (g *Guard) Acquire(service string) (release func(), err error) {
 	if g.locks[service] {
 		return nil, ErrLocked
 	}
-	var lockFile string
-	if g.LockDir != "" {
-		lockFile = filepath.Join(g.LockDir, "vigilante-"+sanitize(service)+".lock")
-		if err := g.lockFile(lockFile); err != nil {
+	var stopRenew func()
+	if g.Leases != nil {
+		key := "service:" + service
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ok, err := g.Leases.TryLease(ctx, key, g.Owner, g.TTL)
+		if err == nil && !ok {
+			holder, _ := g.Leases.LeaseHolder(ctx, key)
+			err = fmt.Errorf("%w (held by %s)", ErrLocked, holder)
+		}
+		cancel()
+		if err != nil {
 			return nil, err
 		}
+		stopRenew = g.renew(key)
 	}
 	g.locks[service] = true
 	return func() {
 		g.mu.Lock()
 		delete(g.locks, service)
 		g.mu.Unlock()
-		if lockFile != "" {
-			os.Remove(lockFile)
+		if stopRenew != nil {
+			stopRenew()
 		}
 	}, nil
 }
 
-func (g *Guard) lockFile(path string) error {
-	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err == nil {
-			fmt.Fprintf(f, "%d %s\n", os.Getpid(), g.Now().Format(time.RFC3339))
-			return f.Close()
+// renew keeps a held lease alive until the returned stop function runs, then
+// releases it.
+func (g *Guard) renew(key string) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(g.TTL / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, _ = g.Leases.TryLease(rctx, key, g.Owner, g.TTL)
+				rcancel()
+			}
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		if fi, serr := os.Stat(path); serr == nil && g.Now().Sub(fi.ModTime()) > g.Stale {
-			os.Remove(path) // abandoned by a crashed process
-			continue
-		}
-		owner, _ := os.ReadFile(path)
-		return fmt.Errorf("%w (lock %s held by %s)", ErrLocked, path, strings.TrimSpace(string(owner)))
+	}()
+	return func() {
+		cancel()
+		<-done
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = g.Leases.ReleaseLease(rctx, key, g.Owner)
+		rcancel()
 	}
-	return ErrLocked
-}
-
-func sanitize(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '/' || r == '\\' || r == ':' || r == ' ' {
-			return '_'
-		}
-		return r
-	}, s)
 }
 
 // Check rejects an automatic rollback when the service is flapping (the

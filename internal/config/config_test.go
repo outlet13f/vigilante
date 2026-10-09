@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReferenceConfigValidates(t *testing.T) {
@@ -97,5 +98,36 @@ services:
 `))
 	if err == nil || !strings.Contains(err.Error(), "could never fail") {
 		t.Fatalf("phase selecting only notify rules must be rejected, got %v", err)
+	}
+}
+
+func TestStateAndHAValidation(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x}
+server:
+`
+	cases := map[string]string{
+		"  ha: {enabled: true, advertise_url: http://n1}\n":                                                   "requires server.state.backend: postgres",
+		"  state: {backend: postgres}\n":                                                                      "postgres needs dsn or dsn_env",
+		"  state: {backend: etcd}\n":                                                                          "must be file|postgres",
+		"  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true}\n":                                  "advertise_url required",
+		"  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true, advertise_url: u, lease_ttl: 1s}\n": "at least 3s",
+	}
+	for tail, want := range cases {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	c, err := Parse([]byte(base + "  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true, advertise_url: http://n1:8088}\n"))
+	if err != nil || c.Server.HA.LeaseTTL != 15*time.Second {
+		t.Fatalf("valid HA config: %v %+v", err, c)
 	}
 }

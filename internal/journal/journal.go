@@ -107,12 +107,42 @@ func (s *State) InFlight() []*model.Deployment {
 	return out
 }
 
-func Replay(path string) (*State, error) {
-	st := &State{
+// NewState returns an empty replay state.
+func NewState() *State {
+	return &State{
 		Deployments: map[string]*model.Deployment{},
 		Rollbacks:   map[string][]time.Time{},
 		StepsDone:   map[string]map[string]int{},
 	}
+}
+
+// Apply folds one entry into the state. Every store backend replays through
+// this, so file and database journals mean exactly the same thing.
+func (st *State) Apply(e Entry) {
+	switch e.Kind {
+	case KindDeployment:
+		if e.Deployment != nil {
+			st.Deployments[e.Deployment.ID] = e.Deployment
+		}
+	case KindCircuit:
+		st.Circuit = e.Circuit
+	case KindRollbackStart:
+		st.Rollbacks[e.Service] = append(st.Rollbacks[e.Service], e.Time)
+	case KindStepDone:
+		m := st.StepsDone[e.DeployID]
+		if m == nil {
+			m = map[string]int{}
+			st.StepsDone[e.DeployID] = m
+		}
+		if e.Step+1 > m[e.Target] {
+			m[e.Target] = e.Step + 1
+		}
+	}
+}
+
+// Replay rebuilds state from a JSONL journal file (a missing file is empty).
+func Replay(path string) (*State, error) {
+	st := NewState()
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
@@ -129,25 +159,7 @@ func Replay(path string) (*State, error) {
 			st.Corrupt++
 			continue
 		}
-		switch e.Kind {
-		case KindDeployment:
-			if e.Deployment != nil {
-				st.Deployments[e.Deployment.ID] = e.Deployment
-			}
-		case KindCircuit:
-			st.Circuit = e.Circuit
-		case KindRollbackStart:
-			st.Rollbacks[e.Service] = append(st.Rollbacks[e.Service], e.Time)
-		case KindStepDone:
-			m := st.StepsDone[e.DeployID]
-			if m == nil {
-				m = map[string]int{}
-				st.StepsDone[e.DeployID] = m
-			}
-			if e.Step+1 > m[e.Target] {
-				m[e.Target] = e.Step + 1
-			}
-		}
+		st.Apply(e)
 	}
 	if err := sc.Err(); err != nil {
 		return st, fmt.Errorf("replay %s: %w", path, err)

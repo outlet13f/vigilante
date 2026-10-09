@@ -34,6 +34,27 @@ type Server struct {
 	JournalPath   string `yaml:"journal_path"`
 	DryRun        bool   `yaml:"dry_run"`
 	WebhookSecret string `yaml:"webhook_secret_env"`
+	State         State  `yaml:"state"`
+	HA            HA     `yaml:"ha"`
+}
+
+// State selects where decisions, rollback progress, circuit state and locks
+// are kept. "file" (default) is the JSONL journal at journal_path, for a single
+// node or CI. "postgres" is shared by every node and enables HA.
+type State struct {
+	Backend string `yaml:"backend"` // file | postgres
+	DSN     string `yaml:"dsn"`     // avoid inline passwords; prefer dsn_env
+	DSNEnv  string `yaml:"dsn_env"`
+}
+
+// HA runs several `vigilante server` nodes against one postgres state store:
+// one leader acts, the others forward API calls to it and take over when its
+// lease expires.
+type HA struct {
+	Enabled      bool          `yaml:"enabled"`
+	AdvertiseURL string        `yaml:"advertise_url"` // how other nodes reach this node's API
+	NodeID       string        `yaml:"node_id"`       // default: hostname
+	LeaseTTL     time.Duration `yaml:"lease_ttl"`
 }
 
 // Agent configures the optional push agent (`vigilante agent`).

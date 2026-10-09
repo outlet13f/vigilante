@@ -40,8 +40,23 @@ notify:      [...]   # 알림
 | `listen` | `:8088` | REST API 주소 |
 | `auth_token_env` | — | Bearer 토큰 환경변수. 비우면 인증 비활성(개발용, 경고 로그) |
 | `webhook_secret_env` | — | GitHub HMAC 서명 / GitLab `X-Gitlab-Token` 검증 비밀 |
-| `journal_path` | `vigilante-journal.jsonl` | WAL 저널. **CI 단발 실행 간 서킷/플래핑 이력 공유를 위해 공유 경로 권장**. 같은 디렉토리에 서비스별 롤백 락 파일 생성 |
+| `journal_path` | `vigilante-journal.jsonl` | `state.backend: file`일 때의 WAL 저널. **CI 단발 실행 간 서킷/플래핑 이력 공유를 위해 공유 경로 권장**. 같은 디렉토리에 리스(락) 파일 생성 |
 | `dry_run` | `false` | 모든 변경 액션을 로그로만 출력 (읽기 전용 명령·체크포인트는 실행) |
+| `state.backend` | `file` | `file`(단일 노드·CI) \| `postgres`(여러 노드가 공유, HA 전제) |
+| `state.dsn_env` / `state.dsn` | — | PostgreSQL 접속 문자열. 비밀번호가 들어가므로 `dsn_env` 권장. 스키마는 시작 시 자동 마이그레이션 |
+| `ha.enabled` | `false` | 여러 `vigilante server` 노드 중 하나만 리더로 동작. `postgres` 필수 |
+| `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달 |
+| `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름 |
+| `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
+
+```yaml
+server:
+  listen: ":8088"
+  state: {backend: postgres, dsn_env: VIGILANTE_PG_DSN}
+  ha: {enabled: true, advertise_url: "https://vigilante-1.internal:8088", lease_ttl: 15s}
+```
+
+리더만 판정·롤백을 실행하고 상태를 기록합니다. 리더 자리를 잃은 노드의 기록은 DB에서 거부되므로(펜싱) 두 노드가 동시에 결정을 남기지 않습니다. 새 리더는 공유 상태를 다시 읽고, 진행 중이던 롤백을 완료된 단계부터 이어서 끝냅니다.
 
 ## `agent`
 

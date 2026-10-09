@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -43,13 +45,28 @@ type Server struct {
 	// WebhookSecret verifies GitHub signatures / GitLab tokens.
 	WebhookSecret string
 
-	ctx    context.Context
-	mu     sync.Mutex
-	agents map[string]time.Time
+	// HA is set when several nodes share a postgres store; followers forward
+	// every API call to the leader. nil = single node.
+	HA Leadership
+
+	ctx     context.Context
+	mu      sync.Mutex
+	agents  map[string]time.Time
+	proxies map[string]*httputil.ReverseProxy
 }
 
+// Leadership is what the API needs from the HA elector.
+type Leadership interface {
+	IsLeader() bool
+	Leader() (node, addr string)
+}
+
+// forwardedHeader marks a request a follower already forwarded, so a request
+// is never bounced between two nodes that disagree during a leader change.
+const forwardedHeader = "X-Vigilante-Forwarded-By"
+
 func New(ctx context.Context, e *orchestrator.Engine) *Server {
-	s := &Server{E: e, ctx: ctx, agents: map[string]time.Time{}}
+	s := &Server{E: e, ctx: ctx, agents: map[string]time.Time{}, proxies: map[string]*httputil.ReverseProxy{}}
 	if env := e.Cfg.Server.AuthTokenEnv; env != "" {
 		s.Token = os.Getenv(env)
 	}
@@ -62,7 +79,16 @@ func New(ctx context.Context, e *orchestrator.Engine) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "circuit": s.E.Breaker.State().State, "dry_run": s.E.DryRun})
+		role, leader := "single", ""
+		if s.HA != nil {
+			role = "follower"
+			if s.HA.IsLeader() {
+				role = "leader"
+			}
+			_, leader = s.HA.Leader()
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "role": role, "leader": leader, "active": s.E.Active(),
+			"circuit": s.E.Breaker.State().State, "dry_run": s.E.DryRun, "store": s.E.Journal.Describe()})
 	})
 	mux.HandleFunc("POST /v1/deployments", s.auth(s.createDeployment))
 	mux.HandleFunc("GET /v1/deployments", s.auth(func(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +121,43 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/agents/{target}/heartbeat", s.auth(s.heartbeat))
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
 	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.auth(s.targetMetrics))
-	return mux
+	return s.forwardToLeader(mux)
+}
+
+// forwardToLeader sends every API call except /healthz to the HA leader when
+// this node is a follower, so clients may talk to any node.
+func (s *Server) forwardToLeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.HA == nil || s.HA.IsLeader() || r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		node, addr := s.HA.Leader()
+		if addr == "" || r.Header.Get(forwardedHeader) != "" {
+			w.Header().Set("Retry-After", "2")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no leader available yet; retry shortly"})
+			return
+		}
+		s.mu.Lock()
+		p, ok := s.proxies[addr]
+		if !ok {
+			target, err := url.Parse(addr)
+			if err != nil {
+				s.mu.Unlock()
+				writeErr(w, http.StatusBadGateway, fmt.Errorf("leader %s advertises an invalid URL %q", node, addr))
+				return
+			}
+			p = httputil.NewSingleHostReverseProxy(target)
+			p.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+				w.Header().Set("Retry-After", "2")
+				writeErr(w, http.StatusBadGateway, fmt.Errorf("leader %s unreachable: %w", node, err))
+			}
+			s.proxies[addr] = p
+		}
+		s.mu.Unlock()
+		r.Header.Set(forwardedHeader, s.E.Owner())
+		p.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {

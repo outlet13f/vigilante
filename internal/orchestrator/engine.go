@@ -13,9 +13,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vigilante/internal/config"
@@ -28,6 +28,7 @@ import (
 	"vigilante/internal/probe"
 	"vigilante/internal/rules"
 	"vigilante/internal/safety"
+	"vigilante/internal/store"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -38,12 +39,17 @@ type Options struct {
 	Runners func(target string) (transport.Runner, error) // override (tests)
 	// TrafficHTTP overrides the HTTP client of API-driven traffic controllers (tests).
 	TrafficHTTP *http.Client
+	// Store overrides the state store from server.state (tests, HA wiring).
+	// The engine closes only a store it opened itself.
+	Store store.Store
+	// Owner names this process in lease records (default host/pid).
+	Owner string
 }
 
 type Engine struct {
 	Cfg     *config.Config
 	Store   *metrics.Store
-	Journal *journal.Journal
+	Journal store.Store
 	Breaker *safety.Breaker
 	Guard   *safety.Guard
 	Notify  *notify.Notifier
@@ -53,6 +59,11 @@ type Engine struct {
 	transport   *transport.Manager
 	runners     func(string) (transport.Runner, error)
 	trafficHTTP *http.Client
+	ownsStore   bool
+	owner       string
+	// active is false on an HA follower or a demoted leader: no new phases
+	// or rollback steps start, and fenced writes have already been refused.
+	active atomic.Bool
 
 	mu          sync.Mutex
 	deployments map[string]*model.Deployment
@@ -63,57 +74,119 @@ type Engine struct {
 	inflight    []*model.Deployment
 }
 
-// New replays the journal and wires every component.
+// ErrInactive is returned when this node may not act (HA follower or demoted leader).
+var ErrInactive = errors.New("this node is not the active leader")
+
+// New opens the state store, replays it and wires every component.
 func New(cfg *config.Config, opt Options) (*Engine, error) {
 	log := opt.Log
 	if log == nil {
 		log = slog.Default()
 	}
-	st, err := journal.Replay(cfg.Server.JournalPath)
-	if err != nil {
-		return nil, err
-	}
-	if st.Corrupt > 0 {
-		log.Warn("journal contained unreadable lines (skipped)", "count", st.Corrupt)
-	}
-	j, err := journal.Open(cfg.Server.JournalPath)
-	if err != nil {
-		return nil, err
+	st := opt.Store
+	owns := false
+	if st == nil {
+		var err error
+		if st, err = store.Open(context.Background(), cfg); err != nil {
+			return nil, err
+		}
+		owns = true
 	}
 	e := &Engine{
-		Cfg:         cfg,
-		Store:       metrics.NewStore(30 * time.Minute),
-		Journal:     j,
-		Notify:      notify.New(cfg.Notify, log),
-		Log:         log,
-		DryRun:      opt.DryRun || cfg.Server.DryRun,
-		transport:   transport.NewManager(cfg),
-		deployments: st.Deployments,
-		stepsDone:   st.StepsDone,
-		baselines:   map[string]*rules.Snapshot{},
-		cancels:     map[string]context.CancelFunc{},
-		lastEval:    map[string]decision.Evaluation{},
-		inflight:    st.InFlight(),
+		Cfg:       cfg,
+		Store:     metrics.NewStore(30 * time.Minute),
+		Journal:   st,
+		Notify:    notify.New(cfg.Notify, log),
+		Log:       log,
+		DryRun:    opt.DryRun || cfg.Server.DryRun,
+		transport: transport.NewManager(cfg),
+		ownsStore: owns,
+		owner:     opt.Owner,
+		baselines: map[string]*rules.Snapshot{},
+		cancels:   map[string]context.CancelFunc{},
+		lastEval:  map[string]decision.Evaluation{},
+	}
+	if e.owner == "" {
+		host, _ := os.Hostname()
+		e.owner = fmt.Sprintf("%s/%d", host, os.Getpid())
 	}
 	e.runners = e.transport.ForTarget
 	e.trafficHTTP = opt.TrafficHTTP
 	if opt.Runners != nil {
 		e.runners = opt.Runners
 	}
-	e.Breaker = safety.NewBreaker(cfg.Safety.CircuitBreaker, st.Circuit)
-	e.Breaker.Persist = func(s safety.CircuitState) {
-		if err := e.Journal.Append(journal.Entry{Kind: journal.KindCircuit, Circuit: &s}); err != nil {
-			log.Error("journal write failed", "err", err)
+	e.active.Store(true)
+	if err := e.Reload(context.Background()); err != nil {
+		if owns {
+			st.Close()
 		}
+		return nil, err
 	}
-	e.Guard = safety.NewGuard(cfg.Safety.Flapping, st.Rollbacks)
-	e.Guard.LockDir = filepath.Dir(cfg.Server.JournalPath)
 	return e, nil
+}
+
+// Reload rebuilds in-memory state from the store: deployments, rollback
+// progress, circuit breaker and flapping history. A node calls it when it
+// becomes HA leader, because the previous leader may have written since.
+func (e *Engine) Reload(ctx context.Context) error {
+	st, err := e.Journal.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("load state from %s: %w", e.Journal.Describe(), err)
+	}
+	if st.Corrupt > 0 {
+		e.Log.Warn("state contained unreadable entries (skipped)", "count", st.Corrupt)
+	}
+	breaker := safety.NewBreaker(e.Cfg.Safety.CircuitBreaker, st.Circuit)
+	breaker.Persist = func(s safety.CircuitState) {
+		e.record(journal.Entry{Kind: journal.KindCircuit, Circuit: &s})
+	}
+	guard := safety.NewGuard(e.Cfg.Safety.Flapping, st.Rollbacks)
+	guard.Leases, guard.Owner = e.Journal, e.owner
+	e.mu.Lock()
+	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
+	e.Breaker, e.Guard = breaker, guard
+	e.mu.Unlock()
+	return nil
+}
+
+// SetActive switches this node between acting (leader / single node) and
+// standing by (HA follower or demoted). Deactivating cancels observations.
+func (e *Engine) SetActive(on bool) {
+	e.active.Store(on)
+	if !on {
+		e.mu.Lock()
+		for _, cancel := range e.cancels {
+			cancel()
+		}
+		e.mu.Unlock()
+	}
+}
+
+func (e *Engine) Active() bool { return e.active.Load() }
+
+// Owner is this process's identity in lease records.
+func (e *Engine) Owner() string { return e.owner }
+
+// record appends to the store. A fenced write means another node is leader
+// now: this node stops acting at once.
+func (e *Engine) record(en journal.Entry) {
+	if err := e.Journal.Append(context.Background(), en); err != nil {
+		if errors.Is(err, store.ErrFenced) {
+			if e.active.Load() {
+				e.Log.Error("leadership lost: state writes are fenced, standing down")
+			}
+			e.SetActive(false)
+			return
+		}
+		e.Log.Error("state write failed", "err", err, "store", e.Journal.Describe())
+	}
 }
 
 func (e *Engine) Close() {
 	e.transport.Close()
-	e.Journal.Close()
+	if e.ownsStore {
+		e.Journal.Close()
+	}
 }
 
 // persist journals a snapshot of the deployment (caller must not hold e.mu).
@@ -124,9 +197,7 @@ func (e *Engine) persist(d *model.Deployment) {
 	cp.Breaches = append([]model.Breach(nil), d.Breaches...)
 	e.deployments[d.ID] = d
 	e.mu.Unlock()
-	if err := e.Journal.Append(journal.Entry{Kind: journal.KindDeployment, Deployment: &cp}); err != nil {
-		e.Log.Error("journal write failed", "err", err)
-	}
+	e.record(journal.Entry{Kind: journal.KindDeployment, Deployment: &cp})
 }
 
 func (e *Engine) event(d *model.Deployment, kind, msg string, args ...any) {
@@ -405,6 +476,9 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	pc, ok := svc.Phases[string(phase)]
 	if !ok {
 		return fmt.Errorf("service %s has no phase %q configured", svc.Name, phase)
+	}
+	if !e.Active() {
+		return ErrInactive
 	}
 	if len(svc.PhaseTargets(string(phase))) == 0 {
 		return fmt.Errorf("service %s phase %s resolves to no targets", svc.Name, phase)

@@ -233,6 +233,8 @@ func (a *Agent) failsafe(ctx context.Context) {
 func (a *Agent) localRollback(ctx context.Context, d *model.Deployment, reason string) error {
 	cfg := *a.Cfg
 	cfg.Server.JournalPath = filepath.Join(filepath.Dir(a.Cfg.Server.JournalPath), "vigilante-agent-"+a.Target+".jsonl")
+	cfg.Server.State = config.State{Backend: "file"} // the shared store may be unreachable too
+	cfg.Server.HA = config.HA{}
 	cfg.Services = append([]config.Service(nil), a.Cfg.Services...)
 	cfg.Targets = append([]config.Target(nil), a.Cfg.Targets...)
 	for i := range cfg.Targets {

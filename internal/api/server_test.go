@@ -138,3 +138,38 @@ func TestCreateFillsPreviousFromLastGood(t *testing.T) {
 		t.Fatalf("create: %d %v", r.StatusCode, d["previous_version"])
 	}
 }
+
+type fakeLeadership struct {
+	leader bool
+	addr   string
+}
+
+func (f fakeLeadership) IsLeader() bool           { return f.leader }
+func (f fakeLeadership) Leader() (string, string) { return "node-x", f.addr }
+
+func TestFollowerForwardsToLeader(t *testing.T) {
+	leader, leaderHS := newTestServer(t)
+	leader.HA = fakeLeadership{leader: true}
+	call(t, "POST", leaderHS.URL+"/v1/deployments", "tok", `{"id":"on-leader","service":"svc","version":"v2","previous_version":"v1"}`, nil)
+
+	follower, followerHS := newTestServer(t)
+	follower.HA = fakeLeadership{addr: leaderHS.URL}
+	r, out := call(t, "GET", followerHS.URL+"/v1/deployments/on-leader", "tok", "", nil)
+	if r.StatusCode != 200 || out["deployment"] == nil {
+		t.Fatalf("follower did not forward: %d %v", r.StatusCode, out)
+	}
+	_, h := call(t, "GET", followerHS.URL+"/healthz", "", "", nil)
+	if h["role"] != "follower" || h["leader"] != leaderHS.URL {
+		t.Fatalf("healthz is answered locally: %v", h)
+	}
+	// A request another follower already forwarded is not bounced again.
+	r, _ = call(t, "GET", followerHS.URL+"/v1/deployments", "tok", "", map[string]string{forwardedHeader: "node-y"})
+	if r.StatusCode != 503 || r.Header.Get("Retry-After") == "" {
+		t.Fatalf("forward loop guard: %d", r.StatusCode)
+	}
+	// No leader known yet -> 503 with Retry-After.
+	follower.HA = fakeLeadership{}
+	if r, _ := call(t, "GET", followerHS.URL+"/v1/deployments", "tok", "", nil); r.StatusCode != 503 {
+		t.Fatalf("no leader: %d", r.StatusCode)
+	}
+}

@@ -27,11 +27,11 @@ import (
 	"vigilante/internal/api"
 	"vigilante/internal/config"
 	"vigilante/internal/executor"
-	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/probe"
 	"vigilante/internal/safety"
+	"vigilante/internal/store"
 )
 
 var version = "0.1.0-dev"
@@ -408,7 +408,12 @@ func cmdStatus(args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	st, err := journal.Replay(cfg.Server.JournalPath)
+	db, err := store.Open(context.Background(), cfg)
+	if err != nil {
+		return 1, err
+	}
+	defer db.Close()
+	st, err := db.Load(context.Background())
 	if err != nil {
 		return 1, err
 	}
@@ -503,11 +508,17 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	if srv.Token == "" {
 		e.Log.Warn("API authentication disabled: set server.auth_token_env")
 	}
-	go func() {
-		if n := e.Resume(ctx); n > 0 {
-			e.Log.Warn("resumed interrupted rollbacks", "count", n)
-		}
-	}()
+	role := "single node"
+	if e.Cfg.Server.HA.Enabled {
+		startHA(ctx, e, srv)
+		role = "HA node " + e.Cfg.Server.HA.AdvertiseURL
+	} else {
+		go func() {
+			if n := e.Resume(ctx); n > 0 {
+				e.Log.Warn("resumed interrupted rollbacks", "count", n)
+			}
+		}()
+	}
 	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -515,7 +526,7 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 		defer cancel()
 		_ = hs.Shutdown(sctx)
 	}()
-	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "journal", e.Cfg.Server.JournalPath, "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
+	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return 1, err
 	}

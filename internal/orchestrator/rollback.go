@@ -73,6 +73,9 @@ func (e *Engine) traffic(svc *config.Service) (executor.TrafficController, error
 // deployment state tells the outcome: ROLLED_BACK, ROLLBACK_FAILED or
 // AWAITING_APPROVAL.
 func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt RollbackOptions) error {
+	if !e.Active() {
+		return ErrInactive
+	}
 	svc, _ := e.Cfg.Service(d.Service)
 	targets := e.rollbackTargets(d, svc, opt)
 	if !opt.Manual {
@@ -92,7 +95,7 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 
 	now := time.Now()
 	e.Guard.Record(svc.Name, now)
-	_ = e.Journal.Append(journal.Entry{Kind: journal.KindRollbackStart, Service: svc.Name, DeployID: d.ID, Time: now})
+	e.record(journal.Entry{Kind: journal.KindRollbackStart, Service: svc.Name, DeployID: d.ID, Time: now})
 	reason := opt.Reason
 	if reason == "" {
 		reason = "manual rollback"
@@ -102,6 +105,12 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 
 	run := &rollbackRun{e: e, d: d, svc: svc, opt: opt}
 	failures := run.execute(ctx, targets)
+	if !e.Active() {
+		// Leadership moved mid-rollback. The new leader replays the recorded
+		// steps and finishes; this node must not report a failure it did not have.
+		e.Log.Warn("rollback handed over to the new leader", "deployment", d.ID)
+		return ErrInactive
+	}
 
 	if len(failures) == 0 {
 		e.Breaker.Success()
@@ -269,7 +278,7 @@ func (r *rollbackRun) markDone(target string, step int) {
 	}
 	m[target] = step + 1
 	r.e.mu.Unlock()
-	_ = r.e.Journal.Append(journal.Entry{Kind: journal.KindStepDone, DeployID: r.d.ID, Target: target, Step: step})
+	r.e.record(journal.Entry{Kind: journal.KindStepDone, DeployID: r.d.ID, Target: target, Step: step})
 }
 
 func (r *rollbackRun) primary() (executor.Executor, string, error) {
@@ -309,8 +318,14 @@ func (r *rollbackRun) target(ctx context.Context, tn string, drain bool) error {
 			r.markDone(tn, i)
 			continue
 		}
+		if !r.e.Active() {
+			return ErrInactive
+		}
 		r.e.event(r.d, "step", fmt.Sprintf("%s: %s (%s)", tn, st.Action, exName))
 		err := r.step(ctx, st, ex, rc, member)
+		if errors.Is(err, ErrInactive) {
+			return err
+		}
 		if err == nil {
 			r.markDone(tn, i)
 			continue
@@ -394,6 +409,9 @@ func (r *rollbackRun) step(ctx context.Context, st config.Step, ex executor.Exec
 	backoff := rb.Retry.Backoff
 	var err error
 	for a := 1; a <= attempts; a++ {
+		if !r.e.Active() {
+			return ErrInactive
+		}
 		actx, cancel := context.WithTimeout(ctx, timeout)
 		err = r.do(actx, st, ex, rc, m)
 		cancel()

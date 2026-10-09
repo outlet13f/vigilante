@@ -15,6 +15,12 @@ func (c *Config) applyDefaults() {
 	if c.Server.JournalPath == "" {
 		c.Server.JournalPath = "vigilante-journal.jsonl"
 	}
+	if c.Server.State.Backend == "" {
+		c.Server.State.Backend = "file"
+	}
+	if c.Server.HA.LeaseTTL == 0 {
+		c.Server.HA.LeaseTTL = 15 * time.Second
+	}
 	if c.Agent.PushInterval == 0 {
 		c.Agent.PushInterval = time.Second
 	}
@@ -529,6 +535,26 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	switch st := c.Server.State; st.Backend {
+	case "file":
+	case "postgres":
+		if st.DSN == "" && st.DSNEnv == "" {
+			bad("server.state: postgres needs dsn or dsn_env")
+		}
+	default:
+		bad("server.state.backend must be file|postgres, got %q", st.Backend)
+	}
+	if ha := c.Server.HA; ha.Enabled {
+		if c.Server.State.Backend != "postgres" {
+			bad("server.ha: requires server.state.backend: postgres (nodes must share state)")
+		}
+		if ha.AdvertiseURL == "" {
+			bad("server.ha: advertise_url required (followers forward API calls to the leader at this URL)")
+		}
+		if ha.LeaseTTL < 3*time.Second {
+			bad("server.ha.lease_ttl must be at least 3s")
+		}
+	}
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
 		bad("agent.failsafe must be hold|rollback")
 	}
