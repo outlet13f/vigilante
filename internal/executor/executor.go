@@ -185,3 +185,30 @@ func bearer(creds map[string]config.Credential, name string) string {
 	}
 	return ""
 }
+
+// Finding is one read-only pre-flight check result (`vigilante doctor`).
+// Status: ok | warn | fail | skip.
+type Finding struct {
+	Name   string
+	Status string
+	Detail string
+}
+
+// Diagnoser is implemented by strategies that can verify, without changing
+// anything, that a rollback on rc's target would have what it needs.
+type Diagnoser interface {
+	Diagnose(ctx context.Context, rc *RunContext) []Finding
+}
+
+// TrafficDiagnoser is the same for traffic controllers, beyond the generic
+// pool-membership check every controller gets.
+type TrafficDiagnoser interface {
+	Diagnose(ctx context.Context, members []Member) []Finding
+}
+
+func finding(name string, err error, okDetail string) Finding {
+	if err != nil {
+		return Finding{Name: name, Status: "fail", Detail: err.Error()}
+	}
+	return Finding{Name: name, Status: "ok", Detail: okDetail}
+}

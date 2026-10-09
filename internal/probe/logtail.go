@@ -320,3 +320,9 @@ func (p *accessLogProbe) Run(ctx context.Context, emit Emit) error {
 		}
 	})
 }
+
+// ParseAccessLine parses one access-log line as the access_log probe does;
+// `vigilante doctor` uses it to check that a log's format is understood.
+func ParseAccessLine(a *config.AccessLogProbe, line string) (status int, latencyMs float64, ok bool) {
+	return parseAccessLine(a, line)
+}

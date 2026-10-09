@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,6 +24,8 @@ type Config struct {
 	Services    []Service             `yaml:"services"`
 	Safety      Safety                `yaml:"safety"`
 	Notify      []Notifier            `yaml:"notify"`
+	// PresetDirs holds organisation presets (*.yaml), relative to this file.
+	PresetDirs []string `yaml:"preset_dirs"`
 }
 
 type Server struct {
@@ -204,7 +207,12 @@ type WebhookExec struct {
 
 // Service ties targets, probes, rules, phases and the rollback plan together.
 type Service struct {
-	Name           string                 `yaml:"name"`
+	Name string `yaml:"name"`
+	// Preset ("java-web" or pinned "java-web@1") supplies probes, rules,
+	// baseline and phases; Overrides fills its parameters. Probes, rules and
+	// phases written on the service replace the preset's of the same id/name.
+	Preset         string                 `yaml:"preset"`
+	Overrides      map[string]any         `yaml:"overrides"`
 	Targets        []string               `yaml:"targets"`
 	ControlTargets []string               `yaml:"control_targets"`
 	Probes         []Probe                `yaml:"probes"`
@@ -399,15 +407,21 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(raw)
+	return parse(raw, filepath.Dir(path))
 }
 
-func Parse(raw []byte) (*Config, error) {
+// Parse decodes a config; relative preset_dirs resolve against the working directory.
+func Parse(raw []byte) (*Config, error) { return parse(raw, ".") }
+
+func parse(raw []byte, baseDir string) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	if err := c.expandPresets(baseDir); err != nil {
+		return nil, err
 	}
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {

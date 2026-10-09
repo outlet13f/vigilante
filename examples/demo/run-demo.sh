@@ -30,28 +30,42 @@ APP_PID=$!
 trap 'kill $APP_PID 2>/dev/null' EXIT
 for _ in $(seq 1 50); do curl -fs "$APP_URL/health" >/dev/null && break; sleep 0.2; done
 
+say "pre-flight: vigilante doctor (access, logs, rollback path)"
+"$VIG" doctor -c "$CFG" 2>/dev/null | sed 's/^/   /'
+expect 0 "${PIPESTATUS[0]}" "pre-flight checks pass"
+
+say "0. register v1 as the known-good version (once, before the first pipeline run)"
+"$VIG" mark-good -c "$CFG" --service demo --version v1 2>/dev/null | sed 's/^/   /'
+
 say "1. capture pre-deploy baseline (10s)"
 "$VIG" baseline -c "$CFG" --service demo --window 10s --out "$RUN/baseline.json" >/dev/null 2>"$RUN/baseline.log"
 cat "$RUN/baseline.json"
 
 say "2. deploy BAD v2 -> canary watch should detect it and roll back to v1 (exit 2)"
 curl -fs -X POST "$APP_URL/admin/deploy?version=v2"
-"$VIG" watch -c "$CFG" --id demo-bad-1 --service demo --version v2 --previous v1 --phase canary \
+# Like a CI job: only --service and --phase. The ID and version come from the
+# environment (as Jenkins/GitLab/GitHub would provide), --previous from the
+# last known-good version recorded in the journal.
+export VIGILANTE_DEPLOYMENT_ID=demo-bad-1 VIGILANTE_VERSION=v2
+"$VIG" watch -c "$CFG" --service demo --phase canary \
   --baseline "$RUN/baseline.json" >"$RUN/watch1.json" 2>"$RUN/watch1.log"
 CODE=$?
+grep -m1 'auto-filled' "$RUN/watch1.log" | sed 's/^/   /'
 grep -E 'deployment state|step|verdict' "$RUN/watch1.log" | sed 's/^/   /' | cut -c1-220
 expect 2 "$CODE" "bad release rolled back automatically"
 printf '     running version now: %s' "$(curl -fs "$APP_URL/admin/version")"
 
 say "3. deploy BAD v2 again, but the rollback path is broken -> rollback fails, circuit opens (exit 3)"
 curl -fs -X POST "$APP_URL/admin/deploy?version=v2"
-DEMO_ROLLBACK_HOST=127.0.0.1:18099 "$VIG" watch -c "$CFG" --id demo-bad-2 --service demo --version v2 --previous v1 \
-  --phase canary --baseline "$RUN/baseline.json" >"$RUN/watch2.json" 2>"$RUN/watch2.log"
+export VIGILANTE_DEPLOYMENT_ID=demo-bad-2 VIGILANTE_VERSION=v2
+DEMO_ROLLBACK_HOST=127.0.0.1:18099 "$VIG" watch -c "$CFG" --service demo --phase canary \
+  --baseline "$RUN/baseline.json" >"$RUN/watch2.json" 2>"$RUN/watch2.log"
 expect 3 "$?" "failed rollback escalates to a human"
 "$VIG" circuit -c "$CFG" status 2>/dev/null | sed 's/^/   /'
 
 say "4. while the circuit is OPEN, the deployment gate is closed (exit 3)"
-"$VIG" watch -c "$CFG" --id demo-next --service demo --version v3 --previous v1 --phase canary >/dev/null 2>"$RUN/watch3.log"
+export VIGILANTE_DEPLOYMENT_ID=demo-next VIGILANTE_VERSION=v3
+"$VIG" watch -c "$CFG" --service demo --phase canary >/dev/null 2>"$RUN/watch3.log"
 expect 3 "$?" "new deployments are refused"
 tail -1 "$RUN/watch3.log" | cut -c1-200 | sed 's/^/   /'
 
@@ -64,7 +78,8 @@ sleep 11
 
 say "6. deploy GOOD v1.1 -> canary passes after the 20s window (exit 0)"
 curl -fs -X POST "$APP_URL/admin/deploy?version=v1.1"
-"$VIG" watch -c "$CFG" --id demo-good --service demo --version v1.1 --previous v1 --phase canary \
+export VIGILANTE_DEPLOYMENT_ID=demo-good VIGILANTE_VERSION=v1.1
+"$VIG" watch -c "$CFG" --service demo --phase canary \
   --baseline "$RUN/baseline.json" >"$RUN/watch4.json" 2>"$RUN/watch4.log"
 expect 0 "$?" "healthy release promoted"
 

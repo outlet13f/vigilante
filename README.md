@@ -17,6 +17,7 @@
 | [docs/02-config-spec.md](docs/02-config-spec.md) | `vigilante.yaml` 전체 명세 (프로브 메트릭 카탈로그, 규칙 문법, 실행기/트래픽) |
 | [docs/03-engine-design.md](docs/03-engine-design.md) | 비동기 수집, 3값 규칙 평가, 실행기 인터페이스, 확장·테스트 |
 | [docs/04-safety-circuit-breaker.md](docs/04-safety-circuit-breaker.md) | 롤백 실패·비상 정지 시나리오 18종, 서킷 상태도, 런북 |
+| [docs/05-roadmap.md](docs/05-roadmap.md) | 엔터프라이즈 제품화 로드맵 M0~M6, 진행 현황, 결정 필요 사항 |
 | [examples/config/vigilante.yaml](examples/config/vigilante.yaml) | 3개 서비스 × 전 인프라 유형 참조 설정 |
 | [examples/ci/](examples/ci/) | Jenkins / GitLab CI / GitHub Actions 연동 |
 
@@ -26,6 +27,8 @@
 go build -o bin/vigilante ./cmd/vigilante          # CGO 불필요, 정적 바이너리
 bin/vigilante plugins                              # 등록된 프로브/실행기/트래픽 제어기
 bin/vigilante validate -c examples/config/vigilante.yaml
+bin/vigilante presets                              # 내장 규칙 프리셋과 파라미터
+bin/vigilante doctor -c vigilante.yaml             # 배포 전 읽기 전용 점검: 접속·sudo·로그 형식·이전 릴리스·LB 풀
 
 # 로컬 E2E 데모 (Linux/macOS/Git Bash): 불량 배포 자동 롤백 → 롤백 경로 고장 → 서킷 OPEN → 리셋 → 정상 배포
 ./examples/demo/run-demo.sh
@@ -34,13 +37,17 @@ bin/vigilante validate -c examples/config/vigilante.yaml
 ### CI 파이프라인에서 (단발 실행)
 
 ```bash
-vigilante prepare  -c vigilante.yaml --id $BUILD --service order-api --version v42 --previous v41   # 체크포인트/스냅샷
-vigilante baseline -c vigilante.yaml --service order-api --out baseline.json                        # 배포 전 기준점
+# 최초 1회: 지금 운영 중인 버전을 기준(known-good)으로 등록
+vigilante mark-good -c vigilante.yaml --service order-api --version v41
+
+vigilante prepare  -c vigilante.yaml --service order-api                       # 체크포인트/스냅샷
+vigilante baseline -c vigilante.yaml --service order-api --out baseline.json   # 배포 전 기준점
 # ... canary 배포 ...
-vigilante watch    -c vigilante.yaml --id $BUILD --service order-api --version v42 --previous v41 \
-                   --phase canary --baseline baseline.json
+vigilante watch    -c vigilante.yaml --service order-api --phase canary --baseline baseline.json
 # exit 0 PASS · 2 롤백 완료 · 3 롤백 실패/서킷 OPEN/승인 대기 · 4 HOLD · 1 오류
 ```
+
+`--id`와 `--version`은 CI 실행 정보에서 자동으로 채웁니다(Jenkins `BUILD_TAG`·`GIT_COMMIT`, GitLab `CI_PIPELINE_ID`·`CI_COMMIT_TAG`/`CI_COMMIT_SHORT_SHA`, GitHub `GITHUB_RUN_ID`·`GITHUB_SHA`, 또는 `VIGILANTE_DEPLOYMENT_ID`·`VIGILANTE_VERSION`, 없으면 `git describe`). `--previous`는 저널에 기록된 그 서비스의 마지막 성공 배포 버전을 씁니다. full 단계를 통과한 배포가 다음 배포의 `--previous`가 됩니다. 직접 지정한 플래그가 항상 우선하며, 자동으로 채운 값과 출처는 출력과 배포 기록에 남습니다.
 
 ### 중앙 서버 / 에이전트
 
@@ -54,7 +61,7 @@ vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--app
 
 ## 검증 현황
 
-- `go vet ./...`, `go test ./...` — 10개 패키지 테스트 통과 (vSphere는 govmomi `vcsim` 시뮬레이터, 그 외 외부 API는 httptest/mock)
+- `go vet ./...`, `go test ./...` — 14개 패키지 테스트 통과 (vSphere는 govmomi `vcsim` 시뮬레이터, 그 외 외부 API는 httptest/mock)
 - `examples/demo/run-demo.sh` — 실제 프로세스로 5개 시나리오 통과 (불량 v2 배포 후 약 4초 만에 탐지·롤백)
 - 정적 크로스 빌드: linux/amd64, linux/arm64, linux/ppc64le, windows/amd64 (`CGO_ENABLED=0`)
 

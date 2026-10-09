@@ -1,0 +1,66 @@
+name: java-web
+version: 1
+description: Java/Spring 웹 서비스(베어메탈·VM). HTTP 헬스, 액세스 로그 5xx 비율, 앱 로그(OOM·예외·커넥션 풀 고갈), 서버 자원
+params:
+  - {name: health_url, required: true, description: "헬스체크 URL. 대상 주소는 {{.Address}}로 지정 (예: http://{{.Address}}:8080/actuator/health)"}
+  - {name: access_log, required: true, description: 액세스 로그 경로}
+  - {name: app_log, required: true, description: 애플리케이션 로그 경로}
+  - {name: access_log_format, default: combined, description: "combined | json"}
+  - {name: error_rate_pct, default: 2, description: 롤백할 5xx 비율(%)}
+  - {name: exception_rate, default: 10, description: 롤백할 예외 로그 초당 건수}
+  - {name: exception_pattern, default: '[A-Za-z]+(?:Exception|Error)\b', description: 예외로 셀 로그 정규식}
+  - {name: health_failures, default: 3, description: 롤백할 헬스체크 연속 실패 횟수}
+  - {name: window, default: 30s, description: 5xx 비율·OOM·커넥션 풀 판정 구간}
+  - {name: latency_window, default: 1m, description: p99 지연 판정 구간}
+  - {name: p99_increase_pct, default: 200, description: 배포 전 대비 p99 증가율(%)}
+  - {name: p99_min_ms, default: 300, description: p99 절대 하한(ms). 이보다 낮으면 증가율과 무관하게 정상}
+  - {name: host_probe, default: true, description: 서버 자원(/proc) 수집 여부. Linux가 아니면 false}
+  - {name: mem_available_min_pct, default: 5, description: 롤백할 가용 메모리 하한(%)}
+---
+probes:
+  - id: health
+    type: http
+    interval: 2s
+    timeout: 1500ms
+    http: {url: "[[ .health_url ]]"}
+  - id: access
+    type: access_log
+    access_log: {path: "[[ .access_log ]]", format: "[[ .access_log_format ]]"}
+  - id: applog
+    type: log
+    log:
+      path: "[[ .app_log ]]"
+      patterns:
+        oom: 'OutOfMemoryError'
+        exception: '[[ .exception_pattern ]]'
+        pool_exhausted: 'HikariPool.*Connection is not available|Cannot get a connection, pool error|Unable to acquire JDBC Connection'
+[[- if .host_probe ]]
+  - id: host
+    type: host
+    interval: 5s
+    timeout: 5s
+[[- end ]]
+rules:
+  - name: fatal-errors
+    when:
+      any:
+        - {metric: access.count_5xx, ratio_of: access.requests, window: [[ .window ]], op: ">", value: [[ .error_rate_pct ]], for: 2}
+        - {metric: applog.match.exception, agg: rate, window: 10s, op: ">", value: [[ .exception_rate ]], for: 2}
+        - {metric: health.consecutive_failures, op: ">=", value: [[ .health_failures ]]}
+        - {metric: applog.match.oom, agg: sum, window: [[ .window ]], op: ">", value: 0}
+        - {metric: applog.match.pool_exhausted, agg: sum, window: [[ .window ]], op: ">", value: 5}
+  - name: latency-regression
+    when: {metric: health.latency_ms, agg: p99, window: [[ .latency_window ]], op: ">", baseline: {increase_pct: [[ .p99_increase_pct ]]}, min_value: [[ .p99_min_ms ]], for: 3, reset_after: 2}
+[[- if .host_probe ]]
+  - name: host-exhaustion
+    when:
+      any:
+        - {metric: host.mem_available_pct, agg: avg, window: 1m, op: "<", value: [[ .mem_available_min_pct ]], for: 3}
+        - {metric: host.disk_util_pct, agg: avg, window: 1m, op: ">", value: 95, for: 3}
+        - {metric: host.load_per_cpu, agg: avg, window: 1m, op: ">", value: 4, for: 3}
+[[- end ]]
+baseline: {window: 5m, min_samples: 100}
+phases:
+  canary: {observation_window: 10m, warmup: 60s, on_inconclusive: hold}
+  rolling: {observation_window: 15m, warmup: 30s, on_inconclusive: hold}
+  full: {observation_window: 20m, warmup: 30s, on_inconclusive: pass}

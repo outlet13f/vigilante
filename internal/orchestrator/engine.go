@@ -166,6 +166,13 @@ func (e *Engine) Live(id string) *model.Deployment {
 	return e.deployments[id]
 }
 
+// Annotate records a note on the deployment timeline (journalled), e.g. where
+// an auto-filled input came from.
+func (e *Engine) Annotate(d *model.Deployment, kind, msg string) {
+	e.event(d, kind, msg)
+	e.persist(d)
+}
+
 // MarkBlocked records that a phase could not start (e.g. circuit open).
 func (e *Engine) MarkBlocked(d *model.Deployment, err error) {
 	e.setState(d, model.StateHeld, err.Error())
@@ -229,6 +236,44 @@ func (e *Engine) Create(id, service, version, previous string) (*model.Deploymen
 	e.mu.Unlock()
 	e.event(d, "created", fmt.Sprintf("deployment created: %s %s -> %s", service, previous, version))
 	e.persist(d)
+	return d, nil
+}
+
+// LastGoodVersion returns the version of the service's most recent SUCCEEDED
+// deployment (a full phase that passed, or one registered with MarkGood) and
+// that deployment's ID. ok is false when the journal has no such record.
+func (e *Engine) LastGoodVersion(service string) (version, fromID string, ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var best *model.Deployment
+	for _, d := range e.deployments {
+		if d.Service != service || d.State != model.StateSucceeded || d.Version == "" {
+			continue
+		}
+		if best == nil || d.UpdatedAt.After(best.UpdatedAt) {
+			best = d
+		}
+	}
+	if best == nil {
+		return "", "", false
+	}
+	return best.Version, best.ID, true
+}
+
+// MarkGood records version as the service's known-good version without a
+// deployment, so automatic --previous works from the first pipeline run.
+func (e *Engine) MarkGood(service, version, reason string) (*model.Deployment, error) {
+	if version == "" {
+		return nil, errors.New("version is required")
+	}
+	d, err := e.Create(fmt.Sprintf("mark-good-%s-%s-%d", service, version, time.Now().Unix()), service, version, "")
+	if err != nil {
+		return nil, err
+	}
+	if reason == "" {
+		reason = "marked as known-good manually"
+	}
+	e.setState(d, model.StateSucceeded, reason)
 	return d, nil
 }
 

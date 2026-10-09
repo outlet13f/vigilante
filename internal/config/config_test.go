@@ -68,3 +68,34 @@ func TestUnknownFieldsRejected(t *testing.T) {
 		t.Fatalf("typo in a key must fail loudly: %v", err)
 	}
 }
+
+func TestServiceWithoutRollbackRuleRejected(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rollback: {executor: x}
+`
+	_, err := Parse([]byte(base))
+	if err == nil || !strings.Contains(err.Error(), "at least one rule with action: rollback") {
+		t.Fatalf("service without rules must be rejected, got %v", err)
+	}
+	_, err = Parse([]byte(base + `    rules: [{name: warn, action: notify, when: {metric: h.up, op: "==", value: 0}}]
+`))
+	if err == nil || !strings.Contains(err.Error(), "at least one rule with action: rollback") {
+		t.Fatalf("notify-only service must be rejected, got %v", err)
+	}
+	_, err = Parse([]byte(base + `    rules:
+      - {name: down, when: {metric: h.up, op: "==", value: 0}}
+      - {name: warn, action: notify, when: {metric: h.up, op: "==", value: 0}}
+    phases:
+      canary: {rules: [warn]}
+`))
+	if err == nil || !strings.Contains(err.Error(), "could never fail") {
+		t.Fatalf("phase selecting only notify rules must be rejected, got %v", err)
+	}
+}

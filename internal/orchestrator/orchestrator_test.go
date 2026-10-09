@@ -448,3 +448,37 @@ func TestEnvironmentalProblemHolds(t *testing.T) {
 		t.Fatal("rolled back for an environmental problem")
 	}
 }
+
+func TestLastGoodVersionAndMarkGood(t *testing.T) {
+	h := newHarness(t, opts{})
+	if _, _, ok := h.e.LastGoodVersion("order"); ok {
+		t.Fatal("empty journal has no known-good version")
+	}
+	if _, err := h.e.MarkGood("order", "v1", "baseline before vigilante"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, ok := h.e.LastGoodVersion("order"); !ok || v != "v1" {
+		t.Fatalf("after mark-good: %q %v", v, ok)
+	}
+	// A rolled-back deployment never becomes the known-good version.
+	h.app1.healthy.Store(false)
+	bad := h.deploy("bad-1")
+	_ = h.e.Watch(context.Background(), bad, model.PhaseCanary)
+	if bad.State != model.StateRolledBack {
+		t.Fatalf("setup: %s", bad.State)
+	}
+	// A full phase that passes does.
+	good, _ := h.e.Create("good-1", "order", "v3", "v1")
+	_ = h.e.Watch(context.Background(), good, model.PhaseFull)
+	if good.State != model.StateSucceeded {
+		t.Fatalf("setup: %s %s", good.State, good.Reason)
+	}
+	if v, from, _ := h.e.LastGoodVersion("order"); v != "v3" || from != "good-1" {
+		t.Fatalf("got %q from %q", v, from)
+	}
+	// It survives a restart (read back from the journal).
+	h2 := newHarness(t, opts{journal: h.journal, app1: h.app1, app2: h.app2})
+	if v, _, _ := h2.e.LastGoodVersion("order"); v != "v3" {
+		t.Fatalf("after restart: %q", v)
+	}
+}

@@ -1,0 +1,52 @@
+name: container-api
+version: 1
+description: VM 위 Docker/Podman 단독 컨테이너 API. 재시작·OOM·중지, HTTP 헬스, 지연, 선택적으로 액세스 로그 5xx 비율
+params:
+  - {name: container, required: true, description: 컨테이너 이름}
+  - {name: health_url, required: true, description: "헬스체크 URL (예: http://{{.Address}}:8080/healthz)"}
+  - {name: access_log, default: "", description: 액세스 로그 경로. 비우면 5xx 규칙 없음}
+  - {name: access_log_format, default: combined, description: "combined | json"}
+  - {name: max_restarts, default: 2, description: 관측 중 허용 재시작 횟수(이상이면 롤백)}
+  - {name: health_failures, default: 3, description: 롤백할 헬스체크 연속 실패 횟수}
+  - {name: error_rate_pct, default: 2, description: 롤백할 5xx 비율(%)}
+  - {name: window, default: 30s, description: 5xx 비율 판정 구간}
+  - {name: latency_window, default: 1m, description: p99 지연 판정 구간}
+  - {name: p99_increase_pct, default: 200, description: 배포 전 대비 p99 증가율(%)}
+  - {name: p99_min_ms, default: 200, description: p99 절대 하한(ms)}
+---
+probes:
+  - id: ctr
+    type: docker
+    interval: 3s
+    docker: {container: "[[ .container ]]"}
+  - id: health
+    type: http
+    interval: 2s
+    timeout: 1500ms
+    http: {url: "[[ .health_url ]]"}
+[[- if .access_log ]]
+  - id: access
+    type: access_log
+    access_log: {path: "[[ .access_log ]]", format: "[[ .access_log_format ]]"}
+[[- end ]]
+rules:
+  - name: crashloop
+    when:
+      any:
+        - {metric: ctr.restarts, op: ">=", value: [[ .max_restarts ]]}
+        - {metric: ctr.oom_events, agg: sum, window: 5m, op: ">", value: 0}
+        - {metric: ctr.running, op: "==", value: 0, for: 2}
+  - name: errors
+    when:
+      any:
+        - {metric: health.consecutive_failures, op: ">=", value: [[ .health_failures ]]}
+[[- if .access_log ]]
+        - {metric: access.count_5xx, ratio_of: access.requests, window: [[ .window ]], op: ">", value: [[ .error_rate_pct ]], for: 2}
+[[- end ]]
+  - name: latency-regression
+    when: {metric: health.latency_ms, agg: p99, window: [[ .latency_window ]], op: ">", baseline: {increase_pct: [[ .p99_increase_pct ]]}, min_value: [[ .p99_min_ms ]], for: 3, reset_after: 2}
+baseline: {window: 5m}
+phases:
+  canary: {observation_window: 5m, warmup: 20s, on_inconclusive: hold}
+  rolling: {observation_window: 10m, warmup: 20s, on_inconclusive: hold}
+  full: {observation_window: 10m, warmup: 20s, on_inconclusive: pass}

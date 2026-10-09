@@ -94,7 +94,38 @@ notify:      [...]   # 알림
 
 모든 프로브는 프로세스가 죽거나 시작 실패 시 `<id>.probe_error`를 남기고 지수 백오프로 재시작됩니다.
 
+## `services[].preset` — 규칙 프리셋
+
+프리셋 이름 하나와 몇 개의 값만으로 프로브·롤백 규칙·기준선·단계 시간을 채웁니다. 규칙을 직접 쓰지 않아도 검증된 기준으로 시작할 수 있습니다.
+
+```yaml
+services:
+  - name: order-api
+    targets: [order-bm-01, order-bm-02]
+    preset: java-web@1          # 버전 고정 권장: 프리셋이 새 버전으로 바뀌어도 이 서비스의 판정 기준은 그대로
+    overrides:
+      health_url: "http://{{.Address}}:8080/actuator/health"
+      access_log: /var/log/order/access.log
+      app_log: /var/log/order/application.log
+      error_rate_pct: 3         # 바꾸고 싶은 값만
+    rollback: {executor: order-symlink, traffic: nginx-edge}
+```
+
+| 내장 프리셋 | 대상 | 필수 값 |
+|---|---|---|
+| `java-web` | Java/Spring 웹(베어메탈·VM): 헬스, 5xx 비율, OOM·예외·커넥션 풀, 서버 자원 | `health_url`, `access_log`, `app_log` |
+| `container-api` | VM 위 단독 컨테이너: 재시작·OOM·중지, 헬스, 선택적 5xx | `container`, `health_url` |
+| `static-web` | 정적 웹·프록시: 헬스, 5xx 비율, 지연 | `health_url`, `access_log` |
+| `worker` | 배치·큐 워커: 앱 로그 OOM·오류율, 메모리, 선택적 컨테이너 | `app_log` |
+
+- 전체 파라미터와 기본값: `vigilante presets`. 실제로 펼쳐지는 내용: `vigilante presets show java-web --set error_rate_pct=3`.
+- 서비스에 직접 쓴 프로브·규칙은 같은 id·이름의 프리셋 항목을 대체하고, 나머지는 프리셋 것을 씁니다. 단계(`phases`)는 항목별로 합쳐져서, `canary: {targets: [...]}`만 써도 관측 시간과 warmup은 프리셋 값을 유지합니다.
+- 알 수 없는 override 키, 빠진 필수 값은 `validate`에서 오류입니다.
+- **조직 프리셋:** 최상위 `preset_dirs: [presets]`(설정 파일 기준 상대경로)에 같은 형식의 파일을 두면 `preset: corp/java-web@2`처럼 씁니다. 파일 형식은 `internal/presets/builtin/*.yaml`을 참고하십시오: YAML 헤더(name, version, description, params) + `---` + `[[ ]]` 템플릿 본문입니다. `[[ ]]`를 쓰기 때문에 `{{.Address}}` 같은 실행 시 템플릿은 그대로 남습니다.
+
 ## `services[].rules[]` — 복합 롤백 규칙
+
+서비스마다 `action: rollback` 규칙이 **1개 이상 필수**입니다. 없으면 어떤 배포도 실패할 수 없어 모두 PASS가 되므로 `validate`가 거부합니다. 단계의 `rules`로 규칙을 골라 쓸 때도 그중 하나는 rollback 규칙이어야 합니다.
 
 ```yaml
 rules:
