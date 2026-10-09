@@ -29,6 +29,7 @@ services:
   - name: svc
     targets: [a]
     probes: [{id: h, type: tcp, tcp: {address: "127.0.0.1:1"}}]
+    rules: [{name: down, when: {metric: h.consecutive_failures, op: ">=", value: 3}}]
     rollback: {executor: x}
 `))
 	if err != nil {

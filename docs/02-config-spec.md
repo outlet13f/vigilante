@@ -96,6 +96,8 @@ notify:      [...]   # 알림
 
 ## `services[].rules[]` — 복합 롤백 규칙
 
+서비스마다 `action: rollback` 규칙이 **1개 이상 필수**입니다. 없으면 어떤 배포도 실패할 수 없어 모두 PASS가 되므로 `validate`가 거부합니다. 단계의 `rules`로 규칙을 골라 쓸 때도 그중 하나는 rollback 규칙이어야 합니다.
+
 ```yaml
 rules:
   - name: fatal-errors

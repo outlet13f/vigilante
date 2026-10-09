@@ -451,17 +451,25 @@ func (c *Config) Validate() error {
 			}
 		}
 		rules := map[string]bool{}
+		rollbackRules := map[string]bool{}
 		for _, r := range s.Rules {
 			if rules[r.Name] {
 				bad("service %q: duplicate rule %q", s.Name, r.Name)
 			}
 			rules[r.Name] = true
+			if r.Action == "rollback" {
+				rollbackRules[r.Name] = true
+			}
 			if !validRuleActions[r.Action] {
 				bad("service %q rule %q: unknown action %q", s.Name, r.Name, r.Action)
 			}
 			for _, err := range validateNode(r.When, probes, "when") {
 				bad("service %q rule %q: %v", s.Name, r.Name, err)
 			}
+		}
+		// Without a rollback rule nothing can fail, so every deployment would PASS.
+		if len(rollbackRules) == 0 {
+			bad("service %q: at least one rule with action: rollback is required (without one every deployment passes)", s.Name)
 		}
 		for pname, pc := range s.Phases {
 			if !validPhases[pname] {
@@ -472,10 +480,15 @@ func (c *Config) Validate() error {
 					bad("service %q phase %q: target %q is not a service target", s.Name, pname, t)
 				}
 			}
+			phaseCanFail := false
 			for _, rn := range pc.Rules {
 				if !rules[rn] {
 					bad("service %q phase %q: unknown rule %q", s.Name, pname, rn)
 				}
+				phaseCanFail = phaseCanFail || rollbackRules[rn]
+			}
+			if len(pc.Rules) > 0 && !phaseCanFail && len(rollbackRules) > 0 {
+				bad("service %q phase %q: rules %v include no action: rollback rule (the phase could never fail)", s.Name, pname, pc.Rules)
 			}
 			if !validInconclusive[pc.OnInconclusive] {
 				bad("service %q phase %q: on_inconclusive must be hold|pass|rollback", s.Name, pname)
