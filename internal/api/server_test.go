@@ -14,19 +14,27 @@ import (
 	"strings"
 	"testing"
 
+	"vigilante/internal/auth"
 	"vigilante/internal/config"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 )
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
-	cfg, err := config.Parse([]byte(`
+	return newTestServerWith(t, "")
+}
+
+// newTestServerWith builds a server; authYAML (an "auth:" block) enables
+// service accounts. The legacy token "tok" is always an admin.
+func newTestServerWith(t *testing.T, authYAML string) (*Server, *httptest.Server) {
+	cfg, err := config.Parse([]byte(authYAML + `
 version: v1
 server: {journal_path: ` + filepath.ToSlash(filepath.Join(t.TempDir(), "j.jsonl")) + `}
 targets: [{name: a}]
 executors: {x: {type: exec, exec: {rollback: "true", on: local}}}
 services:
   - name: svc
+    team: payments
     targets: [a]
     probes: [{id: h, type: tcp, tcp: {address: "127.0.0.1:1"}}]
     rules: [{name: down, when: {metric: h.consecutive_failures, op: ">=", value: 3}}]
@@ -40,8 +48,14 @@ services:
 		t.Fatal(err)
 	}
 	t.Cleanup(e.Close)
-	s := New(context.Background(), e)
-	s.Token, s.WebhookSecret = "tok", "hook"
+	s, err := New(context.Background(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Auth, err = auth.New(context.Background(), cfg.Auth, "tok"); err != nil {
+		t.Fatal(err)
+	}
+	s.WebhookSecret = "hook"
 	hs := httptest.NewServer(s.Handler())
 	t.Cleanup(hs.Close)
 	return s, hs
@@ -171,5 +185,89 @@ func TestFollowerForwardsToLeader(t *testing.T) {
 	follower.HA = fakeLeadership{}
 	if r, _ := call(t, "GET", followerHS.URL+"/v1/deployments", "tok", "", nil); r.StatusCode != 503 {
 		t.Fatalf("no leader: %d", r.StatusCode)
+	}
+}
+
+func sa(t *testing.T, name, role, scope string) (token, yaml string) {
+	tok, sha, err := auth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok, "  - {name: " + name + ", token_sha256: " + sha + ", roles: [{role: " + role + ", scope: \"" + scope + "\"}]}\n"
+}
+
+func TestRoleAndScopeEnforcement(t *testing.T) {
+	deployer, y1 := sa(t, "ci-svc", "deployer", "service=svc")
+	otherTeam, y2 := sa(t, "ci-other", "deployer", "team=frontend")
+	viewer, y3 := sa(t, "dash", "viewer", "*")
+	agent, y4 := sa(t, "agents", "agent", "*")
+	s, hs := newTestServerWith(t, "auth:\n  service_accounts:\n"+y1+y2+y3+y4)
+	create := `{"id":"d1","service":"svc","version":"v2","previous_version":"v1"}`
+
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments", "", create, nil); r.StatusCode != 401 || r.Header.Get("WWW-Authenticate") == "" {
+		t.Fatalf("anonymous create: %d", r.StatusCode)
+	}
+	if r, out := call(t, "POST", hs.URL+"/v1/deployments", otherTeam, create, nil); r.StatusCode != 403 || !strings.Contains(out["error"].(string), "team=payments") {
+		t.Fatalf("other team create: %d %v", r.StatusCode, out)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments", viewer, create, nil); r.StatusCode != 403 {
+		t.Fatalf("viewer create: %d", r.StatusCode)
+	}
+	r, d := call(t, "POST", hs.URL+"/v1/deployments", deployer, create, nil)
+	if r.StatusCode != 201 || d["created_by"] != "sa:ci-svc" {
+		t.Fatalf("deployer create: %d %v", r.StatusCode, d)
+	}
+	if r, _ := call(t, "GET", hs.URL+"/v1/deployments/d1", viewer, "", nil); r.StatusCode != 200 {
+		t.Fatalf("viewer read: %d", r.StatusCode)
+	}
+	// The other team's token sees an empty list, not d1.
+	req, _ := http.NewRequest("GET", hs.URL+"/v1/deployments", nil)
+	req.Header.Set("Authorization", "Bearer "+otherTeam)
+	resp, _ := http.DefaultClient.Do(req)
+	var list []map[string]any
+	json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	if len(list) != 0 {
+		t.Fatalf("list leaked another team's deployment: %v", list)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments/d1/rollback", deployer, "{}", nil); r.StatusCode != 403 {
+		t.Fatalf("deployer may not roll back manually: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/circuit/reset", deployer, "", nil); r.StatusCode != 403 {
+		t.Fatalf("circuit reset needs admin: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/circuit/reset", "tok", "", nil); r.StatusCode != 200 {
+		t.Fatalf("legacy admin token: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/samples", viewer, `[{"target":"a","metric":"h.up","value":1}]`, nil); r.StatusCode != 403 {
+		t.Fatalf("viewer may not push samples: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/samples", agent, `[{"target":"a","metric":"h.up","value":1}]`, nil); r.StatusCode != 204 {
+		t.Fatalf("agent push: %d", r.StatusCode)
+	}
+	if r, _ := call(t, "GET", hs.URL+"/v1/deployments", agent, "", nil); r.StatusCode != 200 {
+		t.Fatalf("agent list: %d", r.StatusCode) // allowed, but filtered to nothing
+	}
+	_, who := call(t, "GET", hs.URL+"/v1/whoami", deployer, "", nil)
+	if who["id"] != "sa:ci-svc" || who["grants"].([]any)[0] != "deployer@service=svc" {
+		t.Fatalf("whoami: %v", who)
+	}
+	_ = s
+}
+
+func TestFourEyesApproval(t *testing.T) {
+	alice, y1 := sa(t, "alice-bot", "operator", "*")
+	bob, y2 := sa(t, "bob-bot", "operator", "*")
+	s, hs := newTestServerWith(t, "auth:\n  four_eyes: true\n  service_accounts:\n"+y1+y2)
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments", alice, `{"id":"d1","service":"svc","version":"v2","previous_version":"v1"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("create: %d", r.StatusCode)
+	}
+	s.E.Live("d1").State = model.StateAwaitApproval // as left by a gated escalation
+	r, out := call(t, "POST", hs.URL+"/v1/deployments/d1/approve", alice, "", nil)
+	if r.StatusCode != 403 || !strings.Contains(out["error"].(string), "four-eyes") {
+		t.Fatalf("creator approving own deployment: %d %v", r.StatusCode, out)
+	}
+	if r, _ := call(t, "POST", hs.URL+"/v1/deployments/d1/approve", bob, "", nil); r.StatusCode != 202 {
+		t.Fatalf("second operator approval: %d", r.StatusCode)
 	}
 }

@@ -27,6 +27,8 @@ type RollbackOptions struct {
 	Approved bool
 	Executor string   // override the primary executor
 	Targets  []string // override the target set
+	// Actor is who asked (auth principal ID); empty for automatic rollbacks.
+	Actor string
 }
 
 // ErrNeedsApproval marks a target whose remaining recovery path requires a human OK.
@@ -85,6 +87,16 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 		if err := e.Breaker.Allow(); err != nil {
 			return e.blocked(ctx, d, svc, err)
 		}
+	}
+	if opt.Actor != "" {
+		e.mu.Lock()
+		if opt.Approved {
+			d.ApprovedBy = opt.Actor
+		} else {
+			d.RollbackRequestedBy = opt.Actor
+		}
+		e.mu.Unlock()
+		e.event(d, "actor", fmt.Sprintf("%s by %s", map[bool]string{true: "escalation approved", false: "rollback requested"}[opt.Approved], opt.Actor))
 	}
 	release, err := e.Guard.Acquire(svc.Name)
 	if err != nil {

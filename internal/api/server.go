@@ -14,7 +14,11 @@
 //	GET  /v1/agents/{target}/heartbeat         agent heartbeat; returns the active deployment
 //	POST /v1/webhooks/{provider}               github | gitlab | jenkins | generic
 //	GET  /v1/targets/{target}/metrics          latest values per metric (debug)
+//	GET  /v1/whoami                            the caller's identity and grants
 //	GET  /healthz
+//
+// Every route but /healthz and signed webhooks requires a bearer token (see
+// package auth); each checks the caller's role on the service it touches.
 package api
 
 import (
@@ -35,13 +39,14 @@ import (
 	"sync"
 	"time"
 
+	"vigilante/internal/auth"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 )
 
 type Server struct {
-	E     *orchestrator.Engine
-	Token string // bearer token; empty disables auth (dev only)
+	E    *orchestrator.Engine
+	Auth *auth.Authenticator
 	// WebhookSecret verifies GitHub signatures / GitLab tokens.
 	WebhookSecret string
 
@@ -65,15 +70,23 @@ type Leadership interface {
 // is never bounced between two nodes that disagree during a leader change.
 const forwardedHeader = "X-Vigilante-Forwarded-By"
 
-func New(ctx context.Context, e *orchestrator.Engine) *Server {
+// New builds the API server. With auth.oidc configured it contacts the
+// identity provider for its discovery document.
+func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 	s := &Server{E: e, ctx: ctx, agents: map[string]time.Time{}, proxies: map[string]*httputil.ReverseProxy{}}
+	var legacy string
 	if env := e.Cfg.Server.AuthTokenEnv; env != "" {
-		s.Token = os.Getenv(env)
+		legacy = os.Getenv(env)
 	}
 	if env := e.Cfg.Server.WebhookSecret; env != "" {
 		s.WebhookSecret = os.Getenv(env)
 	}
-	return s
+	a, err := auth.New(ctx, e.Cfg.Auth, legacy)
+	if err != nil {
+		return nil, err
+	}
+	s.Auth = a
+	return s, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -90,37 +103,22 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"ok": true, "role": role, "leader": leader, "active": s.E.Active(),
 			"circuit": s.E.Breaker.State().State, "dry_run": s.E.DryRun, "store": s.E.Journal.Describe()})
 	})
-	mux.HandleFunc("POST /v1/deployments", s.auth(s.createDeployment))
-	mux.HandleFunc("GET /v1/deployments", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, s.E.Deployments())
-	}))
-	mux.HandleFunc("GET /v1/deployments/{id}", s.auth(s.getDeployment))
-	mux.HandleFunc("POST /v1/deployments/{id}/phases/{phase}", s.auth(s.startPhase))
-	mux.HandleFunc("POST /v1/deployments/{id}/rollback", s.auth(s.manualRollback))
-	mux.HandleFunc("POST /v1/deployments/{id}/approve", s.auth(s.approve))
-	mux.HandleFunc("POST /v1/deployments/{id}/abort", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]bool{"aborted": s.E.Abort(r.PathValue("id"))})
-	}))
-	mux.HandleFunc("POST /v1/baselines/{service}", s.auth(s.captureBaseline))
-	mux.HandleFunc("GET /v1/circuit", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, s.E.Breaker.State())
-	}))
-	mux.HandleFunc("POST /v1/circuit/reset", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		s.E.Breaker.Reset()
-		writeJSON(w, 200, s.E.Breaker.State())
-	}))
-	mux.HandleFunc("POST /v1/circuit/trip", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		reason := r.URL.Query().Get("reason")
-		if reason == "" {
-			reason = "kill switch via API"
-		}
-		s.E.Breaker.Trip(reason)
-		writeJSON(w, 200, s.E.Breaker.State())
-	}))
-	mux.HandleFunc("POST /v1/samples", s.auth(s.ingest))
-	mux.HandleFunc("GET /v1/agents/{target}/heartbeat", s.auth(s.heartbeat))
+	mux.HandleFunc("GET /v1/whoami", s.authn(s.whoami))
+	mux.HandleFunc("POST /v1/deployments", s.authn(s.createDeployment))
+	mux.HandleFunc("GET /v1/deployments", s.authn(s.listDeployments))
+	mux.HandleFunc("GET /v1/deployments/{id}", s.authn(s.getDeployment))
+	mux.HandleFunc("POST /v1/deployments/{id}/phases/{phase}", s.authn(s.startPhase))
+	mux.HandleFunc("POST /v1/deployments/{id}/rollback", s.authn(s.manualRollback))
+	mux.HandleFunc("POST /v1/deployments/{id}/approve", s.authn(s.approve))
+	mux.HandleFunc("POST /v1/deployments/{id}/abort", s.authn(s.abort))
+	mux.HandleFunc("POST /v1/baselines/{service}", s.authn(s.captureBaseline))
+	mux.HandleFunc("GET /v1/circuit", s.authn(s.circuitStatus))
+	mux.HandleFunc("POST /v1/circuit/reset", s.authn(s.circuitReset))
+	mux.HandleFunc("POST /v1/circuit/trip", s.authn(s.circuitTrip))
+	mux.HandleFunc("POST /v1/samples", s.authn(s.ingest))
+	mux.HandleFunc("GET /v1/agents/{target}/heartbeat", s.authn(s.heartbeat))
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
-	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.auth(s.targetMetrics))
+	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.authn(s.targetMetrics))
 	return s.forwardToLeader(mux)
 }
 
@@ -160,17 +158,86 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
+// authn identifies the caller and stores the principal in the request context.
+func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-				return
+		p, err := s.Auth.Authenticate(r)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="vigilante"`)
+			writeErr(w, http.StatusUnauthorized, err)
+			return
+		}
+		h(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
+	}
+}
+
+// svc describes a service for authorization (name + owning team).
+func (s *Server) svc(name string) auth.Service {
+	if sv, ok := s.E.Cfg.Service(name); ok {
+		return auth.Service{Name: sv.Name, Team: sv.Team}
+	}
+	return auth.Service{Name: name}
+}
+
+// targetServices lists the services a target belongs to.
+func (s *Server) targetServices(target string) []auth.Service {
+	var out []auth.Service
+	for _, sv := range s.E.Cfg.Services {
+		for _, t := range sv.Targets {
+			if t == target {
+				out = append(out, auth.Service{Name: sv.Name, Team: sv.Team})
 			}
 		}
-		h(w, r)
 	}
+	return out
+}
+
+// allow checks the caller's role for action a on svc and writes 403 if not.
+func (s *Server) allow(w http.ResponseWriter, r *http.Request, a auth.Action, svc auth.Service) (*auth.Principal, bool) {
+	p := auth.FromContext(r.Context())
+	if p != nil && p.Can(a, svc) {
+		return p, true
+	}
+	writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role %s on %s", principalID(p), auth.Required(a), describe(svc)))
+	return p, false
+}
+
+// allowAny passes if the caller may do a on at least one of svcs.
+func (s *Server) allowAny(w http.ResponseWriter, r *http.Request, a auth.Action, svcs []auth.Service, what string) bool {
+	p := auth.FromContext(r.Context())
+	for _, sv := range svcs {
+		if p != nil && p.Can(a, sv) {
+			return true
+		}
+	}
+	writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role %s on a service using %s", principalID(p), auth.Required(a), what))
+	return false
+}
+
+func principalID(p *auth.Principal) string {
+	if p == nil {
+		return "caller"
+	}
+	return p.ID
+}
+
+func describe(svc auth.Service) string {
+	switch {
+	case svc.Name == "":
+		return "all services (scope *)"
+	case svc.Team != "":
+		return "service=" + svc.Name + " (team=" + svc.Team + ")"
+	}
+	return "service=" + svc.Name
+}
+
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	p := auth.FromContext(r.Context())
+	grants := make([]string, len(p.Bindings))
+	for i, b := range p.Bindings {
+		grants[i] = b.String()
+	}
+	writeJSON(w, 200, map[string]any{"id": p.ID, "kind": p.Kind, "groups": p.Groups, "grants": grants})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -200,7 +267,11 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	d, err := s.create(r.Context(), req)
+	p, ok := s.allow(w, r, auth.ActDeploy, s.svc(req.Service))
+	if !ok {
+		return
+	}
+	d, err := s.create(r.Context(), p, req)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -208,7 +279,7 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, d)
 }
 
-func (s *Server) create(ctx context.Context, req createReq) (*model.Deployment, error) {
+func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (*model.Deployment, error) {
 	if req.Service == "" || req.Version == "" {
 		return nil, errors.New("service and version are required")
 	}
@@ -223,6 +294,7 @@ func (s *Server) create(ctx context.Context, req createReq) (*model.Deployment, 
 	if err != nil {
 		return nil, err
 	}
+	s.E.SetCreatedBy(d, p.ID)
 	if note != "" {
 		s.E.Annotate(d, "input", note)
 	}
@@ -240,22 +312,75 @@ func (s *Server) create(ctx context.Context, req createReq) (*model.Deployment, 
 	return cp, nil
 }
 
-func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (*model.Deployment, bool) {
+// lookup finds the deployment in the path and checks the caller may do a on its service.
+func (s *Server) lookup(w http.ResponseWriter, r *http.Request, a auth.Action) (*model.Deployment, *auth.Principal, bool) {
 	id := r.PathValue("id")
-	if _, ok := s.E.Deployment(id); !ok {
+	d := s.E.Live(id)
+	if d == nil {
 		writeErr(w, 404, fmt.Errorf("deployment %q not found", id))
-		return nil, false
+		return nil, nil, false
 	}
-	return s.E.Live(id), true
+	p, ok := s.allow(w, r, a, s.svc(d.Service))
+	return d, p, ok
+}
+
+func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
+	p := auth.FromContext(r.Context())
+	out := []*model.Deployment{}
+	for _, d := range s.E.Deployments() {
+		if p.Can(auth.ActRead, s.svc(d.Service)) {
+			out = append(out, d)
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
+	d, _, ok := s.lookup(w, r, auth.ActDeploy)
+	if !ok {
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"aborted": s.E.Abort(d.ID)})
+}
+
+func (s *Server) circuitStatus(w http.ResponseWriter, r *http.Request) {
+	if p := auth.FromContext(r.Context()); !p.CanSomewhere(auth.ActRead) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s has no viewer role", p.ID))
+		return
+	}
+	writeJSON(w, 200, s.E.Breaker.State())
+}
+
+func (s *Server) circuitReset(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.allow(w, r, auth.ActCircuit, auth.Service{})
+	if !ok {
+		return
+	}
+	s.E.Breaker.Reset()
+	s.E.Log.Warn("circuit reset", "by", p.ID)
+	writeJSON(w, 200, s.E.Breaker.State())
+}
+
+func (s *Server) circuitTrip(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.allow(w, r, auth.ActCircuit, auth.Service{})
+	if !ok {
+		return
+	}
+	reason := r.URL.Query().Get("reason")
+	if reason == "" {
+		reason = "kill switch via API"
+	}
+	s.E.Breaker.Trip(reason + " (by " + p.ID + ")")
+	writeJSON(w, 200, s.E.Breaker.State())
 }
 
 func (s *Server) getDeployment(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	d, ok := s.E.Deployment(id)
+	live, _, ok := s.lookup(w, r, auth.ActRead)
 	if !ok {
-		writeErr(w, 404, fmt.Errorf("deployment %q not found", id))
 		return
 	}
+	id := live.ID
+	d, _ := s.E.Deployment(id)
 	resp := map[string]any{"deployment": d, "exit_code": model.ExitCode(d)}
 	if ev, ok := s.E.LastEvaluation(id); ok {
 		resp["last_evaluation"] = ev
@@ -285,7 +410,7 @@ func (s *Server) launch(d *model.Deployment, phase model.Phase) error {
 }
 
 func (s *Server) startPhase(w http.ResponseWriter, r *http.Request) {
-	d, ok := s.lookup(w, r)
+	d, _, ok := s.lookup(w, r, auth.ActDeploy)
 	if !ok {
 		return
 	}
@@ -319,7 +444,7 @@ type rollbackReq struct {
 }
 
 func (s *Server) manualRollback(w http.ResponseWriter, r *http.Request) {
-	d, ok := s.lookup(w, r)
+	d, p, ok := s.lookup(w, r, auth.ActRollback)
 	if !ok {
 		return
 	}
@@ -330,12 +455,12 @@ func (s *Server) manualRollback(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "manual rollback via API"
 	}
-	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets})
+	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
 	writeJSON(w, 202, map[string]string{"status": "rollback started"})
 }
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
-	d, ok := s.lookup(w, r)
+	d, p, ok := s.lookup(w, r, auth.ActApprove)
 	if !ok {
 		return
 	}
@@ -343,11 +468,18 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, fmt.Errorf("deployment is %s, not awaiting approval", d.State))
 		return
 	}
-	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true})
+	if s.E.Cfg.Auth.FourEyes && (p.ID == d.CreatedBy || p.ID == d.RollbackRequestedBy) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must approve", p.ID))
+		return
+	}
+	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
 	writeJSON(w, 202, map[string]string{"status": "approved; escalation running"})
 }
 
 func (s *Server) captureBaseline(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.allow(w, r, auth.ActDeploy, s.svc(r.PathValue("service"))); !ok {
+		return
+	}
 	var window time.Duration
 	if v := r.URL.Query().Get("window"); v != "" {
 		var err error
@@ -370,6 +502,15 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	checked := map[string]bool{}
+	for _, sm := range samples {
+		if !checked[sm.Target] {
+			if !s.allowAny(w, r, auth.ActAgent, s.targetServices(sm.Target), "target "+sm.Target) {
+				return
+			}
+			checked[sm.Target] = true
+		}
+	}
 	for _, sm := range samples {
 		if !strings.HasPrefix(sm.Source, "agent:") {
 			sm.Source = "agent:" + sm.Target
@@ -381,6 +522,9 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	target := r.PathValue("target")
+	if !s.allowAny(w, r, auth.ActAgent, s.targetServices(target), "target "+target) {
+		return
+	}
 	s.mu.Lock()
 	s.agents[target] = time.Now()
 	s.mu.Unlock()
@@ -400,6 +544,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) targetMetrics(w http.ResponseWriter, r *http.Request) {
 	target := r.PathValue("target")
+	if !s.allowAny(w, r, auth.ActRead, s.targetServices(target), "target "+target) {
+		return
+	}
 	out := map[string]float64{}
 	now := time.Now()
 	for _, m := range s.E.Store.Metrics(target) {
@@ -421,7 +568,8 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider := r.PathValue("provider")
-	if err := s.verifyWebhook(provider, r, body); err != nil {
+	p, err := s.verifyWebhook(provider, r, body)
+	if err != nil {
 		writeErr(w, 401, err)
 		return
 	}
@@ -434,7 +582,11 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 202, map[string]string{"status": "ignored"})
 		return
 	}
-	d, err := s.create(r.Context(), *req)
+	if !p.Can(auth.ActDeploy, s.svc(req.Service)) {
+		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role deployer on %s", p.ID, describe(s.svc(req.Service))))
+		return
+	}
+	d, err := s.create(r.Context(), p, *req)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -442,33 +594,31 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, d)
 }
 
-func (s *Server) verifyWebhook(provider string, r *http.Request, body []byte) error {
+// verifyWebhook authenticates a webhook. GitHub and GitLab sign with the
+// shared secret and act as a deployer on every service; other providers use
+// a normal bearer token and that caller's own grants.
+func (s *Server) verifyWebhook(provider string, r *http.Request, body []byte) (*auth.Principal, error) {
+	signed := &auth.Principal{ID: "webhook:" + provider, Kind: "webhook",
+		Bindings: []auth.Binding{{Role: auth.Deployer, Scope: auth.Scope{Kind: "all"}}}}
 	switch provider {
 	case "github":
 		if s.WebhookSecret == "" {
-			return errors.New("webhook secret not configured")
+			return nil, errors.New("webhook secret not configured")
 		}
 		mac := hmac.New(sha256.New, []byte(s.WebhookSecret))
 		mac.Write(body)
 		want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 		if !hmac.Equal([]byte(want), []byte(r.Header.Get("X-Hub-Signature-256"))) {
-			return errors.New("bad signature")
+			return nil, errors.New("bad signature")
 		}
-		return nil
+		return signed, nil
 	case "gitlab":
 		if s.WebhookSecret == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Gitlab-Token")), []byte(s.WebhookSecret)) != 1 {
-			return errors.New("bad gitlab token")
+			return nil, errors.New("bad gitlab token")
 		}
-		return nil
-	default: // jenkins / generic use the API bearer token
-		if s.Token == "" {
-			return nil
-		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-			return errors.New("unauthorized")
-		}
-		return nil
+		return signed, nil
+	default: // jenkins / generic: an ordinary API caller
+		return s.Auth.Authenticate(r)
 	}
 }
 

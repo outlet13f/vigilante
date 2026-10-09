@@ -31,6 +31,7 @@ executors:   {...}   # 이름 → 롤백 전략 (A/B/D/범용)
 services:    [...]   # 서비스 = 대상 + 프로브 + 규칙 + 단계 + 롤백 플랜
 safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼럼
 notify:      [...]   # 알림
+auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
 ```
 
 ## `server`
@@ -259,6 +260,62 @@ safety:
 ```
 
 상세 동작은 [04-safety-circuit-breaker.md](04-safety-circuit-breaker.md).
+
+## `auth` — 인증과 권한
+
+API 호출자는 Bearer 토큰을 보냅니다. 세 종류를 받습니다.
+
+| 토큰 | 용도 | 신원 |
+|---|---|---|
+| 서비스 계정 토큰 (`vgl_…`) | CI 잡, 에이전트 | `sa:<name>`. 설정에는 SHA-256 해시만 저장. `vigilante token create`로 발급 |
+| OIDC JWT | 사람(사내 SSO: Keycloak, Azure AD, Okta 등) | `user:<preferred_username>`. 그룹을 역할에 매핑 |
+| `server.auth_token_env`의 토큰 | 비상용(break-glass) | `token:legacy`, admin. 평소에는 비워 두기를 권장 |
+
+아무것도 설정하지 않으면 인증이 꺼집니다(개발용, 시작 시 경고, 모든 작업이 `anonymous`로 기록).
+
+**역할** (아래로 갈수록 상위 권한 포함)
+
+| 역할 | 할 수 있는 일 |
+|---|---|
+| `viewer` | 배포·서킷·지표 조회 |
+| `deployer` | 배포 생성, 단계 관측 시작, 중단, 기준선 측정, `mark-good` |
+| `operator` | 수동 롤백, 승인 대기 에스컬레이션 승인 |
+| `admin` | 서킷 리셋·차단, 그 외 전부 |
+| `agent` | 에이전트 전용: 샘플 전송, 하트비트만 (다른 역할과 별개) |
+
+**범위(scope)**: `*`(전체, 기본) · `team=<팀>`(서비스의 `team` 값과 일치) · `service=<이름>`. 서킷 리셋처럼 특정 서비스에 속하지 않는 작업은 `*` 범위가 필요합니다. 목록 조회는 권한 있는 서비스만 돌려줍니다.
+
+```yaml
+services:
+  - name: order-api
+    team: payments            # team= 범위가 이 값과 맞춰짐
+    ...
+auth:
+  oidc:
+    issuer: https://sso.example.internal/realms/ops
+    audience: vigilante       # 토큰의 aud(client ID)
+    groups_claim: groups      # 기본 groups
+    username_claim: preferred_username
+  role_bindings:
+    - {group: sre-oncall, role: operator}
+    - {group: platform-admins, role: admin}
+    - {group: payments-dev, role: deployer, scope: team=payments}
+    - {user: alice, role: viewer}
+  service_accounts:
+    - name: ci-order-api
+      token_sha256: fb4afd06a1bdd94f9f3febfaa8b22a2d3fd2db9d10bf0c51ab3a75ba8e9fd8a9
+      expires: 2027-06-30     # 이 날짜까지 유효
+      roles: [{role: deployer, scope: "service=order-api"}]
+    - name: agent-fleet
+      token_sha256: 0f1e...   # (64자 hex)
+      roles: [{role: agent}]
+  four_eyes: true             # 배포 생성자·롤백 요청자는 그 승인 요청을 직접 승인할 수 없음
+```
+
+- 토큰 폐기: 서비스 계정 항목을 지우고 설정을 다시 읽히면 즉시 무효가 됩니다. 만료일을 두는 것을 권장합니다.
+- 확인: `vigilante whoami --server URL` (환경변수 `VIGILANTE_TOKEN`의 신원과 권한 출력).
+- 모든 생성·롤백·승인 기록에 작업자(`created_by`, `rollback_requested_by`, `approved_by`)가 남습니다. 로컬 CLI 실행은 `cli:<OS 사용자>@<호스트>`로 기록됩니다.
+- OIDC를 설정하면 서버 시작 시 발급자(issuer)의 discovery 문서를 가져오므로 서버에서 SSO에 접근할 수 있어야 합니다.
 
 ## `notify[]`
 

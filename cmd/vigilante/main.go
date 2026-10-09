@@ -53,6 +53,8 @@ Usage:
   vigilante agent    -c FILE --target NAME --server URL
   vigilante doctor   -c FILE [--service S] [--previous P] [--json] [--junit FILE]
   vigilante presets [list | show NAME[@V] [--set k=v]...] [--dir DIRS]
+  vigilante token    create --name NAME [--role ROLE] [--scope SCOPE] [--expires YYYY-MM-DD]
+  vigilante whoami   --server URL
   vigilante plugins
   vigilante version
 
@@ -167,6 +169,10 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdPresets(args)
 	case "doctor":
 		return cmdDoctor(ctx, args)
+	case "token":
+		return cmdToken(args)
+	case "whoami":
+		return cmdWhoami(ctx, args)
 	case "circuit":
 		return cmdCircuit(ctx, args)
 	case "server":
@@ -193,6 +199,7 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	err = e.Prepare(ctx, d)
 	cp, _ := e.Deployment(d.ID)
@@ -247,6 +254,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
@@ -353,12 +361,13 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 		if d, err = e.Create(c.id, c.service, c.ver, c.prev); err != nil {
 			return 1, err
 		}
+		e.SetCreatedBy(d, cliActor())
 		annotate(e, d, notes)
 	}
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
 	}
-	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec}
+	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec, Actor: cliActor()}
 	if *targets != "" {
 		opt.Targets = strings.Split(*targets, ",")
 	} else if len(d.Targets) == 0 {
@@ -504,9 +513,12 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	defer e.Close()
-	srv := api.New(ctx, e)
-	if srv.Token == "" {
-		e.Log.Warn("API authentication disabled: set server.auth_token_env")
+	srv, err := api.New(ctx, e)
+	if err != nil {
+		return 1, err
+	}
+	if srv.Auth.Disabled() {
+		e.Log.Warn("API authentication disabled: configure auth (service accounts / OIDC) or server.auth_token_env")
 	}
 	role := "single node"
 	if e.Cfg.Server.HA.Enabled {

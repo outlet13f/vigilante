@@ -26,6 +26,53 @@ type Config struct {
 	Notify      []Notifier            `yaml:"notify"`
 	// PresetDirs holds organisation presets (*.yaml), relative to this file.
 	PresetDirs []string `yaml:"preset_dirs"`
+	Auth       Auth     `yaml:"auth"`
+}
+
+// Auth configures who may call the API and what they may do.
+//
+// Roles, lowest to highest: viewer (read), deployer (create deployments, run
+// phases, abort, baselines, mark-good), operator (manual rollback, approve),
+// admin (circuit reset/trip and everything else). The agent role may only
+// push samples and heartbeats. A scope limits a grant: "*" (default),
+// "team=<team>" or "service=<name>".
+type Auth struct {
+	OIDC            *OIDC            `yaml:"oidc"`
+	ServiceAccounts []ServiceAccount `yaml:"service_accounts"`
+	RoleBindings    []RoleBinding    `yaml:"role_bindings"`
+	// FourEyes: whoever created a deployment or requested its rollback may
+	// not also approve its gated escalation.
+	FourEyes bool `yaml:"four_eyes"`
+}
+
+// OIDC validates bearer JWTs from the company identity provider.
+type OIDC struct {
+	Issuer        string `yaml:"issuer"`
+	Audience      string `yaml:"audience"`       // expected client ID
+	UsernameClaim string `yaml:"username_claim"` // default preferred_username
+	GroupsClaim   string `yaml:"groups_claim"`   // default groups
+}
+
+// ServiceAccount is a machine identity (CI job, agent fleet). Only the
+// SHA-256 of its token is stored; create one with `vigilante token create`.
+type ServiceAccount struct {
+	Name        string  `yaml:"name"`
+	TokenSHA256 string  `yaml:"token_sha256"`
+	Expires     string  `yaml:"expires"` // YYYY-MM-DD, optional
+	Roles       []Grant `yaml:"roles"`
+}
+
+type Grant struct {
+	Role  string `yaml:"role"`
+	Scope string `yaml:"scope"`
+}
+
+// RoleBinding grants a role to an OIDC group or user.
+type RoleBinding struct {
+	Group string `yaml:"group"`
+	User  string `yaml:"user"`
+	Role  string `yaml:"role"`
+	Scope string `yaml:"scope"`
 }
 
 type Server struct {
@@ -229,6 +276,8 @@ type WebhookExec struct {
 // Service ties targets, probes, rules, phases and the rollback plan together.
 type Service struct {
 	Name string `yaml:"name"`
+	// Team owns the service; auth scopes "team=<team>" match it.
+	Team string `yaml:"team"`
 	// Preset ("java-web" or pinned "java-web@1") supplies probes, rules,
 	// baseline and phases; Overrides fills its parameters. Probes, rules and
 	// phases written on the service replace the preset's of the same id/name.

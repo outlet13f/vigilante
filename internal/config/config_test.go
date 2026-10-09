@@ -131,3 +131,38 @@ server:
 		t.Fatalf("valid HA config: %v %+v", err, c)
 	}
 }
+
+func TestAuthValidation(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x}
+auth:
+`
+	h := strings.Repeat("ab", 32)
+	cases := map[string]string{
+		"  service_accounts: [{name: ci, token_sha256: nothex, roles: [{role: deployer}]}]\n":                         "64 hex",
+		"  service_accounts: [{name: ci, token_sha256: " + h + ", roles: [{role: root}]}]\n":                          `unknown role "root"`,
+		"  service_accounts: [{name: ci, token_sha256: " + h + ", roles: [{role: deployer, scope: service=nope}]}]\n": "unknown service",
+		"  service_accounts: [{name: ci, token_sha256: " + h + ", roles: [{role: deployer, scope: env=prod}]}]\n":     "must be *, team=",
+		"  service_accounts: [{name: ci, token_sha256: " + h + ", expires: soon, roles: [{role: admin}]}]\n":          "YYYY-MM-DD",
+		"  service_accounts: [{name: ci, token_sha256: " + h + "}]\n":                                                 "no roles",
+		"  role_bindings: [{group: sre, role: operator}]\n":                                                           "auth.oidc is required",
+		"  oidc: {issuer: https://idp}\n":                                                "issuer and audience",
+		"  oidc: {issuer: https://idp, audience: v}\n  role_bindings: [{role: admin}]\n": "exactly one of group or user",
+	}
+	for tail, want := range cases {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	if _, err := Parse([]byte(base + "  four_eyes: true\n  service_accounts: [{name: ci, token_sha256: " + h + ", expires: 2027-01-31, roles: [{role: deployer, scope: team=payments}]}]\n")); err != nil {
+		t.Fatalf("valid auth block: %v", err)
+	}
+}

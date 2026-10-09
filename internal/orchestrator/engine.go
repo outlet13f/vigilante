@@ -244,6 +244,19 @@ func (e *Engine) Annotate(d *model.Deployment, kind, msg string) {
 	e.persist(d)
 }
 
+// SetCreatedBy records who created the deployment (first caller wins).
+func (e *Engine) SetCreatedBy(d *model.Deployment, actor string) {
+	e.mu.Lock()
+	set := d.CreatedBy == "" && actor != ""
+	if set {
+		d.CreatedBy = actor
+	}
+	e.mu.Unlock()
+	if set {
+		e.persist(d)
+	}
+}
+
 // MarkBlocked records that a phase could not start (e.g. circuit open).
 func (e *Engine) MarkBlocked(d *model.Deployment, err error) {
 	e.setState(d, model.StateHeld, err.Error())

@@ -555,6 +555,7 @@ func (c *Config) Validate() error {
 			bad("server.ha.lease_ttl must be at least 3s")
 		}
 	}
+	c.validateAuth(services, bad)
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
 		bad("agent.failsafe must be hold|rollback")
 	}
@@ -664,4 +665,65 @@ func contains(xs []string, x string) bool {
 		}
 	}
 	return false
+}
+
+var validRoles = set("viewer", "deployer", "operator", "admin", "agent")
+
+func (c *Config) validateAuth(services map[string]bool, bad func(string, ...any)) {
+	a := c.Auth
+	checkGrant := func(where, role, scope string) {
+		if !validRoles[role] {
+			bad("%s: unknown role %q (viewer|deployer|operator|admin|agent)", where, role)
+		}
+		switch k, v, _ := strings.Cut(scope, "="); {
+		case scope == "" || scope == "*":
+		case k == "service" && v != "":
+			if !services[v] {
+				bad("%s: scope %q names an unknown service", where, scope)
+			}
+		case k == "team" && v != "":
+		default:
+			bad("%s: scope %q must be *, team=<team> or service=<name>", where, scope)
+		}
+	}
+	names := map[string]bool{}
+	hashes := map[string]bool{}
+	for i, sa := range a.ServiceAccounts {
+		where := fmt.Sprintf("auth.service_accounts[%d] %q", i, sa.Name)
+		if sa.Name == "" || names[sa.Name] {
+			bad("%s: empty or duplicate name", where)
+		}
+		names[sa.Name] = true
+		h := strings.ToLower(sa.TokenSHA256)
+		if len(h) != 64 || strings.Trim(h, "0123456789abcdef") != "" {
+			bad("%s: token_sha256 must be 64 hex characters (vigilante token create)", where)
+		} else if hashes[h] {
+			bad("%s: token_sha256 reused by another account", where)
+		}
+		hashes[h] = true
+		if sa.Expires != "" {
+			if _, err := time.Parse("2006-01-02", sa.Expires); err != nil {
+				bad("%s: expires must be YYYY-MM-DD", where)
+			}
+		}
+		if len(sa.Roles) == 0 {
+			bad("%s: no roles", where)
+		}
+		for _, g := range sa.Roles {
+			checkGrant(where, g.Role, g.Scope)
+		}
+	}
+	for i, rb := range a.RoleBindings {
+		where := fmt.Sprintf("auth.role_bindings[%d]", i)
+		if (rb.Group == "") == (rb.User == "") {
+			bad("%s: set exactly one of group or user", where)
+		}
+		checkGrant(where, rb.Role, rb.Scope)
+	}
+	if a.OIDC != nil && (a.OIDC.Issuer == "" || a.OIDC.Audience == "") {
+		bad("auth.oidc: issuer and audience are required")
+	}
+	if len(a.RoleBindings) > 0 && a.OIDC == nil {
+		bad("auth.role_bindings: map OIDC groups/users, so auth.oidc is required")
+	}
 }
