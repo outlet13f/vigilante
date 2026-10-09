@@ -1,0 +1,5 @@
+/bin/
+/dist/
+examples/demo/run/
+*.jsonl
+vigilante-*.lock

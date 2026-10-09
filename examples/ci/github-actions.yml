@@ -1,0 +1,32 @@
+# GitHub Actions: the job blocks on vigilante's verdict for each phase.
+name: deploy-web
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, prod-network]
+    env:
+      VIGILANTE_TOKEN: ${{ secrets.VIGILANTE_TOKEN }}
+      VIG_SERVER: https://vigilante.example.internal
+      SVC: web
+      NEW: ${{ github.sha }}
+      PREV: ${{ vars.WEB_LAST_GOOD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Canary (web-ec2-a)
+        run: |
+          ./deploy.sh web-ec2-a "$NEW"
+          vigilante watch --server "$VIG_SERVER" --id "gh-${{ github.run_id }}" \
+            --service "$SVC" --version "$NEW" --previous "$PREV" --phase canary
+      - name: Full
+        run: |
+          ./deploy.sh all "$NEW"
+          vigilante watch --server "$VIG_SERVER" --id "gh-${{ github.run_id }}" \
+            --service "$SVC" --version "$NEW" --previous "$PREV" --phase full
+      - name: Explain failure
+        if: failure()
+        run: |
+          curl -fsS -H "Authorization: Bearer $VIGILANTE_TOKEN" \
+            "$VIG_SERVER/v1/deployments/gh-${{ github.run_id }}" | jq '.deployment | {state, reason, breaches}'

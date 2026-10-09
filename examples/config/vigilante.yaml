@@ -1,0 +1,416 @@
+# vigilante.yaml — reference configuration covering every supported layer:
+#   bare-metal / on-prem Linux (SSH), vSphere / Nutanix / KVM VMs, AWS EC2,
+#   standalone Docker/Podman containers, Nginx / HAProxy / Envoy / F5 / AWS ALB.
+# Secrets are never inline: they are read from environment variables or files.
+version: v1
+
+server:
+  listen: ":8088"
+  auth_token_env: VIGILANTE_TOKEN          # Bearer token for the REST API and agents
+  webhook_secret_env: VIGILANTE_WEBHOOK_SECRET
+  journal_path: /var/lib/vigilante/journal.jsonl
+  dry_run: false
+
+agent:
+  push_interval: 1s
+  heartbeat_interval: 5s
+  failsafe_after: 30s
+  failsafe: hold                           # hold | rollback (agent may roll back its own host if the orchestrator is gone)
+
+credentials:
+  ssh-deploy:
+    type: ssh
+    user: deploy
+    private_key_file: ~/.ssh/vigilante_ed25519
+    known_hosts_file: ~/.ssh/known_hosts
+  f5-admin:
+    type: basic
+    username_env: F5_USER
+    password_env: F5_PASSWORD
+  vcenter:
+    type: basic
+    username_env: VC_USER
+    password_env: VC_PASSWORD
+  prism:
+    type: basic
+    username_env: PRISM_USER
+    password_env: PRISM_PASSWORD
+  aws-prod:
+    type: aws
+    region: ap-northeast-2
+    profile: prod
+  deploy-console:
+    type: token
+    token_env: DEPLOY_CONSOLE_TOKEN
+
+targets:
+  # --- legacy bare-metal / on-prem ------------------------------------------
+  - name: bastion-dc1
+    kind: baremetal
+    address: 10.10.0.5
+    connection: {type: ssh, credential: ssh-deploy}
+  - name: order-bm-01
+    kind: baremetal
+    address: 10.10.1.11
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  - name: order-bm-02
+    kind: baremetal
+    address: 10.10.1.12
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  - name: order-bm-03
+    kind: baremetal
+    address: 10.10.1.13
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  - name: order-bm-04
+    kind: baremetal
+    address: 10.10.1.14
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  # --- software load balancers -----------------------------------------------
+  - name: lb-nginx-01
+    kind: vm
+    address: 10.10.0.21
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  - name: lb-nginx-02
+    kind: vm
+    address: 10.10.0.22
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+  - name: lb-haproxy-01
+    kind: vm
+    address: 10.10.0.31
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1}
+  # --- private virtualisation (vSphere VMs hosting Docker) --------------------
+  - name: pay-vm-01
+    kind: vm
+    address: 10.20.1.21
+    labels: {vcenter_vm: pay-vm-01, nutanix_uuid: 6f1c0d7e-0000-4000-8000-000000000001}
+    connection: {type: ssh, credential: ssh-deploy}
+  - name: pay-vm-02
+    kind: vm
+    address: 10.20.1.22
+    labels: {vcenter_vm: pay-vm-02}
+    connection: {type: ssh, credential: ssh-deploy}
+  - name: kvm-host-01
+    kind: baremetal
+    address: 10.20.0.5
+    connection: {type: ssh, credential: ssh-deploy, sudo: true}
+  # --- public cloud IaaS (EC2 behind an ALB) ----------------------------------
+  - name: web-ec2-a
+    kind: cloud_vm
+    address: 172.31.10.15
+    labels: {instance_id: i-0a1b2c3d4e5f60001, az: ap-northeast-2a}
+    connection: {type: ssh, credential: ssh-deploy}
+  - name: web-ec2-c
+    kind: cloud_vm
+    address: 172.31.20.15
+    labels: {instance_id: i-0a1b2c3d4e5f60002, az: ap-northeast-2c}
+    connection: {type: ssh, credential: ssh-deploy}
+
+traffic:
+  nginx-edge:
+    type: nginx
+    drain_wait: 10s                     # let in-flight requests finish
+    nginx:
+      hosts: [lb-nginx-01, lb-nginx-02] # HA pair: both are updated
+      upstream_file: /etc/nginx/conf.d/upstream_order.conf
+      member_format: "{{.Address}}:8080"
+  haproxy-pay:
+    type: haproxy
+    drain_wait: 15s
+    haproxy:
+      hosts: [lb-haproxy-01]
+      socket: /run/haproxy/admin.sock   # reached through SSH stream-local forwarding
+      backend: pay_backend
+      server_name: "{{.Name}}"
+      drain_to_maint: true
+  f5-dc1:
+    type: f5
+    f5:
+      url: https://bigip-dc1.example.internal
+      credential: f5-admin
+      pool: /Common/order_pool
+      member_format: "{{.Address}}:8080"
+      token_auth: true
+  alb-web:
+    type: aws_alb
+    aws_alb:
+      credential: aws-prod
+      target_group_arn: arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:targetgroup/web/0123456789abcdef
+      target_id: "{{.Labels.instance_id}}"
+      port: 8080
+      wait_timeout: 3m
+
+executors:
+  # Strategy A — symlink switch + systemd restart
+  order-symlink:
+    type: symlink
+    symlink:
+      link: /opt/order/current
+      releases_dir: /opt/order/releases
+      release: "{{.PreviousVersion}}"
+      init: systemd
+      unit: order-api
+  # Strategy B — container image switch (Docker or Podman socket, tunnelled over SSH)
+  pay-container:
+    type: container
+    container:
+      socket: /var/run/docker.sock
+      name: pay-api
+      image_repo: registry.example.internal/pay/pay-api
+      tag: "{{.PreviousVersion}}"
+      pull: true
+  # Strategy D — hypervisor snapshot restore (escalation of last resort)
+  pay-vm-snapshot:
+    type: vsphere
+    vsphere:
+      url: https://vcenter.example.internal/sdk
+      credential: vcenter
+      vm: "{{.Labels.vcenter_vm}}"
+      snapshot: "vigilante-{{.Service}}-{{.Version}}"
+      power_on: true
+  pay-nutanix-snapshot:
+    type: nutanix
+    nutanix:
+      url: https://prism.example.internal:9440
+      credential: prism
+      vm_uuid: "{{.Labels.nutanix_uuid}}"
+  legacy-kvm-snapshot:
+    type: kvm
+    kvm:
+      hypervisor: kvm-host-01
+      domain: "{{.Name}}"
+  # Generic: hand over to an in-house deploy console / Ansible
+  web-console:
+    type: webhook
+    webhook:
+      url: https://deploy-console.example.internal/api/apps/web/rollback
+      credential: deploy-console
+      body: '{"host":"{{.Name}}","to":"{{.PreviousVersion}}","reason":"vigilante {{.DeploymentID}}"}'
+      verify_url: https://deploy-console.example.internal/api/apps/web/hosts/{{.Name}}/version?expect={{.PreviousVersion}}
+  web-ansible:
+    type: exec
+    exec:
+      on: bastion-dc1
+      rollback: ansible-playbook -i inventories/prod rollback.yml -l {{.Name}} -e version={{.PreviousVersion}}
+
+services:
+  # ===========================================================================
+  # order-api: Java on bare metal behind an Nginx HA pair (+ F5 in front)
+  # ===========================================================================
+  - name: order-api
+    targets: [order-bm-01, order-bm-02, order-bm-03, order-bm-04]
+    control_targets: [auto]   # not-yet-deployed targets act as the live control group
+    probes:
+      - id: health
+        type: http
+        interval: 2s
+        timeout: 1500ms
+        http:
+          url: "http://{{.Address}}:8080/actuator/health"
+          expect_status: [200]
+          json_path: status
+          json_expect: UP
+      - id: dbpool
+        type: http
+        interval: 5s
+        http:
+          url: "http://{{.Address}}:8080/actuator/health/db"
+          json_path: status
+          json_expect: UP
+      - id: port
+        type: tcp
+        tcp: {address: "{{.Address}}:8080"}
+      - id: host
+        type: host
+        interval: 5s
+        timeout: 5s
+      - id: applog
+        type: log
+        log:
+          path: /var/log/order/application.log
+          patterns:
+            oom: "java\\.lang\\.OutOfMemoryError"
+            exception: "(?:Exception|Error)\\b.*\\bat [a-z]"
+            pool_exhausted: "HikariPool.*Connection is not available|Cannot get a connection, pool error"
+      - id: access
+        type: access_log
+        access_log:
+          path: /var/log/order/access.log
+          format: combined            # trailing $request_time column (seconds) is parsed when present
+    baseline:
+      window: 5m
+      min_samples: 100
+    rules:
+      - name: fatal-errors
+        action: rollback
+        when:
+          any:
+            - {metric: access.count_5xx, ratio_of: access.requests, window: 30s, op: ">", value: 2, for: 2}
+            - {metric: applog.match.exception, agg: rate, window: 10s, op: ">", value: 10, for: 2}
+            - {metric: health.consecutive_timeouts, op: ">=", value: 3}
+            - {metric: applog.match.oom, agg: sum, window: 1m, op: ">", value: 0}
+            - {metric: applog.match.pool_exhausted, agg: sum, window: 1m, op: ">", value: 5}
+      - name: latency-regression
+        action: rollback
+        when:
+          metric: health.latency_ms
+          agg: p99
+          window: 1m
+          op: ">"
+          baseline: {increase_pct: 200}   # p99 more than 3x the pre-deploy baseline
+          min_value: 300                  # ...and above 300ms in absolute terms
+          for: 3
+          reset_after: 2
+      - name: host-exhaustion
+        action: rollback
+        when:
+          any:
+            - {metric: host.mem_available_pct, agg: avg, window: 1m, op: "<", value: 5, for: 3}
+            - {metric: host.disk_util_pct, agg: avg, window: 1m, op: ">", value: 95, for: 3}
+            - {metric: host.load_per_cpu, agg: avg, window: 1m, op: ">", value: 4, for: 3}
+      - name: db-pool
+        action: rollback
+        when: {metric: dbpool.consecutive_failures, op: ">=", value: 3}
+      - name: elevated-4xx
+        action: notify
+        when: {metric: access.count_4xx, ratio_of: access.requests, window: 1m, op: ">", value: 10}
+    phases:
+      canary:
+        targets: [order-bm-01]
+        observation_window: 10m
+        warmup: 60s                       # JVM warm-up / JIT / pool fill
+        eval_interval: 5s
+        min_samples: 200
+        on_inconclusive: hold
+      rolling:
+        percent: 50
+        observation_window: 15m
+        warmup: 30s
+        on_inconclusive: hold
+      full:
+        observation_window: 20m
+        warmup: 30s
+        rules: [fatal-errors, latency-regression, db-pool]
+        on_inconclusive: pass
+    rollback:
+      executor: order-symlink
+      traffic: nginx-edge
+      scope: deployed
+      parallelism: 2
+      step_timeout: 2m
+      retry: {attempts: 3, backoff: 2s, max_backoff: 30s}
+      plan:
+        - action: traffic.drain
+        - action: app.rollback
+        - action: app.verify
+        - action: probe.verify
+          probe: health
+          successes: 3
+          timeout: 90s
+        - action: traffic.enable
+      escalation:
+        - executor: legacy-kvm-snapshot
+          require_approval: true
+
+  # ===========================================================================
+  # pay-api: Docker containers on vSphere VMs behind HAProxy
+  # ===========================================================================
+  - name: pay-api
+    targets: [pay-vm-01, pay-vm-02]
+    probes:
+      - id: grpc
+        type: grpc
+        grpc: {address: "{{.Address}}:9090", service: pay.v1.Payments}
+      - id: ctr
+        type: docker
+        interval: 3s
+        docker: {container: pay-api}      # docker.sock tunnelled over SSH
+      - id: access
+        type: access_log
+        access_log:
+          path: /var/log/pay/access.json
+          format: json
+          status_field: status
+          latency_field: duration_ms
+          latency_unit: ms
+      - id: db
+        type: db
+        interval: 10s
+        timeout: 3s
+        db: {driver: postgres, dsn_env: PAY_DB_DSN, pool_size: 5}
+    rules:
+      - name: crashloop
+        action: rollback
+        when:
+          any:
+            - {metric: ctr.restarts, op: ">=", value: 2}
+            - {metric: ctr.oom_events, agg: sum, window: 5m, op: ">", value: 0}
+            - {metric: ctr.oom_killed, op: "==", value: 1}
+            - {metric: ctr.running, op: "==", value: 0, for: 2}
+      - name: errors
+        action: rollback
+        when:
+          any:
+            - {metric: access.count_5xx, ratio_of: access.requests, window: 30s, op: ">", value: 2, for: 2}
+            - {metric: grpc.consecutive_failures, op: ">=", value: 3}
+            - {metric: db.consecutive_failures, op: ">=", value: 2}
+    phases:
+      canary: {targets: [pay-vm-01], observation_window: 5m, warmup: 20s}
+      full: {observation_window: 10m, warmup: 20s}
+    rollback:
+      executor: pay-container
+      traffic: haproxy-pay
+      plan:
+        - action: traffic.drain
+        - action: app.rollback
+        - action: app.verify
+        - {action: probe.verify, probe: grpc, successes: 3}
+        - action: traffic.enable
+      escalation:
+        - executor: pay-vm-snapshot       # strategy D: large patch went wrong -> revert the whole VM
+          require_approval: true
+
+  # ===========================================================================
+  # web: EC2 instances behind an AWS ALB, deployed by an in-house console
+  # ===========================================================================
+  - name: web
+    targets: [web-ec2-a, web-ec2-c]
+    probes:
+      - id: health
+        type: http
+        http: {url: "http://{{.Address}}:8080/healthz"}
+      - id: host
+        type: host
+        interval: 10s
+        timeout: 5s
+    rules:
+      - name: down
+        when: {metric: health.consecutive_failures, op: ">=", value: 3}
+    phases:
+      canary: {targets: [web-ec2-a], observation_window: 5m, warmup: 15s}
+      full: {observation_window: 10m}
+    rollback:
+      executor: web-console
+      traffic: alb-web
+      escalation:
+        - executor: web-ansible
+
+safety:
+  observer_quorum: true                   # central and agent must agree before a rollback
+  circuit_breaker:
+    failure_threshold: 2                  # 2 failed rollbacks within 1h => freeze automation
+    window: 1h
+    open_duration: 0s                     # 0s = manual reset only
+  blast_radius:
+    min_healthy: 1
+    min_healthy_percent: 50
+  flapping:
+    max_rollbacks_per_hour: 3
+    cooldown: 5m
+
+notify:
+  - type: slack
+    url_env: SLACK_WEBHOOK_URL
+    min_level: warning
+  - type: webhook
+    url_env: PAGER_WEBHOOK_URL
+    min_level: critical

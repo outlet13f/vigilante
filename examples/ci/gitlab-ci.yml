@@ -1,0 +1,40 @@
+# GitLab CI: delegate observation to the central orchestrator (server mode).
+# VIGILANTE_TOKEN is a masked CI/CD variable.
+variables:
+  VIGILANTE_SERVER: https://vigilante.example.internal
+  SVC: pay-api
+  PREV: $LAST_GOOD_VERSION
+
+stages: [validate, canary, full]
+
+.gate: &gate
+  image: registry.example.internal/tools/vigilante:0.1
+  script:
+    - deploy-pay.sh "$DEPLOY_HOSTS" "$CI_COMMIT_SHORT_SHA"
+    - |
+      set +e
+      vigilante watch --server "$VIGILANTE_SERVER" --id "gl-$CI_PIPELINE_ID" \
+        --service "$SVC" --version "$CI_COMMIT_SHORT_SHA" --previous "$PREV" --phase "$PHASE"
+      rc=$?
+      case $rc in
+        0) echo "PASS";;
+        2) echo "rolled back automatically"; exit 1;;
+        3) echo "ROLLBACK FAILED / circuit open - paging on-call"; exit 1;;
+        4) echo "HELD - needs a human"; exit 1;;
+        *) exit $rc;;
+      esac
+
+validate:
+  stage: validate
+  image: registry.example.internal/tools/vigilante:0.1
+  script: [vigilante validate -c deploy/vigilante.yaml]
+
+canary:
+  stage: canary
+  variables: {PHASE: canary, DEPLOY_HOSTS: pay-vm-01}
+  <<: *gate
+
+full:
+  stage: full
+  variables: {PHASE: full, DEPLOY_HOSTS: "pay-vm-01,pay-vm-02"}
+  <<: *gate

@@ -1,0 +1,68 @@
+# Vigilante — Unified Rollback Orchestrator
+
+이기종 하이브리드 인프라(베어메탈 · vSphere/Nutanix/KVM · EC2/Azure VM · Docker/Podman · Nginx/HAProxy/Envoy/F5/ALB)의 배포를 **외부 APM 없이 자체 측정·판정하고, 실패 시 즉시 자동 롤백**하는 단일 Go 바이너리.
+
+```
+배포 ─▶ vigilante watch ─▶ 수집(HTTP/gRPC/TCP·/proc·docker.sock·로그·5xx·DB 풀)
+                         ─▶ 판정(복합 규칙·베이스라인·연속 실패·대조군·관측 쿼럼)
+                         ─▶ 롤백(드레인 → symlink/컨테이너/스냅샷 → 검증 → 복귀)
+                         ─▶ 안전장치(서킷 브레이커·blast radius·플래핑·크래시 재개)
+```
+
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| [docs/01-architecture.md](docs/01-architecture.md) | 하이브리드 아키텍처 결정, 구성도, 데이터 흐름, 상태 머신, 운영 토폴로지 |
+| [docs/02-config-spec.md](docs/02-config-spec.md) | `vigilante.yaml` 전체 명세 (프로브 메트릭 카탈로그, 규칙 문법, 실행기/트래픽) |
+| [docs/03-engine-design.md](docs/03-engine-design.md) | 비동기 수집, 3값 규칙 평가, 실행기 인터페이스, 확장·테스트 |
+| [docs/04-safety-circuit-breaker.md](docs/04-safety-circuit-breaker.md) | 롤백 실패·비상 정지 시나리오 18종, 서킷 상태도, 런북 |
+| [examples/config/vigilante.yaml](examples/config/vigilante.yaml) | 3개 서비스 × 전 인프라 유형 참조 설정 |
+| [examples/ci/](examples/ci/) | Jenkins / GitLab CI / GitHub Actions 연동 |
+
+## 빠른 시작
+
+```bash
+go build -o bin/vigilante ./cmd/vigilante          # CGO 불필요, 정적 바이너리
+bin/vigilante plugins                              # 등록된 프로브/실행기/트래픽 제어기
+bin/vigilante validate -c examples/config/vigilante.yaml
+
+# 로컬 E2E 데모 (Linux/macOS/Git Bash): 불량 배포 자동 롤백 → 롤백 경로 고장 → 서킷 OPEN → 리셋 → 정상 배포
+./examples/demo/run-demo.sh
+```
+
+### CI 파이프라인에서 (단발 실행)
+
+```bash
+vigilante prepare  -c vigilante.yaml --id $BUILD --service order-api --version v42 --previous v41   # 체크포인트/스냅샷
+vigilante baseline -c vigilante.yaml --service order-api --out baseline.json                        # 배포 전 기준점
+# ... canary 배포 ...
+vigilante watch    -c vigilante.yaml --id $BUILD --service order-api --version v42 --previous v41 \
+                   --phase canary --baseline baseline.json
+# exit 0 PASS · 2 롤백 완료 · 3 롤백 실패/서킷 OPEN/승인 대기 · 4 HOLD · 1 오류
+```
+
+### 중앙 서버 / 에이전트
+
+```bash
+VIGILANTE_TOKEN=... vigilante server -c vigilante.yaml                 # REST + 웹훅 + 크래시 재개
+vigilante watch --server https://vigilante:8088 --service ... --phase canary
+vigilante agent -c vigilante.yaml --target order-bm-01 --server https://vigilante:8088
+vigilante circuit -c vigilante.yaml status|reset|trip
+vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--approve]
+```
+
+## 검증 현황
+
+- `go vet ./...`, `go test ./...` — 10개 패키지 테스트 통과 (vSphere는 govmomi `vcsim` 시뮬레이터, 그 외 외부 API는 httptest/mock)
+- `examples/demo/run-demo.sh` — 실제 프로세스로 5개 시나리오 통과 (불량 v2 배포 후 약 4초 만에 탐지·롤백)
+- 정적 크로스 빌드: linux/amd64, linux/arm64, linux/ppc64le, windows/amd64 (`CGO_ENABLED=0`)
+
+## 알려진 한계 (프로토타입)
+
+- 실제 F5 / AWS / Nutanix / vCenter 장비와는 연동 테스트하지 않았습니다(시뮬레이터·mock 기준). 특히 Nutanix는 Prism Element v2 API 경로 기준이므로 AOS 버전별 확인이 필요합니다.
+- `host` 프로브는 Linux `/proc` 전용입니다. AIX/Solaris/HP-UX는 `exec` 기반 프로브 추가가 필요합니다.
+- Azure Load Balancer / Application Gateway, Citrix ADC 등은 `TrafficController` 구현 추가가 필요합니다 (현재는 `exec`/`webhook`으로 우회).
+- 저널은 단일 노드 파일 — 오케스트레이터 이중화 시 리더 선출 필요.
+- 바이너리 크기 약 35MB (govmomi·AWS SDK·gRPC 포함). 플러그인별 빌드 태그 분리는 아직 구현하지 않았습니다.
+- Race detector(`go test -race`)는 이 개발 환경에 cgo 툴체인이 없어 실행하지 못했습니다.

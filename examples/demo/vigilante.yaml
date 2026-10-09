@@ -1,0 +1,78 @@
+# Local end-to-end demo: one fake service instance on 127.0.0.1:18080.
+# Run ./examples/demo/run-demo.sh from the repository root.
+version: v1
+server:
+  journal_path: examples/demo/run/journal.jsonl
+
+targets:
+  - name: demo-app
+    kind: vm
+    address: 127.0.0.1
+    connection: {type: local}
+
+executors:
+  # Hands the rollback to the app's own deploy endpoint (stand-in for an
+  # in-house deploy console). DEMO_ROLLBACK_HOST lets the demo break it on purpose.
+  deploy-api:
+    type: webhook
+    webhook:
+      url: 'http://{{env "DEMO_ROLLBACK_HOST"}}/admin/deploy?version={{.PreviousVersion}}'
+      verify_url: 'http://{{env "DEMO_ROLLBACK_HOST"}}/admin/version?expect={{.PreviousVersion}}'
+
+services:
+  - name: demo
+    targets: [demo-app]
+    probes:
+      - id: health
+        type: http
+        interval: 500ms
+        timeout: 1s
+        http: {url: "http://{{.Address}}:18080/health", json_path: status, json_expect: UP}
+      - id: access
+        type: access_log
+        access_log: {path: examples/demo/run/access.log, format: combined}
+      - id: applog
+        type: log
+        log:
+          path: examples/demo/run/app.log
+          patterns:
+            oom: "OutOfMemoryError"
+            exception: "Exception"
+    baseline:
+      window: 10s
+      min_samples: 20
+    rules:
+      - name: error-rate
+        when:
+          any:
+            - {metric: access.count_5xx, ratio_of: access.requests, window: 10s, op: ">", value: 2, for: 2}
+            - {metric: applog.match.exception, agg: rate, window: 10s, op: ">", value: 10}
+            - {metric: applog.match.oom, agg: sum, window: 10s, op: ">", value: 0, for: 2}
+            - {metric: health.consecutive_failures, op: ">=", value: 3}
+      - name: latency-regression
+        when:
+          metric: health.latency_ms
+          agg: p99
+          window: 10s
+          op: ">"
+          baseline: {increase_pct: 200}
+          min_value: 15
+          for: 2
+    phases:
+      canary:
+        observation_window: 20s
+        warmup: 3s
+        eval_interval: 1s
+        min_samples: 20
+    rollback:
+      executor: deploy-api
+      step_timeout: 10s
+      retry: {attempts: 2, backoff: 500ms}
+      plan:
+        - action: app.rollback
+        - action: app.verify
+        - {action: probe.verify, probe: health, successes: 3}
+
+safety:
+  circuit_breaker: {failure_threshold: 1, window: 1h, open_duration: 0s}
+  flapping: {max_rollbacks_per_hour: 10}

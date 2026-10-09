@@ -1,0 +1,52 @@
+// Jenkins declarative pipeline: vigilante gates each rollout phase.
+// Exit codes: 0 promote | 2 rolled back | 3 rollback failed / circuit open | 4 held
+pipeline {
+  agent any
+  environment {
+    SVC      = 'order-api'
+    NEW      = "${env.GIT_COMMIT.take(8)}"
+    PREV     = sh(script: "cat .last-good-version", returnStdout: true).trim()
+    DEPLOY_ID = "jenkins-${env.JOB_NAME}-${env.BUILD_NUMBER}"
+    VIG      = 'vigilante -c /etc/vigilante/vigilante.yaml'
+  }
+  stages {
+    stage('Validate rollback config') { steps { sh "${VIG} validate" } }
+    stage('Checkpoint + baseline') {
+      steps {
+        sh "${VIG} prepare  --id ${DEPLOY_ID} --service ${SVC} --version ${NEW} --previous ${PREV}"
+        sh "${VIG} baseline --service ${SVC} --window 5m --out baseline.json"
+      }
+    }
+    stage('Canary') {
+      steps {
+        sh "ansible-playbook deploy.yml -l order-bm-01 -e version=${NEW}"
+        script { gate('canary') }
+      }
+    }
+    stage('Rolling') {
+      steps {
+        sh "ansible-playbook deploy.yml -l order-bm-02 -e version=${NEW}"
+        script { gate('rolling') }
+      }
+    }
+    stage('Full') {
+      steps {
+        sh "ansible-playbook deploy.yml -e version=${NEW}"
+        script { gate('full') }
+        sh "echo ${NEW} > .last-good-version"
+      }
+    }
+  }
+}
+
+def gate(String phase) {
+  def rc = sh(returnStatus: true, script:
+    "${VIG} watch --id ${DEPLOY_ID} --service ${SVC} --version ${NEW} --previous ${PREV} --phase ${phase} --baseline baseline.json")
+  switch (rc) {
+    case 0: echo "${phase}: PASS"; break
+    case 2: error("${phase}: FAILED — vigilante rolled back to ${PREV}")
+    case 3: error("${phase}: ROLLBACK FAILED or circuit OPEN — page on-call")
+    case 4: input message: "${phase} is HELD (environmental / inconclusive). Promote anyway?"; break
+    default: error("vigilante error (${rc})")
+  }
+}
