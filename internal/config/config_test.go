@@ -272,3 +272,83 @@ services:
 		t.Fatalf("octavia defaults: %+v", oc)
 	}
 }
+
+func TestRollbackModeValidationAndWarning(t *testing.T) {
+	svc := func(rb string) string {
+		return `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x` + rb + `}
+`
+	}
+	for rb, want := range map[string]string{
+		", mode: manual": "rollback.mode must be auto or approve",
+		", mode: approve, approval: {on_timeout: x}":     "on_timeout must be hold or rollback",
+		", mode: approve, approval: {drain_first: true}": "drain_first needs rollback.traffic",
+		", mode: approve, approval: {timeout: 10s}":      "at least 1m",
+	} {
+		if _, err := Parse([]byte(svc(rb))); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", rb, err, want)
+		}
+	}
+	c, err := Parse([]byte(svc("")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := c.Warnings(); len(w) != 1 || !strings.Contains(w[0], "rollback.mode is not set") || c.Services[0].Rollback.RollbackMode() != "auto" {
+		t.Fatalf("unset mode: %v", w)
+	}
+	c, _ = Parse([]byte(svc(", mode: approve")))
+	if len(c.Warnings()) != 0 || c.Services[0].Rollback.Approval.Timeout != 30*time.Minute || c.Services[0].Rollback.Approval.OnTimeout != "hold" {
+		t.Fatalf("approve defaults: %+v %v", c.Services[0].Rollback.Approval, c.Warnings())
+	}
+}
+
+func TestNotifyAndITSMValidation(t *testing.T) {
+	base := `
+version: v1
+credentials: {snow: {type: basic, user: u, password_env: P}, key: {type: ssh, user: u}}
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x, mode: auto}
+`
+	for tail, want := range map[string]string{
+		"notify: [{type: sms, url: x}]\n":                                                            "type must be webhook, slack, teams, email or pagerduty",
+		"notify: [{type: teams}]\n":                                                                  "url, url_env or url_ref required",
+		"notify: [{type: email, smtp: {host: h}}]\n":                                                 "smtp.host, smtp.from and smtp.to required",
+		"notify: [{type: pagerduty}]\n":                                                              "routing_key_ref or routing_key_env",
+		"notify: [{type: slack, url: x, min_level: loud}]\n":                                         "min_level",
+		"notify: [{type: slack, url: x, services: [nope]}]\n":                                        "unknown service",
+		"itsm: {servicenow: {url: u}}\n":                                                             "url and credential required",
+		"itsm: {servicenow: {url: u, credential: key}}\n":                                            "must be of type basic or token",
+		"itsm: {servicenow: {url: u, credential: snow, change_gate: {on_error: maybe}}}\n":           "on_error must be open or closed",
+		"itsm: {servicenow: {url: u, credential: snow, incidents: {on: [deploy]}}}\n":                "rollback_failed | circuit_opened",
+		"itsm: {servicenow: {url: u, credential: snow, incidents: {urgency: 9}}}\n":                  "urgency and impact must be 1..3",
+		"console: {redirect_url: https://v.example/console/auth/callback}\n":                         "needs auth.oidc",
+		"auth: {oidc: {issuer: i, audience: a}}\nconsole: {redirect_url: https://v.example/login}\n": "/console/auth/callback",
+		"console: {session_key_ref: plain-text-key}\n":                                               "console.session_key_ref",
+	} {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	c, err := Parse([]byte(base + "itsm: {servicenow: {url: u, credential: snow, change_gate: {enabled: true}}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sn := c.ITSM.ServiceNow
+	if sn.ChangeGate.OnError != "closed" || len(sn.ChangeGate.AllowedStates) != 2 || len(sn.Incidents.On) != 2 || sn.Incidents.Urgency != 1 {
+		t.Fatalf("defaults: %+v", sn)
+	}
+}

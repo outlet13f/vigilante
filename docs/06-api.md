@@ -18,6 +18,7 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | 동시 수정 | 배포 조회 응답의 `ETag`를 조치 요청의 `If-Match`에 넣으면, 그 사이 배포가 바뀐 경우 `412`로 거부 |
 | 목록 | `{items, next_cursor}`. `next_cursor`를 `cursor`로 넘겨 다음 페이지. `limit` 1~500(기본 50). 커서는 해석하지 말 것 |
 | 형식 | 시각은 RFC 3339 UTC, ID는 의미 없는 문자열, JSON 필드는 snake_case |
+| 값 목록의 확장 | 응답의 오류 `code`, 배포 상태, 작업 종류, 호출자 종류, 스코프는 값이 늘어날 수 있습니다(`x-extensible-enum`). 모르는 값은 HTTP 상태에 맞는 일반 처리로 다루십시오. 이벤트 종류도 늘어나며, 모르는 이벤트는 무시하면 됩니다 |
 | 추적 | 요청의 `X-Request-ID`(또는 W3C `traceparent`)를 응답과 서버 로그에 그대로 남김 |
 
 ## 인증과 권한
@@ -27,7 +28,8 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | OAuth 2.0 client credentials | `POST /v2/oauth/token`으로 받은 `vat_…` (기본 1시간) | 서버 간 연동: 사내 배포 콘솔, 개발자 포털 |
 | API 키 | `vgk_…` 그대로 | 단순 연동: 스크립트, SIEM 수집 |
 | 서비스 계정 토큰 | `vgl_…` (설정 파일 `auth.service_accounts`) | CI, 에이전트 |
-| OIDC 액세스 토큰 | 사내 IdP가 발급한 JWT | 사용자, 콘솔 |
+| OIDC 토큰 | 사내 IdP가 발급한 JWT | 사용자 |
+| 콘솔 세션 쿠키 | `/console/` 로그인 후 (`Authorization` 헤더가 없을 때만) | 웹 콘솔. 변경 요청은 `X-CSRF-Token` 필요 (docs/02 `console`) |
 
 권한은 두 단계로 판단합니다. **역할 grant**(`deployer@team=payments`처럼 역할@범위)가 어느 서비스에서 무엇을 할 수 있는지 정하고, API 클라이언트는 여기에 **스코프**가 더해져 할 수 있는 일의 종류를 좁힙니다. 둘 다 통과해야 허용됩니다.
 
@@ -91,7 +93,7 @@ curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials "$API/v2/oa
 | `GET /v2/deployments/{id}` | viewer | 배포, 타임라인, 위반, 최근 평가, `exit_code` |
 | `POST /v2/deployments/{id}/observations` | deployer | 단계 관측 시작 → Operation |
 | `POST /v2/deployments/{id}/rollbacks` | operator | 수동 롤백 → Operation |
-| `POST /v2/deployments/{id}/approvals` | operator | 승인 대기 중인 상위 전략 승인 → Operation. 4-eyes 적용 |
+| `POST /v2/deployments/{id}/approvals` | operator | 승인 대기 중인 롤백 결정 → Operation. `{"decision": "approve"\|"reject", "comment"}`. approve 모드의 준비된 롤백은 승인·거절, 상위 전략은 승인만. 4-eyes 적용 |
 | `POST /v2/deployments/{id}/abort` | deployer | 관측 중단 |
 | `GET /v2/operations`, `GET /v2/operations/{id}` | viewer | 작업 진행·결과 |
 | `GET /v2/services`, `GET /v2/services/{name}` | viewer | 서비스 구성(대상, 단계, 규칙, 실행기, 마지막 정상 버전) |
@@ -101,6 +103,8 @@ curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials "$API/v2/oa
 | `GET /v2/presets` | 인증만 | 규칙 프리셋 |
 | `GET /v2/circuit` | viewer | 서킷 상태 |
 | `POST /v2/circuit/reset`, `POST /v2/circuit/trip` | admin | 서킷 닫기·열기. `reason` 필수 |
+| `GET /v2/freezes` | viewer | 변경 동결(설정 창 + 선언된 동결) |
+| `POST /v2/freezes`, `DELETE /v2/freezes/{id}` | admin + `config:write` | 동결 선언, 조기 종료 |
 | `GET /v2/audit-events` | viewer@`*` + `audit:read` | 감사 기록, 오래된 순. `since`, `until`, `actor`, `action`, `service` |
 | `POST /v2/oauth/token` | 클라이언트 인증 | OAuth 토큰 발급 |
 | `/v2/api-clients…` | admin + `config:write` | API 클라이언트 관리 |
@@ -215,13 +219,25 @@ def verify(secret: str, headers: dict, body: bytes) -> bool:
 토큰이 없거나, 만료됐거나, 검증에 실패함.
 
 ### forbidden
-역할 또는 범위가 부족함, 또는 4-eyes 규칙 위반. 거부된 요청도 감사 기록에 남습니다.
+역할 또는 범위가 부족함, 4-eyes 규칙 위반, 또는 콘솔 세션 쿠키로 보낸 변경 요청에 `X-CSRF-Token`이 없거나 틀림. 거부된 요청도 감사 기록에 남습니다.
 
 ### not_found
 리소스가 없거나, 명세에 없는 경로.
 
 ### conflict
 현재 상태에서 할 수 없음: 이미 관측·롤백 중, 승인 대기가 아님, 같은 ID의 다른 배포.
+
+### change_frozen
+변경 동결 기간이라 새 배포·단계 시작을 받지 않음. `detail`에 동결 이름, 이유, 끝나는 시각이 있습니다. 긴급하면 admin이 `freeze_override`로 이유를 남기고 진행합니다.
+
+### change_ticket_invalid
+변경 티켓 게이트가 적용되는 서비스인데 티켓이 없거나, 승인되지 않았거나, 허용 상태가 아니거나, 계획된 작업 시간 밖임. `detail`에 이유가 있습니다.
+
+### itsm_unavailable
+ServiceNow에 닿지 않아 티켓을 확인할 수 없고 게이트가 fail-closed로 설정됨. `Retry-After` 후 재시도하십시오.
+
+### circuit_open
+서킷브레이커가 열려 있어 새 단계를 시작하지 않음. 원인을 조사한 뒤 admin이 `POST /v2/circuit/reset`으로 닫습니다.
 
 ### precondition_failed
 `If-Match`의 ETag가 현재 배포와 다름. 다시 조회한 뒤 판단하십시오.

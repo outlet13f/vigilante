@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +18,23 @@ func (c *Config) applyDefaults() {
 	}
 	if c.API.TokenTTL == 0 {
 		c.API.TokenTTL = time.Hour
+	}
+	if sn := c.ITSM.ServiceNow; sn != nil {
+		if len(sn.ChangeGate.AllowedStates) == 0 {
+			sn.ChangeGate.AllowedStates = []string{"-2", "-1"}
+		}
+		if sn.ChangeGate.OnError == "" {
+			sn.ChangeGate.OnError = "closed"
+		}
+		if len(sn.Incidents.On) == 0 {
+			sn.Incidents.On = []string{"rollback_failed", "circuit_opened"}
+		}
+		if sn.Incidents.Urgency == 0 {
+			sn.Incidents.Urgency = 1
+		}
+		if sn.Incidents.Impact == 0 {
+			sn.Incidents.Impact = 2
+		}
 	}
 	if c.Server.Listen == "" {
 		c.Server.Listen = ":8088"
@@ -209,6 +227,12 @@ func (c *Config) applyDefaults() {
 		r := &s.Rollback
 		if r.Scope == "" {
 			r.Scope = "deployed"
+		}
+		if r.Approval.Timeout == 0 {
+			r.Approval.Timeout = 30 * time.Minute
+		}
+		if r.Approval.OnTimeout == "" {
+			r.Approval.OnTimeout = "hold"
 		}
 		if r.Parallelism == 0 {
 			r.Parallelism = 1
@@ -635,6 +659,20 @@ func (c *Config) Validate() error {
 				bad("service %q: rollback.escalation[%d] unknown executor %q", s.Name, i, e.Executor)
 			}
 		}
+		switch rb.Mode {
+		case "", "auto", "approve":
+		default:
+			bad("service %q: rollback.mode must be auto or approve", s.Name)
+		}
+		if rb.Approval.OnTimeout != "hold" && rb.Approval.OnTimeout != "rollback" {
+			bad("service %q: rollback.approval.on_timeout must be hold or rollback", s.Name)
+		}
+		if rb.Approval.DrainFirst && rb.Traffic == "" {
+			bad("service %q: rollback.approval.drain_first needs rollback.traffic", s.Name)
+		}
+		if rb.Approval.Timeout < time.Minute {
+			bad("service %q: rollback.approval.timeout must be at least 1m", s.Name)
+		}
 	}
 
 	switch st := c.Server.State; st.Backend {
@@ -659,6 +697,41 @@ func (c *Config) Validate() error {
 	}
 	c.validateAuth(services, bad)
 	c.validateSecrets(bad)
+	c.validateFreezes(bad)
+	c.validateNotify(bad)
+	if cc := c.Console; cc.RedirectURL != "" && !cc.Disabled {
+		if c.Auth.OIDC == nil {
+			bad("console.redirect_url: needs auth.oidc (the console signs users in with it)")
+		}
+		if u, err := url.Parse(cc.RedirectURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "/console/auth/callback" {
+			bad("console.redirect_url: must be http(s)://<this server>/console/auth/callback")
+		}
+	}
+	if sn := c.ITSM.ServiceNow; sn != nil {
+		if sn.URL == "" || sn.Credential == "" {
+			bad("itsm.servicenow: url and credential required")
+		} else if cr, ok := c.Credentials[sn.Credential]; !ok {
+			bad("itsm.servicenow: unknown credential %q", sn.Credential)
+		} else if cr.Type != "basic" && cr.Type != "token" {
+			bad("itsm.servicenow: credential %q must be of type basic or token", sn.Credential)
+		}
+		if sn.ChangeGate.OnError != "open" && sn.ChangeGate.OnError != "closed" {
+			bad("itsm.servicenow.change_gate.on_error must be open or closed")
+		}
+		for _, s := range sn.ChangeGate.Services {
+			if _, ok := c.Service(s); !ok {
+				bad("itsm.servicenow.change_gate: unknown service %q", s)
+			}
+		}
+		for _, on := range sn.Incidents.On {
+			if on != "rollback_failed" && on != "circuit_opened" {
+				bad("itsm.servicenow.incidents.on: %q (rollback_failed | circuit_opened)", on)
+			}
+		}
+		if u, i := sn.Incidents.Urgency, sn.Incidents.Impact; u < 1 || u > 3 || i < 1 || i > 3 {
+			bad("itsm.servicenow.incidents: urgency and impact must be 1..3")
+		}
+	}
 	if sl := c.Audit.Syslog; sl != nil {
 		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
 			bad("audit.syslog.address must be tcp://host:port or udp://host:port")
@@ -669,14 +742,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
 		bad("agent.failsafe must be hold|rollback")
-	}
-	for i, n := range c.Notify {
-		if n.Type != "webhook" && n.Type != "slack" {
-			bad("notify[%d]: unknown type %q", i, n.Type)
-		}
-		if n.URL == "" && n.URLEnv == "" {
-			bad("notify[%d]: url or url_env required", i)
-		}
 	}
 	return errors.Join(errs...)
 }
@@ -887,6 +952,15 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 	}
 	check("server.state.dsn_ref", c.Server.State.DSNRef)
 	check("api.webhook_signing_key_ref", c.API.WebhookSigningKeyRef)
+	check("console.session_key_ref", c.Console.SessionKeyRef)
+	check("console.client_secret_ref", c.Console.ClientSecretRef)
+	for i, n := range c.Notify {
+		check(fmt.Sprintf("notify[%d].url_ref", i), n.URLRef)
+		check(fmt.Sprintf("notify[%d].routing_key_ref", i), n.RoutingKeyRef)
+		if n.SMTP != nil {
+			check(fmt.Sprintf("notify[%d].smtp.password_ref", i), n.SMTP.PasswordRef)
+		}
+	}
 	for _, s := range c.Services {
 		for _, p := range s.Probes {
 			if p.DB != nil {
@@ -914,6 +988,59 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 			}
 		default:
 			bad("secrets.vault.auth must be token, approle or kubernetes")
+		}
+	}
+}
+
+// Warnings are findings that do not stop the config from loading but that
+// an operator should act on (printed by validate and doctor).
+func (c *Config) Warnings() []string {
+	var out []string
+	for _, s := range c.Services {
+		if s.Rollback.Mode == "" {
+			out = append(out, fmt.Sprintf("service %q: rollback.mode is not set, so a failing phase rolls back automatically (auto). "+
+				"Set mode: approve to have a person approve each rollback (recommended until the service has passed the pilot), or mode: auto to keep the current behaviour explicitly", s.Name))
+		}
+	}
+	if cc := c.Console; !cc.Disabled && cc.RedirectURL != "" {
+		if cc.SessionKeyRef == "" {
+			out = append(out, "console.session_key_ref is not set: console sign-ins end when the server restarts and do not carry over between HA nodes")
+		}
+		if strings.HasPrefix(cc.RedirectURL, "http://") {
+			out = append(out, "console.redirect_url uses http: session cookies are sent without the Secure flag; serve the console over https")
+		}
+	}
+	return out
+}
+
+func (c *Config) validateNotify(bad func(string, ...any)) {
+	for i, n := range c.Notify {
+		w := fmt.Sprintf("notify[%d]", i)
+		switch n.Type {
+		case "webhook", "slack", "teams":
+			if n.URL == "" && n.URLEnv == "" && n.URLRef == "" {
+				bad("%s (%s): url, url_env or url_ref required", w, n.Type)
+			}
+		case "email":
+			if n.SMTP == nil || n.SMTP.Host == "" || n.SMTP.From == "" || len(n.SMTP.To) == 0 {
+				bad("%s (email): smtp.host, smtp.from and smtp.to required", w)
+			}
+		case "pagerduty":
+			if n.RoutingKeyRef == "" && n.RoutingKeyEnv == "" {
+				bad("%s (pagerduty): routing_key_ref or routing_key_env required", w)
+			}
+		default:
+			bad("%s: type must be webhook, slack, teams, email or pagerduty", w)
+		}
+		switch n.MinLevel {
+		case "", "info", "warning", "critical":
+		default:
+			bad("%s: min_level must be info, warning or critical", w)
+		}
+		for _, s := range n.Services {
+			if _, ok := c.Service(s); !ok {
+				bad("%s: unknown service %q", w, s)
+			}
 		}
 	}
 }

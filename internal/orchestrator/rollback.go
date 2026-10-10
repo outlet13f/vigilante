@@ -84,6 +84,10 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 	svc, _ := e.Cfg.Service(d.Service)
 	targets := e.rollbackTargets(d, svc, opt)
 	if !opt.Manual {
+		if f := e.ActiveFreeze(svc.Name, time.Now()); f != nil && !f.AllowRollback {
+			return e.blocked(ctx, d, svc, fmt.Errorf("%w: change freeze %q forbids automatic rollback until %s",
+				ErrFrozen, f.Name, f.Until.Format(time.RFC3339)))
+		}
 		if err := e.Guard.Check(svc.Name); err != nil {
 			return e.blocked(ctx, d, svc, err)
 		}
@@ -175,21 +179,7 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 // (circuit open, flapping): isolate the failing targets from traffic if that
 // is safe, and hand over to a human.
 func (e *Engine) blocked(ctx context.Context, d *model.Deployment, svc *config.Service, cause error) error {
-	isolated := "no traffic controller configured"
-	if tc, err := e.traffic(svc); err != nil {
-		isolated = "traffic controller error: " + err.Error()
-	} else if tc != nil {
-		failed := map[string]bool{}
-		var members []executor.Member
-		for _, b := range d.Breaches {
-			if !failed[b.Target] {
-				failed[b.Target] = true
-				t, _ := e.Cfg.Target(b.Target)
-				members = append(members, executor.Member{Target: b.Target, Data: e.templateData(d, *t)})
-			}
-		}
-		isolated = e.isolate(ctx, tc, members)
-	}
+	_, isolated := e.isolateBreaches(ctx, d, svc)
 	telemetry.Rollbacks.Inc(svc.Name, "blocked")
 	reason := fmt.Sprintf("automatic rollback blocked: %v; isolation: %s", cause, isolated)
 	e.setState(d, model.StateRollbackFailed, reason)
@@ -197,13 +187,35 @@ func (e *Engine) blocked(ctx context.Context, d *model.Deployment, svc *config.S
 	return cause
 }
 
-func (e *Engine) isolate(ctx context.Context, tc executor.TrafficController, members []executor.Member) string {
+// isolateBreaches drains the targets that breached rules, within the blast
+// radius. It returns the drained targets and a summary for the reason text.
+func (e *Engine) isolateBreaches(ctx context.Context, d *model.Deployment, svc *config.Service) ([]string, string) {
+	tc, err := e.traffic(svc)
+	if err != nil {
+		return nil, "traffic controller error: " + err.Error()
+	}
+	if tc == nil {
+		return nil, "no traffic controller configured"
+	}
+	seen := map[string]bool{}
+	var members []executor.Member
+	for _, b := range d.Breaches {
+		if !seen[b.Target] {
+			seen[b.Target] = true
+			t, _ := e.Cfg.Target(b.Target)
+			members = append(members, executor.Member{Target: b.Target, Data: e.templateData(d, *t)})
+		}
+	}
+	return e.isolate(ctx, tc, members)
+}
+
+func (e *Engine) isolate(ctx context.Context, tc executor.TrafficController, members []executor.Member) ([]string, string) {
 	if len(members) == 0 {
-		return "no failing targets identified"
+		return nil, "no failing targets identified"
 	}
 	pool, err := tc.Pool(ctx)
 	if err != nil {
-		return "pool state unavailable, not draining: " + err.Error()
+		return nil, "pool state unavailable, not draining: " + err.Error()
 	}
 	enabled := 0
 	for _, p := range pool {
@@ -213,16 +225,16 @@ func (e *Engine) isolate(ctx context.Context, tc executor.TrafficController, mem
 	}
 	n, why := safety.DrainBatch(len(pool), enabled, len(members), e.Cfg.Safety.BlastRadius)
 	if n == 0 {
-		return why
+		return nil, why
 	}
 	if err := tc.Drain(ctx, members[:n]); err != nil {
-		return "drain failed: " + err.Error()
+		return nil, "drain failed: " + err.Error()
 	}
 	names := make([]string, n)
 	for i := range n {
 		names[i] = members[i].Target
 	}
-	return fmt.Sprintf("drained %v %s", names, why)
+	return names, fmt.Sprintf("drained %v %s", names, why)
 }
 
 type rollbackRun struct {

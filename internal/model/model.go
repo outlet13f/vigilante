@@ -99,12 +99,20 @@ type Deployment struct {
 	Checkpoints     map[string]map[string]string `json:"checkpoints,omitempty"` // target -> executor checkpoint
 	Breaches        []Breach                     `json:"breaches,omitempty"`
 	// Who acted (auth principal IDs such as user:alice or sa:ci-order).
-	CreatedBy           string    `json:"created_by,omitempty"`
-	RollbackRequestedBy string    `json:"rollback_requested_by,omitempty"`
-	ApprovedBy          string    `json:"approved_by,omitempty"`
-	Events              []Event   `json:"events,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	CreatedBy           string `json:"created_by,omitempty"`
+	RollbackRequestedBy string `json:"rollback_requested_by,omitempty"`
+	ApprovedBy          string `json:"approved_by,omitempty"`
+	// PendingRollback is the rollback prepared for a failed phase of a
+	// service in approve mode, waiting for a decision.
+	PendingRollback *PendingRollback `json:"pending_rollback,omitempty"`
+	// FreezeOverride records why this deployment may proceed during a
+	// change freeze, and who allowed it.
+	FreezeOverride string `json:"freeze_override,omitempty"`
+	// ChangeTicket is the ITSM change this deployment runs under.
+	ChangeTicket *ChangeTicket `json:"change_ticket,omitempty"`
+	Events       []Event       `json:"events,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.
@@ -130,4 +138,44 @@ func ExitCode(d *Deployment) int {
 		return 4
 	}
 	return 1
+}
+
+// PendingRollback is a rollback waiting for human approval.
+type PendingRollback struct {
+	Reason      string    `json:"reason"`
+	Targets     []string  `json:"targets"`
+	Drained     []string  `json:"drained,omitempty"` // isolated while waiting (drain_first)
+	RequestedAt time.Time `json:"requested_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	DetectedAt  time.Time `json:"detected_at"`
+	// Escalated is set once the timeout alert went out (on_timeout: hold).
+	Escalated bool `json:"escalated,omitempty"`
+}
+
+// Freeze is a change freeze declared at runtime through the API (incident
+// freezes, ad-hoc holidays); config windows live in the config.
+type Freeze struct {
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Reason        string     `json:"reason,omitempty"`
+	StartsAt      time.Time  `json:"starts_at"`
+	EndsAt        time.Time  `json:"ends_at"`
+	Services      []string   `json:"services"`
+	Teams         []string   `json:"teams"`
+	AllowRollback bool       `json:"allow_rollback"`
+	CreatedBy     string     `json:"created_by,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	EndedBy       string     `json:"ended_by,omitempty"`
+	EndedAt       *time.Time `json:"ended_at,omitempty"` // ended early
+}
+
+// ChangeTicket is a verified ITSM change request.
+type ChangeTicket struct {
+	Number    string    `json:"number"`
+	SysID     string    `json:"sys_id,omitempty"`
+	State     string    `json:"state,omitempty"`
+	Approval  string    `json:"approval,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	// Unverified: ServiceNow was unreachable and the gate fails open.
+	Unverified bool `json:"unverified,omitempty"`
 }

@@ -56,6 +56,7 @@ vigilante watch    -c vigilante.yaml --service order-api --phase canary --baseli
 vigilante token create --name ci-order --role deployer --scope service=order-api --expires 2027-06-30
 VIGILANTE_TOKEN=vgl_... vigilante whoami --server https://vigilante:8088
 vigilante server -c vigilante.yaml                                      # REST + 웹훅 + 크래시 재개 (auth·HA 설정 시 적용)
+# 웹 콘솔: https://vigilante:8088/console/ (SSO는 docs/02 console, 없으면 API 토큰으로 로그인)
 vigilante watch --server https://vigilante:8088 --service ... --phase canary
 vigilante agent -c vigilante.yaml --target order-bm-01 --server https://vigilante:8088
 vigilante circuit -c vigilante.yaml status|reset|trip [--ticket CHG-123]

@@ -21,6 +21,7 @@ import (
 	"vigilante/internal/config"
 	"vigilante/internal/decision"
 	"vigilante/internal/executor"
+	"vigilante/internal/itsm"
 	"vigilante/internal/journal"
 	"vigilante/internal/metrics"
 	"vigilante/internal/model"
@@ -54,6 +55,7 @@ type Engine struct {
 	Breaker *safety.Breaker
 	Guard   *safety.Guard
 	Notify  *notify.Notifier
+	ITSM    *itsm.ServiceNow // nil without itsm.servicenow
 	Log     *slog.Logger
 	DryRun  bool
 
@@ -85,6 +87,7 @@ type Engine struct {
 	operations  map[string]*model.Operation
 	liveOps     map[string]bool // operations this node is running
 	idem        map[string]*model.IdemRecord
+	freezes     map[string]*model.Freeze
 	clients     map[string]*model.APIClient
 	clientMu    sync.Mutex // orders client snapshots
 	tokens      map[string]*model.AccessToken
@@ -112,7 +115,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		Cfg:       cfg,
 		Store:     metrics.NewStore(30 * time.Minute),
 		Journal:   st,
-		Notify:    notify.New(cfg.Notify, log),
+		Notify:    newNotifier(cfg, log),
 		Log:       log,
 		DryRun:    opt.DryRun || cfg.Server.DryRun,
 		transport: transport.NewManager(cfg),
@@ -121,6 +124,9 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		baselines: map[string]*rules.Snapshot{},
 		cancels:   map[string]context.CancelFunc{},
 		lastEval:  map[string]decision.Evaluation{},
+	}
+	if sn := cfg.ITSM.ServiceNow; sn != nil {
+		e.ITSM = itsm.NewServiceNow(*sn, cfg.Credentials)
 	}
 	if e.owner == "" {
 		host, _ := os.Hostname()
@@ -162,6 +168,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
 	e.operations, e.idem = st.Operations, st.Idempotency
 	e.clients, e.tokens = st.Clients, st.Tokens
+	e.freezes = st.Freezes
 	e.Breaker, e.Guard = breaker, guard
 	e.mu.Unlock()
 	e.hookMu.Lock()
@@ -587,8 +594,8 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	if len(svc.PhaseTargets(string(phase))) == 0 {
 		return fmt.Errorf("service %s phase %s resolves to no targets", svc.Name, phase)
 	}
-	if st := e.Breaker.State(); st.State == safety.Open {
-		return fmt.Errorf("%w: %w (%s); reset with `vigilante circuit reset` after investigation", ErrBlocked, safety.ErrCircuitOpen, st.Reason)
+	if err := e.Gate(d); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()
@@ -657,6 +664,10 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 		e.Notify.Send(ctx, notify.Message{Level: notify.Warning, Title: fmt.Sprintf("%s %s HELD — human decision needed", d.Service, phase), Text: out.Reason, Deployment: d})
 	case model.VerdictFail:
 		e.event(d, "verdict", "FAIL: "+out.Reason)
+		if svc.Rollback.RollbackMode() == "approve" {
+			e.requestApproval(context.WithoutCancel(ctx), d, svc, out.Reason, out.EndedAt)
+			return nil
+		}
 		e.Rollback(context.WithoutCancel(ctx), d, RollbackOptions{Reason: out.Reason, DetectedAt: out.EndedAt})
 	}
 	return nil
@@ -708,4 +719,15 @@ func (e *Engine) LoadBaselineFile(path string) error {
 func Hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+func newNotifier(cfg *config.Config, log *slog.Logger) *notify.Notifier {
+	n := notify.New(cfg.Notify, log)
+	n.TeamOf = func(service string) string {
+		if sv, ok := cfg.Service(service); ok {
+			return sv.Team
+		}
+		return ""
+	}
+	return n
 }

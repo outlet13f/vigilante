@@ -56,7 +56,7 @@ tags:
   - name: services
     description: Services, their targets and presets (read from configuration).
   - name: safety
-    description: The global circuit breaker (emergency stop).
+    description: The global circuit breaker (emergency stop) and change freezes.
   - name: events
     description: Event catalog, live stream (SSE) and webhook subscriptions.
   - name: audit
@@ -117,6 +117,12 @@ paths:
         Registers a release before (or right after) it is rolled out. When
         `previous_version` is omitted the service's last good version is used;
         without one the request is rejected, because a rollback target is required.
+        During a change freeze new deployments get `409` with code
+        `change_frozen`, unless an admin sends `freeze_override`. Where a
+        ServiceNow change gate applies, `change_ticket` must name an approved
+        change in an allowed state and inside its planned window
+        (`409 change_ticket_invalid`); if ServiceNow cannot be reached and the
+        gate fails closed, the answer is `503 itsm_unavailable`.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
       requestBody:
@@ -147,6 +153,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/ITSMUnavailable'}
 
   /v2/deployments/{id}:
     parameters:
@@ -181,8 +188,12 @@ paths:
       security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Observe a phase
       description: |
-        Starts watching one phase. A failing phase is rolled back automatically;
-        the operation result carries the final state and the CI exit code.
+        Starts watching one phase. A failing phase is rolled back automatically
+        (or, with `rollback.mode: approve`, waits for a decision); the operation
+        result carries the final state and the CI exit code. While the circuit
+        breaker is open (`circuit_open`) or a change freeze applies
+        (`change_frozen`, unless the deployment was created with an override)
+        the request gets `409`.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
         - {$ref: '#/components/parameters/IfMatch'}
@@ -201,6 +212,7 @@ paths:
         '409': {$ref: '#/components/responses/Conflict'}
         '412': {$ref: '#/components/responses/PreconditionFailed'}
         '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/ITSMUnavailable'}
 
   /v2/deployments/{id}/rollbacks:
     parameters:
@@ -239,11 +251,20 @@ paths:
       tags: [deployments]
       operationId: approveEscalation
       security: [{bearerAuth: []}, {oauth2: [approvals:write]}]
-      summary: Approve a gated escalation
+      summary: Approve or reject a waiting rollback
       description: |
-        Allowed only while the deployment is `AWAITING_APPROVAL`. With four-eyes
-        enabled the approver must differ from whoever created the deployment or
-        requested its rollback.
+        Allowed only while the deployment is `AWAITING_APPROVAL`, which happens
+        in two cases:
+
+        * a phase failed for a service with `rollback.mode: approve`; the
+          prepared rollback (`pending_rollback`) runs when approved, and a
+          rejection keeps the new version, puts drained targets back into
+          traffic and holds the deployment;
+        * an escalation step marked `require_approval` (such as a VM snapshot
+          restore) is next; it can only be approved.
+
+        With four-eyes enabled the decider must differ from whoever created the
+        deployment or requested its rollback.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
         - {$ref: '#/components/parameters/IfMatch'}
@@ -273,6 +294,10 @@ paths:
       description: Cancels a running observation. A rollback already running is not interrupted.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AbortRequest'}
       responses:
         '200':
           description: The deployment after the abort request.
@@ -574,6 +599,81 @@ paths:
         '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /v2/freezes:
+    get:
+      tags: [safety]
+      operationId: listFreezes
+      summary: List change freezes
+      description: Config windows (`config:<name>`, weekly or absolute) and freezes declared through the API that have not ended.
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
+      responses:
+        '200':
+          description: Freeze windows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/FreezeWindow'}}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [safety]
+      operationId: createFreeze
+      summary: Declare a change freeze
+      description: |
+        Admin only. New deployments and phase starts of the covered services
+        are refused until `ends_at`. Automatic rollback stays allowed unless
+        `allow_rollback` is false; manual rollback always is.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FreezeCreate'}
+      responses:
+        '201':
+          description: Declared.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Freeze'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/freezes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      tags: [safety]
+      operationId: endFreeze
+      summary: End a declared freeze early
+      description: Admin only. Config windows end by changing the config.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '200':
+          description: Ended.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Freeze'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/audit-events:
     get:
@@ -1319,6 +1419,14 @@ components:
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
+    ITSMUnavailable:
+      description: The change ticket could not be verified because the ITSM system is unreachable, and the change gate fails closed.
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
     RateLimited:
       description: |
         Too many requests from this caller. Rollbacks, approvals, abort and the
@@ -1352,10 +1460,13 @@ components:
         detail: {type: string}
         code:
           type: string
-          description: Stable machine-readable error code.
-          enum: [bad_request, validation_failed, unauthenticated, forbidden, not_found, conflict,
+          description: |
+            Stable machine-readable error code. The set grows over time: treat
+            an unknown code like the generic error for its HTTP status.
+          x-extensible-enum: [bad_request, validation_failed, unauthenticated, forbidden, not_found, conflict,
                  precondition_failed, idempotency_key_reused, idempotency_key_in_flight,
-                 not_leader, rate_limited, internal]
+                 not_leader, rate_limited, internal, change_frozen, circuit_open,
+                 change_ticket_invalid, itsm_unavailable]
         request_id: {type: string}
         errors:
           type: array
@@ -1371,7 +1482,7 @@ components:
       required: [id, kind, grants]
       properties:
         id: {type: string, examples: ['user:alice', 'sa:ci-order', 'client:deploy-console']}
-        kind: {type: string, enum: [user, service, client, legacy, webhook, anonymous]}
+        kind: {type: string, x-extensible-enum: [user, service, client, legacy, webhook, anonymous]}
         scopes: {type: [array, 'null'], items: {type: string}, description: 'OAuth scopes of an API client; null = not scope-limited.'}
         groups: {type: [array, 'null'], items: {type: string}}
         grants:
@@ -1382,6 +1493,15 @@ components:
       type: string
       enum: [PENDING, BASELINE, OBSERVING, PROMOTED, SUCCEEDED, HELD, ROLLING_BACK, ROLLED_BACK,
              ROLLBACK_FAILED, AWAITING_APPROVAL, ABORTED]
+    DeploymentStateValue:
+      type: string
+      description: A deployment state in a response. New states may be added; treat an unknown one as "in progress".
+      x-extensible-enum: [PENDING, BASELINE, OBSERVING, PROMOTED, SUCCEEDED, HELD, ROLLING_BACK, ROLLED_BACK,
+                          ROLLBACK_FAILED, AWAITING_APPROVAL, ABORTED]
+    ScopeValue:
+      type: string
+      description: A scope in a response. New scopes may be added.
+      x-extensible-enum: [deployments:read, deployments:write, rollbacks:execute, approvals:write, circuit:admin, audit:read, metrics:write, config:write]
     Verdict:
       type: string
       enum: [PENDING, PASS, FAIL, HOLD, INCONCLUSIVE]
@@ -1399,6 +1519,14 @@ components:
         version: {type: string}
         previous_version: {type: string, description: 'Rollback target. Defaults to the last good version.'}
         prepare: {type: boolean, default: false, description: 'Record executor checkpoints (current release, image, snapshot) now.'}
+        freeze_override:
+          type: string
+          maxLength: 1000
+          description: Admins only. The reason this deployment may proceed during a change freeze; recorded in the audit trail.
+        change_ticket:
+          type: string
+          maxLength: 64
+          description: 'ITSM change number (e.g. CHG0012345), required where a change gate applies. The X-Change-Ticket header works too.' 
 
     Deployment:
       type: object
@@ -1409,7 +1537,7 @@ components:
         version: {type: string}
         previous_version: {type: string}
         phase: {type: string}
-        state: {$ref: '#/components/schemas/DeploymentState'}
+        state: {$ref: '#/components/schemas/DeploymentStateValue'}
         verdict: {$ref: '#/components/schemas/Verdict'}
         reason: {type: string}
         exit_code:
@@ -1422,6 +1550,30 @@ components:
         created_by: {type: string}
         rollback_requested_by: {type: string}
         approved_by: {type: string}
+        freeze_override: {type: string, description: 'Why, and by whom, this deployment may proceed during a change freeze.'}
+        change_ticket:
+          type: object
+          description: The ITSM change this deployment runs under.
+          required: [number, checked_at]
+          properties:
+            number: {type: string}
+            sys_id: {type: string}
+            state: {type: string}
+            approval: {type: string}
+            checked_at: {type: string, format: date-time}
+            unverified: {type: boolean, description: 'ITSM was unreachable and the gate fails open.'}
+        pending_rollback:
+          type: object
+          description: The rollback prepared for a failed phase, waiting for a decision (approve mode).
+          required: [reason, targets, requested_at, expires_at]
+          properties:
+            reason: {type: string}
+            targets: {type: array, items: {type: string}}
+            drained: {type: array, items: {type: string}, description: 'Taken out of traffic while waiting (drain_first).'}
+            requested_at: {type: string, format: date-time}
+            expires_at: {type: string, format: date-time}
+            detected_at: {type: string, format: date-time}
+            escalated: {type: boolean, description: 'The timeout passed and operators were alerted again.'}
         last_evaluation: {$ref: '#/components/schemas/Evaluation'}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
@@ -1471,10 +1623,20 @@ components:
         reason: {type: string, maxLength: 1000}
         executor: {type: string, description: 'Override the primary executor.'}
         targets: {type: array, items: {type: string}, description: 'Override the target set.'}
+    AbortRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: {type: string, maxLength: 1000, description: 'Recorded in the audit trail.'}
     ApprovalRequest:
       type: object
       additionalProperties: false
       properties:
+        decision:
+          type: string
+          enum: [approve, reject]
+          default: approve
+          description: '`reject` applies only to a prepared rollback (approve mode).'
         comment: {type: string, maxLength: 1000}
 
     OperationStatus:
@@ -1485,7 +1647,7 @@ components:
       required: [id, kind, status, service, created_at]
       properties:
         id: {type: string}
-        kind: {type: string, enum: [observation, rollback, approval, baseline]}
+        kind: {type: string, x-extensible-enum: [observation, rollback, approval, baseline], description: 'New kinds may be added.'}
         status: {$ref: '#/components/schemas/OperationStatus'}
         service: {type: string}
         deployment_id: {type: string}
@@ -1497,7 +1659,7 @@ components:
           type: object
           description: Where the deployment stood when the operation ended.
           properties:
-            state: {$ref: '#/components/schemas/DeploymentState'}
+            state: {$ref: '#/components/schemas/DeploymentStateValue'}
             verdict: {$ref: '#/components/schemas/Verdict'}
             exit_code: {type: integer}
             reason: {type: string}
@@ -1609,6 +1771,52 @@ components:
       properties:
         reason: {type: string, minLength: 1, maxLength: 1000}
 
+    FreezeCreate:
+      type: object
+      required: [name, ends_at]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1}
+        reason: {type: string}
+        starts_at: {type: string, format: date-time, description: 'Default: now.'}
+        ends_at: {type: string, format: date-time}
+        services: {type: array, items: {type: string}, description: 'Empty with no teams = every service.'}
+        teams: {type: array, items: {type: string}}
+        allow_rollback: {type: boolean, default: true}
+    Freeze:
+      type: object
+      required: [id, name, starts_at, ends_at, services, teams, allow_rollback, created_at]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        reason: {type: string}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time}
+        services: {type: array, items: {type: string}}
+        teams: {type: array, items: {type: string}}
+        allow_rollback: {type: boolean}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        ended_by: {type: string}
+        ended_at: {type: string, format: date-time}
+    FreezeWindow:
+      type: object
+      required: [id, name, source, active, allow_rollback, services, teams]
+      properties:
+        id: {type: string, description: '"config:<name>" for config windows, else the API freeze ID.'}
+        name: {type: string}
+        reason: {type: string}
+        source: {type: string, enum: [config, api]}
+        active: {type: boolean}
+        until: {type: string, format: date-time, description: 'End of the current occurrence, when active.'}
+        allow_rollback: {type: boolean}
+        starts_at: {type: string, format: date-time}
+        ends_at: {type: string, format: date-time}
+        weekly: {type: string, examples: ['fri 18:00 - mon 09:00 Asia/Seoul']}
+        services: {type: array, items: {type: string}}
+        teams: {type: array, items: {type: string}}
+        created_by: {type: string}
+
     AuditEvent:
       type: object
       required: [seq, time, kind]
@@ -1666,7 +1874,7 @@ components:
         name: {type: string}
         type: {type: string, enum: [oauth, api_key]}
         description: {type: string}
-        scopes: {type: array, items: {$ref: '#/components/schemas/Scope'}}
+        scopes: {type: array, items: {$ref: '#/components/schemas/ScopeValue'}}
         grants: {type: array, items: {type: string, examples: ['deployer@team=payments']}}
         secret_hint: {type: string, description: 'First characters of the secret.'}
         rate_limit: {$ref: '#/components/schemas/RateLimit'}
@@ -1721,6 +1929,7 @@ components:
         source: {type: string}
         type:
           type: string
+          description: See GET /v2/event-types. New types are added over time; ignore unknown ones.
           enum: [vigilante.deployment.created, vigilante.deployment.marked_good, vigilante.observation.started,
                  vigilante.observation.passed, vigilante.observation.failed, vigilante.observation.held,
                  vigilante.observation.aborted, vigilante.rollback.started, vigilante.rollback.completed,

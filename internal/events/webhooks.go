@@ -280,7 +280,11 @@ func (b *Bus) syncWorkersLocked() {
 		if _, ok := b.workers[id]; !ok {
 			ctx, cancel := context.WithCancel(b.ctx)
 			b.workers[id] = cancel
-			go b.work(ctx, id)
+			b.workersWG.Add(1)
+			go func() {
+				defer b.workersWG.Done()
+				b.work(ctx, id)
+			}()
 		}
 	}
 }

@@ -37,6 +37,7 @@ const (
 	KindEvent         = "event"           // CloudEvent published to subscribers
 	KindWebhook       = "webhook"         // webhook subscription snapshot
 	KindWebhookCursor = "webhook.cursor"  // Message = webhook ID; Seq = last event handled
+	KindFreeze        = "freeze"          // change freeze declared or ended through the API
 )
 
 // MaxEvents is how many recent events replay keeps for SSE resume and
@@ -48,7 +49,7 @@ const MaxEvents = 10000
 func Bookkeeping(kind string) bool {
 	switch kind {
 	case KindDeployment, KindStepDone, KindOperation, KindIdempotency, KindAPIClient, KindAccessToken, KindClientUsed,
-		KindEvent, KindWebhook, KindWebhookCursor:
+		KindEvent, KindWebhook, KindWebhookCursor, KindFreeze:
 		return true
 	}
 	return false
@@ -67,6 +68,7 @@ type Entry struct {
 	Event      *model.CloudEvent    `json:"event,omitempty"`
 	Webhook    *model.Webhook       `json:"webhook,omitempty"`
 	Seq        int64                `json:"seq,omitempty"`
+	Freeze     *model.Freeze        `json:"freeze,omitempty"`
 	DeployID   string               `json:"deployment_id,omitempty"`
 	Target     string               `json:"target,omitempty"`
 	Step       int                  `json:"step,omitempty"`
@@ -216,6 +218,7 @@ type State struct {
 	Tokens      map[string]*model.AccessToken // by SHA256
 	Events      []*model.CloudEvent           // the most recent MaxEvents, oldest first
 	Webhooks    map[string]*model.Webhook
+	Freezes     map[string]*model.Freeze
 	Corrupt     int // unparsable lines skipped (e.g. torn final write)
 }
 
@@ -323,6 +326,16 @@ func Compact(pruned []Entry, cutoff time.Time) []Entry {
 	for _, ev := range evs {
 		out = append(out, Entry{Kind: KindEvent, Time: ev.Time, Event: ev})
 	}
+	freezeIDs := make([]string, 0, len(st.Freezes))
+	for id := range st.Freezes {
+		freezeIDs = append(freezeIDs, id)
+	}
+	sort.Strings(freezeIDs)
+	for _, id := range freezeIDs {
+		if f := st.Freezes[id]; f.EndedAt == nil && f.EndsAt.After(cutoff) {
+			out = append(out, Entry{Kind: KindFreeze, Time: f.CreatedAt, Freeze: f})
+		}
+	}
 	keys := make([]string, 0, len(st.Idempotency))
 	for k := range st.Idempotency {
 		keys = append(keys, k)
@@ -347,6 +360,7 @@ func NewState() *State {
 		Clients:     map[string]*model.APIClient{},
 		Tokens:      map[string]*model.AccessToken{},
 		Webhooks:    map[string]*model.Webhook{},
+		Freezes:     map[string]*model.Freeze{},
 	}
 }
 
@@ -390,6 +404,10 @@ func (st *State) Apply(e Entry) {
 			delete(st.Webhooks, e.Webhook.ID)
 		default:
 			st.Webhooks[e.Webhook.ID] = e.Webhook
+		}
+	case KindFreeze:
+		if e.Freeze != nil {
+			st.Freezes[e.Freeze.ID] = e.Freeze
 		}
 	case KindWebhookCursor:
 		if w := st.Webhooks[e.Message]; w != nil && e.Seq > w.Cursor {

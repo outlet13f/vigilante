@@ -20,6 +20,8 @@ import (
 
 	"vigilante/internal/auth"
 	"vigilante/internal/config"
+	"vigilante/internal/itsm"
+	"vigilante/internal/itsm/snowtest"
 	"vigilante/internal/orchestrator"
 )
 
@@ -416,5 +418,197 @@ func TestV2RoutesMatchSpec(t *testing.T) {
 	}
 	if len(inSpec) < 20 {
 		t.Fatalf("only %d v2 operations found in the spec", len(inSpec))
+	}
+}
+
+func TestV2ApproveModeDecisions(t *testing.T) {
+	s, base := newV2Server(t, "")
+	sv, _ := s.E.Cfg.Service("svc")
+	sv.Rollback.Mode = "approve"
+	c := &v2Client{t: t, base: base, token: "tok"}
+	c.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+
+	fail := func(id string) {
+		t.Helper()
+		c.do("POST", "/v2/deployments", `{"id":"`+id+`","service":"svc","version":"v2"}`, nil)
+		r := c.do("POST", "/v2/deployments/"+id+"/observations", `{"phase":"canary"}`, nil)
+		done := waitOp(t, c, r.JSON["id"].(string))
+		if res := done.JSON["result"].(map[string]any); res["state"] != "AWAITING_APPROVAL" || res["exit_code"].(float64) != 3 {
+			t.Fatalf("approve mode must wait: %s", done.Body)
+		}
+	}
+
+	fail("am1")
+	d := c.do("GET", "/v2/deployments/am1", "", nil)
+	pr, ok := d.JSON["pending_rollback"].(map[string]any)
+	if !ok || pr["targets"].([]any)[0] != "a" || pr["expires_at"] == nil {
+		t.Fatalf("pending rollback: %s", d.Body)
+	}
+	wantProblem(t, c.do("POST", "/v2/deployments/am1/approvals", `{"decision":"maybe"}`, nil), 422, "validation_failed")
+	r := c.do("POST", "/v2/deployments/am1/approvals", `{"decision":"reject","comment":"false positive"}`, nil)
+	if r.StatusCode != 202 || r.JSON["kind"] != "approval" {
+		t.Fatalf("reject: %d %s", r.StatusCode, r.Body)
+	}
+	if done := waitOp(t, c, r.JSON["id"].(string)); done.JSON["result"].(map[string]any)["state"] != "HELD" {
+		t.Fatalf("after reject: %s", done.Body)
+	}
+	if d := c.do("GET", "/v2/deployments/am1", "", nil); d.JSON["pending_rollback"] != nil || !strings.Contains(d.JSON["reason"].(string), "false positive") {
+		t.Fatalf("held deployment: %s", d.Body)
+	}
+	wantProblem(t, c.do("POST", "/v2/deployments/am1/approvals", `{}`, nil), 409, "conflict")
+
+	fail("am2")
+	r = c.do("POST", "/v2/deployments/am2/approvals", `{"comment":"go"}`, nil)
+	if done := waitOp(t, c, r.JSON["id"].(string)); done.JSON["result"].(map[string]any)["state"] != "ROLLED_BACK" {
+		t.Fatalf("after approve: %s", done.Body)
+	}
+	if d := c.do("GET", "/v2/deployments/am2", "", nil); d.JSON["approved_by"] != "token:legacy" {
+		t.Fatalf("approver not recorded: %s", d.Body)
+	}
+	r = c.do("GET", "/v2/audit-events?action=rollback.reject", "", nil)
+	if items := r.JSON["items"].([]any); len(items) != 1 || items[0].(map[string]any)["reason"] != "false positive" {
+		t.Fatalf("audit: %s", r.Body)
+	}
+}
+
+func TestV2ChangeFreeze(t *testing.T) {
+	depTok, dep := sa(t, "ci", "deployer", "*")
+	_, base := newV2Server(t, "auth:\n  service_accounts:\n"+dep)
+	admin := &v2Client{t: t, base: base, token: "tok"}
+	ci := &v2Client{t: t, base: base, token: depTok}
+	admin.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+	admin.do("POST", "/v2/deployments", `{"id":"before","service":"svc","version":"v2"}`, nil)
+
+	wantProblem(t, ci.do("POST", "/v2/freezes", `{"name":"x","ends_at":"2099-01-01T00:00:00Z"}`, nil), 403, "forbidden")
+	wantProblem(t, admin.do("POST", "/v2/freezes", `{"name":"x","ends_at":"2001-01-01T00:00:00Z"}`, nil), 422, "validation_failed")
+	r := admin.do("POST", "/v2/freezes", `{"name":"incident-7","reason":"payment outage","ends_at":"`+time.Now().Add(time.Hour).UTC().Format(time.RFC3339)+`","teams":["payments"]}`, nil)
+	if r.StatusCode != 201 || r.JSON["allow_rollback"] != true {
+		t.Fatalf("declare: %d %s", r.StatusCode, r.Body)
+	}
+	id := r.JSON["id"].(string)
+	if l := ci.do("GET", "/v2/freezes", "", nil); len(l.JSON["items"].([]any)) != 1 || l.JSON["items"].([]any)[0].(map[string]any)["active"] != true {
+		t.Fatalf("list: %s", l.Body)
+	}
+
+	// New deployments of the team's service are refused; others are not.
+	r = ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v3"}`, nil)
+	wantProblem(t, r, 409, "change_frozen")
+	if !strings.Contains(r.JSON["detail"].(string), "payment outage") {
+		t.Fatalf("detail: %s", r.Body)
+	}
+	admin.do("PUT", "/v2/services/zeta/last-good", `{"version":"z1"}`, nil)
+	if r := ci.do("POST", "/v2/deployments", `{"service":"zeta","version":"z2"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("another team's service is not frozen: %d %s", r.StatusCode, r.Body)
+	}
+	// A deployment registered before the freeze cannot start a phase either.
+	wantProblem(t, ci.do("POST", "/v2/deployments/before/observations", `{"phase":"canary"}`, nil), 409, "change_frozen")
+	// Only admins may override.
+	wantProblem(t, ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","freeze_override":"hotfix"}`, nil), 403, "forbidden")
+	r = admin.do("POST", "/v2/deployments", `{"id":"hotfix-1","service":"svc","version":"v3","freeze_override":"fix for incident-7"}`, nil)
+	if r.StatusCode != 201 || !strings.Contains(r.JSON["freeze_override"].(string), "fix for incident-7") {
+		t.Fatalf("override: %d %s", r.StatusCode, r.Body)
+	}
+	if r := admin.do("POST", "/v2/deployments/hotfix-1/observations", `{"phase":"canary"}`, nil); r.StatusCode != 202 {
+		t.Fatalf("overridden deployment may observe: %d %s", r.StatusCode, r.Body)
+	} else {
+		waitOp(t, admin, r.JSON["id"].(string))
+	}
+	if a := admin.do("GET", "/v2/audit-events?action=freeze.override", "", nil); len(a.JSON["items"].([]any)) != 1 {
+		t.Fatalf("override not audited: %s", a.Body)
+	}
+
+	if r := admin.do("DELETE", "/v2/freezes/"+id, "", nil); r.StatusCode != 200 || r.JSON["ended_at"] == nil {
+		t.Fatalf("end: %d %s", r.StatusCode, r.Body)
+	}
+	if r := ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v4"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("after the freeze: %d %s", r.StatusCode, r.Body)
+	}
+	wantProblem(t, admin.do("DELETE", "/v2/freezes/nope", "", nil), 404, "not_found")
+}
+
+func TestV2ServiceNowGateIncidentsAndNotes(t *testing.T) {
+	snow := snowtest.New(t)
+	now := time.Now().UTC()
+	snow.AddChange("CHG100", "sys100", "-1", "approved", now.Add(-time.Hour).Format("2006-01-02 15:04:05"), now.Add(time.Hour).Format("2006-01-02 15:04:05"))
+	snow.AddChange("CHG200", "sys200", "-3", "requested", now.Add(-time.Hour).Format("2006-01-02 15:04:05"), now.Add(time.Hour).Format("2006-01-02 15:04:05"))
+	t.Setenv("VGL_SNOW_PW", "snow-pass")
+	s, base := newV2Server(t, `credentials: {snow: {type: basic, user: vigilante, password_ref: "env:VGL_SNOW_PW"}}
+itsm:
+  servicenow:
+    url: `+snow.Srv.URL+`
+    credential: snow
+    change_gate: {enabled: true, services: [svc]}
+    incidents: {enabled: true, assignment_group: SRE}
+`)
+	c := &v2Client{t: t, base: base, token: "tok"}
+	c.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+
+	r := c.do("POST", "/v2/deployments", `{"service":"svc","version":"v2"}`, nil)
+	wantProblem(t, r, 409, "change_ticket_invalid")
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v2","change_ticket":"CHG200"}`, nil)
+	wantProblem(t, r, 409, "change_ticket_invalid")
+	if !strings.Contains(r.JSON["detail"].(string), "not approved") {
+		t.Fatalf("detail: %s", r.Body)
+	}
+	// Services outside the gate need no ticket.
+	c.do("PUT", "/v2/services/zeta/last-good", `{"version":"z1"}`, nil)
+	if r := c.do("POST", "/v2/deployments", `{"service":"zeta","version":"z2"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("ungated service: %d %s", r.StatusCode, r.Body)
+	}
+
+	r = c.do("POST", "/v2/deployments", `{"id":"chg-1","service":"svc","version":"v2"}`, map[string]string{"X-Change-Ticket": "CHG100"})
+	if r.StatusCode != 201 || r.JSON["change_ticket"].(map[string]any)["sys_id"] != "sys100" {
+		t.Fatalf("valid ticket: %d %s", r.StatusCode, r.Body)
+	}
+	// The canary fails and is rolled back; the ticket gets the story.
+	op := c.do("POST", "/v2/deployments/chg-1/observations", `{"phase":"canary"}`, nil)
+	waitOp(t, c, op.JSON["id"].(string))
+	deadline := time.Now().Add(10 * time.Second)
+	var notes []string
+	for time.Now().Before(deadline) {
+		_, wn := snow.Snapshot()
+		if notes = wn["sys100"]; len(notes) >= 4 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	joined := strings.Join(notes, "\n")
+	for _, want := range []string{"observation started", "phase FAILED", "rollback started", "rollback completed"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("work notes lack %q:\n%s", want, joined)
+		}
+	}
+
+	// ServiceNow down: fail closed by default (503 + Retry-After).
+	snow.SetDown(true)
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","change_ticket":"CHG100"}`, nil)
+	wantProblem(t, r, 503, "itsm_unavailable")
+	if r.Header.Get("Retry-After") == "" {
+		t.Fatal("Retry-After missing")
+	}
+	// fail open: proceeds, marked unverified
+	s.E.ITSM = itsm.NewServiceNow(func() config.ServiceNow {
+		sn := *s.E.Cfg.ITSM.ServiceNow
+		sn.ChangeGate.OnError = "open"
+		return sn
+	}(), s.E.Cfg.Credentials)
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","change_ticket":"CHG100"}`, nil)
+	if r.StatusCode != 201 || r.JSON["change_ticket"].(map[string]any)["unverified"] != true {
+		t.Fatalf("fail open: %d %s", r.StatusCode, r.Body)
+	}
+	snow.SetDown(false)
+
+	// An open circuit raises one incident.
+	c.do("POST", "/v2/circuit/trip", `{"reason":"two failed rollbacks"}`, nil)
+	deadline = time.Now().Add(10 * time.Second)
+	var inc []map[string]any
+	for time.Now().Before(deadline) {
+		if inc, _ = snow.Snapshot(); len(inc) == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(inc) != 1 || !strings.Contains(inc[0]["short_description"].(string), "circuit breaker OPEN") || inc[0]["assignment_group"] != "SRE" {
+		t.Fatalf("incident: %v", inc)
 	}
 }

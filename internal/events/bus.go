@@ -64,7 +64,12 @@ type Bus struct {
 	history   map[string][]Delivery
 	ctx       context.Context
 	cancelAll context.CancelFunc
+	workersWG sync.WaitGroup
 }
+
+// Wait blocks until every delivery worker has stopped (after the context
+// given to Start is cancelled).
+func (b *Bus) Wait() { b.workersWG.Wait() }
 
 // Delivery is one webhook attempt, kept in memory for the deliveries API.
 type Delivery struct {
@@ -186,9 +191,15 @@ func (b *Bus) Observe(en journal.Entry) {
 			b.publishLocked(typ, "circuit", "", map[string]any{"state": c.State, "reason": c.Reason})
 		}
 	case journal.KindAudit:
-		if en.Action == "escalation.approve" {
+		decision := map[string]string{"escalation.approve": "approved", "rollback.approve": "approved", "rollback.reject": "rejected"}[en.Action]
+		if decision != "" {
+			kind := "rollback"
+			if en.Action == "escalation.approve" {
+				kind = "escalation"
+			}
 			b.publishLocked(model.EvApprovalDecided, en.DeployID, en.Service,
-				map[string]any{"deployment_id": en.DeployID, "service": en.Service, "approved_by": en.Actor, "comment": en.Reason})
+				map[string]any{"deployment_id": en.DeployID, "service": en.Service, "kind": kind, "decision": decision,
+					"decided_by": en.Actor, "comment": en.Reason})
 		}
 	}
 }

@@ -43,6 +43,7 @@ import (
 
 	"vigilante/internal/audit"
 	"vigilante/internal/auth"
+	"vigilante/internal/console"
 	"vigilante/internal/events"
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
@@ -67,6 +68,7 @@ type Server struct {
 	inflight map[string]bool // idempotency keys being processed
 	limits   *limiter
 	bus      *events.Bus
+	console  *console.Console
 
 	cancel context.CancelFunc
 	bg     sync.WaitGroup // observations, rollbacks and operations started by requests
@@ -89,6 +91,7 @@ func (s *Server) Close() {
 	done := make(chan struct{})
 	go func() {
 		s.bg.Wait()
+		s.bus.Wait()
 		close(done)
 	}()
 	select {
@@ -125,8 +128,29 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 		return nil, err
 	}
 	s.Auth = a
+	if !e.Cfg.Console.Disabled {
+		if s.console, err = console.New(ctx, e.Cfg, s.consoleVerify, e.Log); err != nil {
+			return nil, err
+		}
+	}
 	s.bus = s.newBus()
+	s.background(s.sweepApprovals)
+	s.background(s.itsmWorker)
 	return s, nil
+}
+
+// sweepApprovals applies approval timeouts while this node is the leader.
+func (s *Server) sweepApprovals() {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-t.C:
+			s.E.ExpireApprovals(s.ctx, now)
+		}
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -169,14 +193,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
 	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.authn(s.targetMetrics))
 	s.routesV2(mux)
+	if s.console != nil {
+		s.console.Register(mux)
+	}
 	return s.instrument(s.forwardToLeader(mux))
+}
+
+// consoleVerify accepts a console sign-in only for a user the API itself
+// accepts and who holds at least one role.
+func (s *Server) consoleVerify(ctx context.Context, raw string) error {
+	p, err := s.Auth.AuthenticateToken(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if len(p.Bindings) == 0 {
+		s.E.Audit(journal.Entry{Actor: p.ID, Source: "ui", Action: "denied", Reason: "console sign-in: no role binding"})
+		return fmt.Errorf("signed in as %s, but no auth.role_bindings entry grants a role to this user or their groups", p.ID)
+	}
+	s.E.Audit(journal.Entry{Actor: p.ID, Source: "ui", Action: "console.sign_in"})
+	return nil
 }
 
 // forwardToLeader sends every API call except /healthz, /readyz and /metrics to the HA leader when
 // this node is a follower, so clients may talk to any node.
 func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.HA == nil || s.HA.IsLeader() || local[r.URL.Path] {
+		if s.HA == nil || s.HA.IsLeader() || local[r.URL.Path] || isConsole(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -209,8 +251,20 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 }
 
 // authn identifies the caller and stores the principal in the request context.
+// Without an Authorization header a console session cookie is accepted;
+// changing requests made with it must carry the CSRF token.
 func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.console != nil && r.Header.Get("Authorization") == "" {
+			if tok, ok, csrfOK := s.console.SessionToken(r); ok {
+				if !csrfOK {
+					s.fail(w, r, http.StatusForbidden, "forbidden", errors.New("console session: missing or wrong "+console.CSRFHeader+" header"))
+					return
+				}
+				r = r.Clone(context.WithValue(r.Context(), uiKey{}, true))
+				r.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
 		p, err := s.Auth.Authenticate(r)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vigilante"`)
@@ -220,6 +274,21 @@ func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
 	}
 }
+
+type uiKey struct{}
+
+// source is the audit source of a request: "ui" for the console session,
+// "api" otherwise.
+func source(r *http.Request) string { return sourceOf(r.Context()) }
+
+func sourceOf(ctx context.Context) string {
+	if ui, _ := ctx.Value(uiKey{}).(bool); ui {
+		return "ui"
+	}
+	return "api"
+}
+
+func isConsole(path string) bool { return path == "/console" || strings.HasPrefix(path, "/console/") }
 
 // svc describes a service for authorization (name + owning team).
 func (s *Server) svc(name string) auth.Service {
@@ -271,13 +340,13 @@ func (s *Server) allowAny(w http.ResponseWriter, r *http.Request, a auth.Action,
 // audit records an API action by the caller. X-Change-Ticket, when sent,
 // links the record to a change or incident ticket.
 func (s *Server) audit(r *http.Request, action, service, deployID, reason string) {
-	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: action,
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: source(r), Action: action,
 		Service: service, DeployID: deployID, Reason: reason, Ticket: r.Header.Get("X-Change-Ticket")})
 }
 
 // denied records a refused request; repeated denials are how probing shows up.
 func (s *Server) denied(r *http.Request, service string, err error) {
-	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: "denied",
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: source(r), Action: "denied",
 		Service: service, DeployID: r.PathValue("id"), Reason: r.Method + " " + r.URL.Path + ": " + err.Error(),
 		Ticket: r.Header.Get("X-Change-Ticket")})
 }
@@ -386,6 +455,11 @@ type createReq struct {
 	PreviousVersion string `json:"previous_version"`
 	Prepare         bool   `json:"prepare"`
 	Phase           string `json:"phase"` // optional: start observing immediately
+	// FreezeOverride (admins only, checked by the caller) lets a new
+	// deployment proceed during a change freeze; it is the reason.
+	FreezeOverride string `json:"-"`
+	// ChangeTicket is checked against ITSM when a change gate applies.
+	ChangeTicket string `json:"-"`
 }
 
 func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -398,9 +472,10 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
 	d, err := s.create(r.Context(), p, req)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, gateStatus(err, 400), err)
 		return
 	}
 	s.audit(r, "deployment.create", d.Service, d.ID, fmt.Sprintf("%s %s -> %s", d.Service, d.PreviousVersion, d.Version))
@@ -411,8 +486,19 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	if req.Service == "" || req.Version == "" {
 		return nil, errors.New("service and version are required")
 	}
+	existing := req.ID != "" && s.E.Live(req.ID) != nil
+	var ticket *model.ChangeTicket
+	if !existing {
+		if err := s.E.FreezeGate(req.Service, req.FreezeOverride); err != nil {
+			return nil, err
+		}
+		var err error
+		if ticket, err = s.E.ChangeGate(ctx, req.Service, req.ChangeTicket); err != nil {
+			return nil, err
+		}
+	}
 	var note string
-	if req.PreviousVersion == "" && (req.ID == "" || s.E.Live(req.ID) == nil) {
+	if req.PreviousVersion == "" && !existing {
 		if v, from, ok := s.E.LastGoodVersion(req.Service); ok {
 			req.PreviousVersion = v
 			note = fmt.Sprintf("auto-filled previous=%s (last good deployment %s)", v, from)
@@ -425,6 +511,14 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	s.E.SetCreatedBy(d, p.ID)
 	if note != "" {
 		s.E.Annotate(d, "input", note)
+	}
+	s.E.SetChangeTicket(d, ticket)
+	if req.FreezeOverride != "" && !existing {
+		if f := s.E.ActiveFreeze(d.Service, time.Now()); f != nil {
+			s.E.SetFreezeOverride(d, p.ID, req.FreezeOverride)
+			s.E.Audit(journal.Entry{Actor: p.ID, Source: sourceOf(ctx), Action: "freeze.override", Service: d.Service, DeployID: d.ID,
+				Reason: f.Name + ": " + req.FreezeOverride})
+		}
 	}
 	if req.Prepare {
 		if err := s.E.Prepare(ctx, d); err != nil {
@@ -539,6 +633,9 @@ func (s *Server) launch(d *model.Deployment, phase model.Phase) error {
 	if err := checkLaunch(d); err != nil {
 		return err
 	}
+	if err := s.E.Gate(d); err != nil {
+		return err
+	}
 	s.background(func() {
 		if err := s.E.Watch(s.ctx, d, phase); err != nil {
 			s.E.Log.Error("watch failed", "deployment", d.ID, "err", err)
@@ -613,6 +710,12 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.E.Cfg.Auth.FourEyes && (p.ID == d.CreatedBy || p.ID == d.RollbackRequestedBy) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must approve", p.ID))
+		return
+	}
+	if _, pending := s.E.PendingRollback(d.ID); pending {
+		s.audit(r, "rollback.approve", d.Service, d.ID, "")
+		s.background(func() { _ = s.E.DecideRollback(s.ctx, d, p.ID, true, "") })
+		writeJSON(w, 202, map[string]string{"status": "approved; rollback running"})
 		return
 	}
 	s.audit(r, "escalation.approve", d.Service, d.ID, "")
@@ -734,9 +837,10 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role deployer on %s", p.ID, describe(s.svc(req.Service))))
 		return
 	}
+	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
 	d, err := s.create(r.Context(), p, *req)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, gateStatus(err, 400), err)
 		return
 	}
 	s.E.Audit(journal.Entry{Actor: p.ID, Source: "webhook", Action: "deployment.create", Service: d.Service, DeployID: d.ID,
@@ -850,4 +954,29 @@ func firstNonEmpty(vs ...string) string {
 		}
 	}
 	return ""
+}
+
+// gateStatus maps a closed deployment gate (circuit open, change freeze) to
+// 409 Conflict and anything else to def.
+func gateStatus(err error, def int) int {
+	if errors.Is(err, orchestrator.ErrITSMUnavailable) {
+		return http.StatusServiceUnavailable
+	}
+	if errors.Is(err, orchestrator.ErrBlocked) {
+		return http.StatusConflict
+	}
+	return def
+}
+
+// gateCode is the problem code for a closed gate.
+func gateCode(err error) string {
+	switch {
+	case errors.Is(err, orchestrator.ErrFrozen):
+		return "change_frozen"
+	case errors.Is(err, orchestrator.ErrITSMUnavailable):
+		return "itsm_unavailable"
+	case errors.Is(err, orchestrator.ErrChangeTicket):
+		return "change_ticket_invalid"
+	}
+	return "circuit_open"
 }

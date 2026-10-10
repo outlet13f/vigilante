@@ -124,7 +124,6 @@ func TestAPIClientsSurviveRestart(t *testing.T) {
 	if _, _, err := e1.ResolveClientCredential(keySecret); err != nil { // records last use
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond) // the last-use entry is written asynchronously
 	if _, err := e1.RevokeClient(key.ID); err != nil {
 		t.Fatal(err)
 	}

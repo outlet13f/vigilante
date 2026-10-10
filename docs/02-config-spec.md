@@ -35,6 +35,9 @@ auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
 audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
+change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
+itsm:        {...}   # ServiceNow 변경 티켓 게이트·인시던트·작업 노트
+console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 ```
 
 ## `server`
@@ -270,6 +273,8 @@ phases:
 
 ```yaml
 rollback:
+  mode: approve                    # auto | approve. 생략하면 auto(기존 동작)이고 validate가 경고
+  approval: {timeout: 30m, on_timeout: hold, drain_first: true}
   executor: order-symlink          # 1차 전략
   traffic: nginx-edge              # 선택: 트래픽 제어기
   scope: deployed                  # deployed(이번 단계까지 배포된 전 대상) | failed(위반 대상만)
@@ -294,6 +299,23 @@ rollback:
 | `probe.verify` | 지정 프로브의 `Check()`가 연속 `successes`회 성공해야 통과 (**헬스 확인**) |
 | `traffic.enable` | 풀 복귀. 앞 단계가 실패하면 실행되지 않음 → 대상은 **격리 상태 유지** |
 | `wait` | `duration` 대기 |
+
+### 롤백 모드 (`mode`)
+
+| 모드 | 단계가 FAIL이면 |
+|---|---|
+| `auto` | 즉시 롤백 플랜을 실행합니다. 생략하면 이 모드이며, `vigilante validate`가 명시하라고 경고합니다 |
+| `approve` | 롤백 대상·이유·만료 시각을 담은 계획(`pending_rollback`)을 만들고 `AWAITING_APPROVAL`(CI 종료 코드 3)로 멈춥니다. 콘솔, API(`POST /v2/deployments/{id}/approvals`), CLI(`vigilante rollback --id ID --approve` 또는 `--reject`)로 결정합니다 |
+
+`approve` 모드의 세부 동작:
+
+- **승인:** 준비한 계획대로 롤백합니다. 사람의 결정이므로 서킷브레이커와 플래핑 제한을 거치지 않습니다(수동 롤백과 같음). 승인자는 `approved_by`에 남습니다.
+- **거절:** 새 버전을 유지하고, `drain_first`로 빼 둔 대상을 다시 트래픽에 넣은 뒤 `HELD`로 둡니다. 오탐을 판정에서 걸러 내는 경로입니다.
+- **`drain_first: true`:** 결정을 기다리는 동안 위반한 대상을 트래픽에서 뺍니다(blast radius 적용). `rollback.traffic`이 필요합니다.
+- **`timeout`(기본 30m)과 `on_timeout`:** `hold`(기본)면 계속 기다리며 운영자에게 한 번 더 상위 호출하고, 그 뒤에도 승인할 수 있습니다. `rollback`이면 자동 롤백으로 넘어가며 이때는 서킷브레이커·플래핑 제한이 적용됩니다. 만료 처리는 서버(리더)가 15초마다 합니다. CI 단발 실행만 쓰는 경우에는 만료 처리가 없습니다.
+- **4-eyes(`auth.four_eyes`):** 배포를 만든 사람이나 롤백을 요청한 사람은 승인·거절할 수 없습니다.
+- **에이전트 failsafe:** `approve` 모드 서비스에서는 `agent.failsafe: rollback`이어도 에이전트가 혼자 롤백하지 않고 보류합니다.
+- 이벤트: `vigilante.approval.requested`(계획 생성), `vigilante.approval.decided`(`decision: approved|rejected`). 지표: `vigilante_rollback_approvals_total{decision}`.
 
 ## `executors.<name>` — 롤백 전략
 
@@ -452,6 +474,26 @@ audit:
 - **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
 - **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
 
+## `change_freeze` — 변경 동결
+
+```yaml
+change_freeze:
+  - name: weekend
+    weekly: {from: "fri 18:00", to: "mon 09:00", timezone: Asia/Seoul}   # 매주 반복
+  - name: year-end-closing
+    reason: 결산 기간
+    start: "2026-12-28T00:00:00+09:00"    # 기간 지정 (RFC 3339)
+    end: "2027-01-02T00:00:00+09:00"
+    teams: [payments]                     # services/teams 생략 시 전 서비스
+    allow_rollback: true                  # 기본 true
+```
+
+- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다. 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
+- **막지 않는 것:** 자동 롤백은 기본으로 허용합니다. 장애 복구는 변경이 아니기 때문입니다. `allow_rollback: false`인 기간에는 자동 롤백 대신 실패한 대상을 격리하고 사람에게 넘깁니다. 수동 롤백은 항상 가능합니다.
+- **예외(긴급 배포):** API는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다. 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
+- **실행 중 선언:** 장애 대응처럼 설정 파일 없이 동결해야 하면 admin이 `POST /v2/freezes`로 선언하고 `DELETE /v2/freezes/{id}`로 일찍 끝냅니다. 상태 저장소에 남아 리더가 바뀌어도 유지됩니다. `GET /v2/freezes`는 설정 창과 선언된 동결을 함께 보여 줍니다.
+- 주간 창의 시각은 `timezone`(생략 시 서버 지역 시간) 기준이며, 바이너리에 시간대 데이터가 들어 있어 호스트 설정과 무관하게 동작합니다.
+
 ## `api` — 오픈 API
 
 ```yaml
@@ -466,6 +508,27 @@ api:
 `rate: 0`이고 `daily`가 없으면 한도가 없습니다. API 클라이언트별 한도와 클라이언트 등록은 설정 파일이 아니라 API(`/v2/api-clients`)로 관리하며, 상태 저장소에 남습니다. 자세한 내용은 docs/06-api.md.
 
 웹훅 서명 비밀은 마스터 키와 구독 ID로 계산하므로 상태 저장소에는 비밀이 남지 않습니다. 마스터 키를 바꾸면 모든 구독의 비밀이 바뀌므로, 키 교체 후에는 각 구독에 `POST /v2/webhooks/{id}/secret`로 새 비밀을 받아 수신 측에 전달하십시오.
+
+## `console` — 웹 운영 콘솔
+
+`vigilante server`는 `/console/`에서 운영 콘솔을 제공합니다. 화면은 바이너리에 내장되어 있고 외부 CDN을 쓰지 않으므로 폐쇄망에서도 그대로 동작합니다. 콘솔은 공개 API(v2)만 호출하므로 사용자가 할 수 있는 일은 그 사용자의 역할·범위와 같습니다.
+
+```yaml
+console:
+  redirect_url: https://vigilante.example.internal/console/auth/callback   # IdP에 등록한 콜백. 있으면 SSO 로그인
+  session_key_ref: "vault:secret/prod/vigilante#console_session_key"     # 세션 쿠키 암호화 키(32자 이상). HA 노드가 같은 값을 써야 함
+  client_id: vigilante-console     # 생략 시 auth.oidc.audience
+  client_secret_ref: "vault:secret/prod/vigilante#console_client_secret" # 기밀 클라이언트일 때만. PKCE는 항상 사용
+  scopes: [openid, profile, email] # 기본값. 그룹 클레임이 별도 스코프면 추가
+  # disabled: true                 # 콘솔을 끔
+```
+
+- **SSO 로그인:** `auth.oidc`와 `redirect_url`이 있으면 OIDC authorization code + PKCE로 로그인합니다. 콘솔이 받은 ID 토큰을 API와 같은 방식(`auth.oidc`, `auth.role_bindings`)으로 검증하므로, IdP의 `aud`가 `auth.oidc.audience`와 같아야 합니다. 역할 바인딩이 하나도 없는 사용자는 로그인을 거부하고 감사 기록에 남깁니다.
+- **세션:** ID 토큰을 AES-GCM으로 암호화한 HttpOnly 쿠키(`SameSite=Lax`, https면 `Secure`)에 담습니다. 서버에는 세션 상태가 없어 HA의 어느 노드든 받을 수 있습니다. 세션은 ID 토큰 만료 시각(최대 12시간)에 끝납니다. `session_key_ref`가 없으면 재시작마다 키가 바뀌어 다시 로그인해야 합니다(`validate`가 경고).
+- **CSRF:** 쿠키로 인증한 변경 요청은 `X-CSRF-Token` 헤더에 CSRF 쿠키 값을 담아야 합니다(double-submit). 없으면 `403 forbidden`입니다. `Authorization` 헤더가 있는 요청은 쿠키를 보지 않으므로 API 클라이언트에는 영향이 없습니다.
+- **토큰 로그인:** SSO가 없으면 콘솔이 서비스 계정 토큰이나 API 키를 묻습니다. 토큰은 그 브라우저 탭(sessionStorage)에만 남습니다.
+- **화면:** 현황(서킷·조치 필요·진행 중·최근 배포·실시간 이벤트), 배포 목록·상세(승인·거절, 롤백, 관측 중단, 규칙 위반, 작업, 타임라인), 서비스, 변경 동결(선언·종료), 감사 기록. 모든 조작은 사유를 받아 감사 기록에 남기며(출처 `ui`), 버튼은 역할에 맞는 것만 보입니다. 실시간 갱신은 `GET /v2/events`(SSE)를 씁니다.
+- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. API 데이터는 모두 텍스트로만 화면에 넣습니다.
 
 ## `secrets` — 비밀값 출처
 
@@ -501,6 +564,49 @@ path "ssh-client-signer/sign/vigilante" { capabilities = ["update"] }
 
 | 키 | 설명 |
 |---|---|
-| `type` | `slack`(incoming webhook 텍스트) \| `webhook`(배포 JSON 전체) |
-| `url` / `url_env` | 대상 URL |
+| `type` | `slack`(incoming webhook 텍스트) \| `teams`(Teams Workflows 웹훅, Adaptive Card) \| `email`(SMTP) \| `pagerduty`(Events v2) \| `webhook`(배포 JSON 전체) |
+| `url` / `url_env` / `url_ref` | slack·teams·webhook 대상 URL. URL에 비밀이 들어가므로 `url_ref`(Vault) 권장 |
 | `min_level` | `info` \| `warning` \| `critical` |
+| `services` / `teams` | 이 채널로 보낼 서비스·팀. 생략하면 전부. 서비스가 없는 알림(서킷 등)은 모든 채널로 갑니다 |
+| `smtp` | email: `host`, `port`(기본 587 STARTTLS, 465는 TLS), `from`, `to[]`, `username`, `password_ref`, `implicit_tls`, `no_starttls`(신뢰 망 릴레이만) |
+| `routing_key_ref` / `routing_key_env` | pagerduty: 서비스 integration key. 경고·치명 알림을 `dedup_key`(배포·제목)로 묶어 트리거 |
+
+같은 배포의 같은 알림은 채널마다 10분에 한 번만 보냅니다. 알림 실패는 기록만 하고 롤백을 막지 않습니다.
+
+```yaml
+notify:
+  - {type: teams, url_ref: "vault:secret/prod/teams#payments_webhook", teams: [payments], min_level: warning}
+  - type: email
+    min_level: critical
+    smtp: {host: smtp.example.internal, from: vigilante@example.internal, to: [sre@example.internal], username: vigilante, password_ref: "vault:secret/prod/smtp#password"}
+  - {type: pagerduty, routing_key_ref: "vault:secret/prod/pagerduty#sre", min_level: critical}
+```
+
+## `itsm` — ServiceNow
+
+```yaml
+itsm:
+  servicenow:
+    url: https://company.service-now.com
+    credential: snow-integration           # type basic(통합 사용자) 또는 token(OAuth bearer)
+    change_gate:
+      enabled: true
+      teams: [payments]                     # services/teams 생략 시 전 서비스
+      allowed_states: ["-2", "-1"]          # Scheduled, Implement (기본)
+      check_window: true                    # 계획된 시작·종료 시각 안이어야 함 (기본)
+      on_error: closed                      # ServiceNow 장애 시 closed(거부, 기본) | open(진행, 미검증 표시)
+    incidents:
+      enabled: true
+      on: [rollback_failed, circuit_opened] # 기본 둘 다
+      assignment_group: SRE
+      urgency: 1
+      impact: 2
+    work_notes: true                        # 변경 티켓에 진행 결과 기록 (기본 true)
+```
+
+- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 v2 `change_ticket`, CLI는 `--ticket`입니다. 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
+- **ServiceNow 장애:** `on_error: closed`면 `503 itsm_unavailable`(Retry-After)로 새 배포를 받지 않고, `open`이면 진행하되 배포의 `change_ticket.unverified: true`와 이벤트에 남깁니다. **롤백은 어느 경우에도 ServiceNow를 기다리지 않습니다.**
+- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다.
+- **작업 노트:** 검증된 티켓이 있는 배포는 관측 시작·판정·롤백 시작·완료·실패·승인 요청·결정을 변경 티켓의 work notes에 남깁니다.
+- 인시던트와 작업 노트는 서버(리더)가 이벤트를 따라가며 처리합니다. CI 단발 실행(`vigilante watch`)만 쓰는 구성에서는 게이트만 동작합니다.
+- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`.

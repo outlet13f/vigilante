@@ -173,6 +173,9 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 			return 1, err
 		}
 		fmt.Printf("OK: %d targets, %d services, %d executors, %d traffic controllers\n", len(cfg.Targets), len(cfg.Services), len(cfg.Executors), len(cfg.Traffic))
+		for _, w := range cfg.Warnings() {
+			fmt.Println("WARN: " + w)
+		}
 		for _, s := range cfg.Services {
 			if s.Preset != "" {
 				fmt.Printf("  %s: preset %s -> %d probes, %d rules\n", s.Name, s.Preset, len(s.Probes), len(s.Rules))
@@ -214,6 +217,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 
 func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	c := newFlags("prepare")
+	override := c.fs.String("freeze-override", "", "reason to proceed during a change freeze (recorded in the audit trail)")
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
@@ -223,11 +227,10 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	}
 	defer e.Close()
 	notes := autoFill(c, e)
-	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	d, code, err := createGated(e, c, *override)
 	if err != nil {
-		return 1, err
+		return code, err
 	}
-	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	cliAudit(e, c, "deployment.prepare", d.Service, d.ID, "")
 	err = e.Prepare(ctx, d)
@@ -264,6 +267,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	c := newFlags("watch")
 	phase := c.fs.String("phase", "canary", "canary | rolling | full")
 	baseline := c.fs.String("baseline", "", "baseline snapshot file from `vigilante baseline`")
+	override := c.fs.String("freeze-override", "", "reason to proceed during a change freeze (recorded in the audit trail)")
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
@@ -279,11 +283,10 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	notes := autoFill(c, e)
-	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	d, code, err := createGated(e, c, *override)
 	if err != nil {
-		return 1, err
+		return code, err
 	}
-	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
@@ -291,7 +294,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	cliAudit(e, c, "phase.start", d.Service, d.ID, *phase)
 	if err := e.Watch(ctx, d, model.Phase(*phase)); err != nil {
 		e.MarkBlocked(d, err)
-		if errors.Is(err, safety.ErrCircuitOpen) {
+		if errors.Is(err, orchestrator.ErrBlocked) || errors.Is(err, safety.ErrCircuitOpen) {
 			return 3, err
 		}
 		return 1, err
@@ -366,7 +369,8 @@ func watchRemote(ctx context.Context, c *common, phase string) (int, error) {
 func cmdRollback(ctx context.Context, args []string) (int, error) {
 	c := newFlags("rollback")
 	exec := c.fs.String("executor", "", "override the rollback executor")
-	approve := c.fs.Bool("approve", false, "allow escalation steps that require approval")
+	approve := c.fs.Bool("approve", false, "approve the rollback waiting for approval (approve mode), or allow escalation steps that require approval")
+	reject := c.fs.Bool("reject", false, "reject the rollback waiting for approval: the deployment is held on the new version")
 	reason := c.fs.String("reason", "manual rollback (CLI)", "reason recorded in the journal")
 	targets := c.fs.String("targets", "", "comma-separated targets (default: deployment targets)")
 	if err := c.fs.Parse(args); err != nil {
@@ -393,6 +397,20 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 		}
 		e.SetCreatedBy(d, cliActor())
 		annotate(e, d, notes)
+	}
+	if _, pending := e.PendingRollback(d.ID); pending && (*approve || *reject) {
+		if *approve && *reject {
+			return 1, errors.New("--approve and --reject are exclusive")
+		}
+		action := map[bool]string{true: "rollback.approve", false: "rollback.reject"}[*approve]
+		cliAudit(e, c, action, d.Service, d.ID, *reason)
+		_ = e.DecideRollback(ctx, d, cliActor(), *approve, *reason)
+		cp, _ := e.Deployment(d.ID)
+		printJSON(cp)
+		return model.ExitCode(cp), nil
+	}
+	if *reject {
+		return 1, fmt.Errorf("deployment %s has no rollback waiting for approval", d.ID)
 	}
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
@@ -607,4 +625,31 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	return 0, nil
+}
+
+// createGated registers the deployment unless a change freeze refuses new
+// ones (exit code 3, like an open circuit). With an override reason it
+// proceeds and records who overrode which freeze.
+func createGated(e *orchestrator.Engine, c *common, override string) (*model.Deployment, int, error) {
+	var ticket *model.ChangeTicket
+	if c.id == "" || e.Live(c.id) == nil {
+		if err := e.FreezeGate(c.service, override); err != nil {
+			return nil, 3, err
+		}
+		var err error
+		if ticket, err = e.ChangeGate(context.Background(), c.service, c.ticket); err != nil {
+			return nil, 3, err
+		}
+	}
+	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	if err != nil {
+		return nil, 1, err
+	}
+	e.SetCreatedBy(d, cliActor())
+	e.SetChangeTicket(d, ticket)
+	if f := e.ActiveFreeze(d.Service, time.Now()); f != nil && override != "" && d.FreezeOverride == "" {
+		e.SetFreezeOverride(d, cliActor(), override)
+		cliAudit(e, c, "freeze.override", d.Service, d.ID, f.Name+": "+override)
+	}
+	return d, 0, nil
 }
