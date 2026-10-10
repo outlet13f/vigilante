@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,6 +138,97 @@ func TestDrainBatch(t *testing.T) {
 			t.Errorf("DrainBatch(%d,%d,%d,%+v) = %d want %d", c.pool, c.enabled, c.drain, c.cfg, got, c.want)
 		}
 	}
+}
+
+// downLeases is a lease store that cannot be reached until up is set.
+type downLeases struct {
+	memLeases
+	up    atomic.Bool
+	tries atomic.Int64
+}
+
+func (l *downLeases) TryLease(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
+	l.tries.Add(1)
+	if !l.up.Load() {
+		return false, errors.New("dial tcp 10.0.0.50:5432: connect: connection refused")
+	}
+	return l.memLeases.TryLease(ctx, key, owner, ttl)
+}
+
+func TestGuardStoreUnreachable(t *testing.T) {
+	leases := &downLeases{memLeases: memLeases{m: map[string]string{}}}
+	newGuard := func(proceed bool) *Guard {
+		g := NewGuard(config.Flapping{}, nil)
+		g.Leases, g.Owner, g.TTL = leases, "proc-1", 300*time.Millisecond
+		g.LeaseWait, g.ProceedUnleased = 300*time.Millisecond, proceed
+		return g
+	}
+
+	// on_unavailable: fail refuses after retrying for LeaseWait.
+	g := newGuard(false)
+	start := time.Now()
+	if _, err := g.Acquire("order-api"); !errors.Is(err, ErrLeaseUnavailable) {
+		t.Fatalf("fail mode: %v", err)
+	}
+	if time.Since(start) < 250*time.Millisecond || leases.tries.Load() < 2 {
+		t.Fatalf("gave up after %s and %d tries; should retry for LeaseWait", time.Since(start), leases.tries.Load())
+	}
+	if _, err := g.Acquire("order-api"); !errors.Is(err, ErrLeaseUnavailable) {
+		t.Fatalf("a refused acquire must not leave the local lock behind: %v", err)
+	}
+
+	// on_unavailable: proceed hands back the local lock and says so.
+	g = newGuard(true)
+	var unleased, conflict atomic.Value
+	g.Unleased = func(s string, err error) { unleased.Store(s) }
+	g.Conflict = func(s, holder string) { conflict.Store(holder) }
+	rel, err := g.Acquire("order-api")
+	if err != nil || unleased.Load() != "order-api" {
+		t.Fatalf("proceed mode: %v (unleased %v)", err, unleased.Load())
+	}
+	if _, err := g.Acquire("order-api"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("local exclusion still applies: %v", err)
+	}
+	// The store comes back with another process holding the lease.
+	leases.memLeases.m["service:order-api"] = "proc-2"
+	leases.up.Store(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for conflict.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if conflict.Load() != "proc-2" {
+		t.Fatalf("conflict not reported: %v", conflict.Load())
+	}
+	rel()
+	if leases.memLeases.m["service:order-api"] != "proc-2" {
+		t.Fatal("release must not drop another process's lease")
+	}
+
+	// The store comes back free: the background loop takes the lease.
+	delete(leases.memLeases.m, "service:order-api")
+	leases.up.Store(false)
+	rel, err = g.Acquire("order-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases.up.Store(true)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		leases.mu.Lock()
+		got := leases.m["service:order-api"]
+		leases.mu.Unlock()
+		if got == "proc-1" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	leases.mu.Lock()
+	got := leases.m["service:order-api"]
+	leases.mu.Unlock()
+	if got != "proc-1" {
+		t.Fatalf("lease not taken once the store came back: %q", got)
+	}
+	rel()
 }
 
 type memLeases struct {

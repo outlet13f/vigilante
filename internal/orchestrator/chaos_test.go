@@ -37,6 +37,13 @@ func (f *flakyStore) Append(ctx context.Context, e journal.Entry) error {
 	return f.Store.Append(ctx, e)
 }
 
+func (f *flakyStore) TryLease(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
+	if f.down.Load() {
+		return false, errors.New("dial tcp 10.0.0.50:5432: connect: connection refused")
+	}
+	return f.Store.TryLease(ctx, key, owner, ttl)
+}
+
 func (f *flakyStore) Ping(ctx context.Context) error {
 	if f.down.Load() {
 		return errors.New("connection refused")
@@ -55,6 +62,7 @@ func TestChaosStoreOutageDuringRollback(t *testing.T) {
 	t.Cleanup(func() { inner.Close() }) // an injected store is not closed by the engine
 	fs := &flakyStore{Store: inner}
 	h := newHarness(t, opts{store: fs, journal: path})
+	h.e.Guard.LeaseWait = 300 * time.Millisecond
 	d := h.deploy("d-outage")
 	fs.down.Store(true)
 	h.app1.healthy.Store(false)
@@ -63,6 +71,10 @@ func TestChaosStoreOutageDuringRollback(t *testing.T) {
 	}
 	if d.State != model.StateRolledBack {
 		t.Fatalf("the rollback must not wait for the store: %s %s", d.State, d.Reason)
+	}
+	// The service lease could not be taken; the rollback says it went ahead without it.
+	if !hasEvent(d, "safety", "rolling back under this process's lock only") {
+		t.Fatalf("no unleased-rollback event: %+v", d.Events)
 	}
 	queued := h.e.PendingWrites()
 	if queued == 0 || fs.refused.Load() == 0 {
@@ -103,6 +115,29 @@ func TestChaosStoreOutageDuringRollback(t *testing.T) {
 	if n := e2.Resume(context.Background()); n != 0 {
 		t.Fatalf("resumed %d rollbacks after a completed one", n)
 	}
+}
+
+// safety.rollback_lease.on_unavailable: fail keeps the strict behaviour: no
+// lease, no rollback, and the reason names the store.
+func TestChaosStoreOutageLeaseFailMode(t *testing.T) {
+	path := t.TempDir() + "/journal.jsonl"
+	inner, err := store.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { inner.Close() })
+	fs := &flakyStore{Store: inner}
+	h := newHarness(t, opts{store: fs, journal: path})
+	h.e.Guard.LeaseWait, h.e.Guard.ProceedUnleased = 300*time.Millisecond, false
+	d := h.deploy("d-strict")
+	fs.down.Store(true)
+	h.app1.healthy.Store(false)
+	_ = h.e.Watch(context.Background(), d, model.PhaseCanary)
+	if d.State != model.StateRollbackFailed || !strings.Contains(d.Reason, "state store unreachable") {
+		t.Fatalf("fail mode: %s %s", d.State, d.Reason)
+	}
+	fs.down.Store(false)
+	h.e.Flush(5 * time.Second)
 }
 
 // flakyLB wraps the fake nginx host: the first n writes fail or stall.
@@ -200,4 +235,22 @@ func hasEvent(d *model.Deployment, kind, contains string) bool {
 		}
 	}
 	return false
+}
+
+// The orchestrator itself is overloaded: probe failures seen during the
+// episode (and the grace period after it) hold instead of rolling back.
+func TestChaosObserverDegradedHolds(t *testing.T) {
+	h := newHarness(t, opts{})
+	d := h.deploy("d-overload")
+	h.app1.healthy.Store(false)
+	h.e.Observer.Report(time.Now(), "scheduling lag: woke 4s late")
+	if err := h.e.Watch(context.Background(), d, model.PhaseCanary); err != nil {
+		t.Fatal(err)
+	}
+	if d.State == model.StateRolledBack || d.State == model.StateRollingBack || d.Verdict != model.VerdictHold {
+		t.Fatalf("a degraded observer must not roll back: %s %s %s", d.State, d.Verdict, d.Reason)
+	}
+	if !strings.Contains(d.Reason, "observer degraded") {
+		t.Fatalf("reason should name the observer: %s", d.Reason)
+	}
 }

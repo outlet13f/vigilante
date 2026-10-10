@@ -709,6 +709,39 @@ type Safety struct {
 	BlastRadius    BlastRadius    `yaml:"blast_radius"`
 	Flapping       Flapping       `yaml:"flapping"`
 	ObserverQuorum bool           `yaml:"observer_quorum"`
+	RollbackLease  RollbackLease  `yaml:"rollback_lease"`
+	ObserverGuard  ObserverGuard  `yaml:"observer_guard"`
+}
+
+// ObserverGuard holds rule breaches built on probe failures (up, latency,
+// failures, timeouts) instead of rolling back while this orchestrator's own
+// measurements are unreliable. See internal/observer.
+type ObserverGuard struct {
+	Disabled bool `yaml:"disabled"`
+	// MaxLag: a 250ms internal tick waking later than this marks the
+	// observer degraded (default 1s).
+	MaxLag time.Duration `yaml:"max_lag"`
+	// LoopbackTimeout bounds a round trip to an in-process TCP echo (default 1s).
+	LoopbackTimeout time.Duration `yaml:"loopback_timeout"`
+	// TimeoutShare and MinServices: probes timing out on at least this share
+	// of the observed targets (default 0.5), spread over at least this many
+	// services (default 3), are the observer's problem, not one release's.
+	TimeoutShare float64 `yaml:"timeout_share"`
+	MinServices  int     `yaml:"min_services"`
+	// Grace keeps holding for this long after the observer recovers, so
+	// failure counts and windows filled during the episode age out (default 1m).
+	Grace time.Duration `yaml:"grace"`
+}
+
+// RollbackLease governs the cross-process rollback lock (a state-store
+// lease) when the store cannot be reached at the moment a rollback starts.
+type RollbackLease struct {
+	// Wait is how long to keep retrying the store (default 10s).
+	Wait time.Duration `yaml:"wait"`
+	// OnUnavailable: proceed (default) rolls back under the in-process lock
+	// alone and says so in the deployment's events, the audit log and a
+	// warning notification; fail refuses the rollback (ROLLBACK_FAILED).
+	OnUnavailable string `yaml:"on_unavailable"`
 }
 
 type CircuitBreaker struct {

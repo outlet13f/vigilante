@@ -39,6 +39,19 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
 ### Fixed (store)
 - State writes that failed while the store was unreachable were dropped;
   they are now queued in order and written when it returns.
+- A rollback that started while the store was unreachable ended
+  ROLLBACK_FAILED because the service lease could not be taken. It now
+  retries for `safety.rollback_lease.wait` (10s) and then rolls back under
+  the in-process lock, recording `lease.unavailable` (and `lease.conflict`
+  if another process holds the lease when the store returns).
+  `on_unavailable: fail` keeps the old behaviour.
+
+### Fixed (decisions)
+- An overloaded orchestrator read its own probe timeouts as target failures
+  and rolled back healthy releases. `safety.observer_guard` (on by default)
+  watches scheduling lag, a loopback round trip and timeouts spread across
+  services, and holds breaches built on probe failures while the observer
+  is degraded and for `grace` (1m) after.
 
 ### Changed
 - DB probe: every interval runs the query on one kept connection; the

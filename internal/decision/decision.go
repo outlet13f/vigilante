@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"vigilante/internal/config"
@@ -56,6 +57,15 @@ type Engine struct {
 	OnEval func(Evaluation)
 	// Now is injectable for tests.
 	Now func() time.Time
+	// Observer, when set, holds breaches built on probe failures while the
+	// orchestrator's own measurements were unreliable (internal/observer).
+	Observer Observer
+}
+
+// Observer reports whether the measuring side was degraded at any time
+// between from and to.
+type Observer interface {
+	Degraded(from, to time.Time) (bool, string)
 }
 
 func New(p Phase, store *metrics.Store, baseline rules.Baseline) *Engine {
@@ -116,6 +126,13 @@ func (e *Engine) Evaluate(now time.Time) Evaluation {
 			case rule.Action == "hold":
 				ev.Hold = append(ev.Hold, b)
 			default:
+				if why := e.observerDegraded(rule, now); why != "" {
+					b.Action = "hold"
+					b.Detail += " — observer degraded (" + why + "), not attributed to the release"
+					ev.Hold = append(ev.Hold, b)
+					telemetry.ObserverHolds.Inc()
+					continue
+				}
 				ev.Fail = append(ev.Fail, b)
 			}
 		}
@@ -170,6 +187,45 @@ func (e *Engine) evalTarget(rule config.Rule, target string, now time.Time) (rul
 		return rules.Result{State: rules.False}, ""
 	}
 	return rules.Result{State: rules.Unknown}, ""
+}
+
+// observerSensitive are the probe metrics a degraded observer distorts: a
+// starved orchestrator turns slow answers into timeouts and failures. Log,
+// host and container metrics report what the target said and are kept.
+var observerSensitive = []string{"up", "latency_ms", "consecutive_failures", "consecutive_timeouts", "timeout", "probe_error"}
+
+// observerDegraded returns why the rule's evidence is untrustworthy, or "".
+func (e *Engine) observerDegraded(rule config.Rule, now time.Time) string {
+	if e.Observer == nil {
+		return ""
+	}
+	sensitive := false
+	for _, m := range rules.Metrics(rule.When) {
+		suffix := m[strings.LastIndex(m, ".")+1:]
+		sensitive = sensitive || slices.Contains(observerSensitive, suffix)
+	}
+	if !sensitive {
+		return ""
+	}
+	lookback := maxWindow(rule.When) + time.Duration(maxFor(rule.When))*e.Phase.Cfg.EvalInterval
+	if ok, why := e.Observer.Degraded(now.Add(-lookback), now); ok {
+		return why
+	}
+	return ""
+}
+
+func maxFor(n config.Node) int {
+	f := n.For
+	for _, c := range n.Any {
+		f = max(f, maxFor(c))
+	}
+	for _, c := range n.All {
+		f = max(f, maxFor(c))
+	}
+	if n.Not != nil {
+		f = max(f, maxFor(*n.Not))
+	}
+	return f
 }
 
 func maxWindow(n config.Node) time.Duration {

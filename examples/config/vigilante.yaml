@@ -491,6 +491,14 @@ safety:
   flapping:
     max_rollbacks_per_hour: 3
     cooldown: 5m
+  rollback_lease:
+    wait: 10s
+    on_unavailable: proceed               # store down: roll back under the local lock, and say so
+  observer_guard:                         # this server overloaded: hold probe-failure breaches
+    max_lag: 1s
+    timeout_share: 0.5
+    min_services: 3
+    grace: 1m
 
 notify:
   - type: slack

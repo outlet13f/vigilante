@@ -22,6 +22,10 @@ var (
 	StoreErrors  = NewCounter("vigilante_store_errors_total", "Failed state store writes (fenced = leadership lost, error = queued for retry, dropped = queue full).", "reason")
 	StorePending = NewGauge("vigilante_store_pending_writes", "Writes queued while the state store is unreachable.")
 
+	ObserverDegraded     = NewGauge("vigilante_observer_degraded", "1 while this orchestrator's own measurements are unreliable (scheduling lag, loopback, timeouts across services).")
+	ObserverDegradations = NewCounter("vigilante_observer_degradations_total", "Times the observer became degraded, by first signal: scheduling lag, loopback, spread.", "signal")
+	ObserverHolds        = NewCounter("vigilante_observer_holds_total", "Rule breaches held instead of failing because the observer was degraded.")
+
 	SSHConnections = NewGauge("vigilante_ssh_connections", "Pooled SSH connections.")
 	SSHSessions    = NewGauge("vigilante_ssh_sessions", "Open SSH sessions (commands and streams).")
 	SSHDials       = NewCounter("vigilante_ssh_dials_total", "SSH connection attempts.", "result")

@@ -397,7 +397,21 @@ safety:
   circuit_breaker: {failure_threshold: 2, window: 1h, open_duration: 0s}
   blast_radius:    {min_healthy: 1, min_healthy_percent: 50}
   flapping:        {max_rollbacks_per_hour: 3, cooldown: 5m}
+  rollback_lease:  {wait: 10s, on_unavailable: proceed}
+  observer_guard:  {max_lag: 1s, loopback_timeout: 1s, timeout_share: 0.5, min_services: 3, grace: 1m}
 ```
+
+| 키 | 기본값 | 설명 |
+|---|---|---|
+| `rollback_lease.wait` | `10s` | 롤백 시작 시 서비스 잠금(상태 저장소 lease)을 얻으려고 저장소를 다시 시도하는 시간 |
+| `rollback_lease.on_unavailable` | `proceed` | 그래도 저장소에 닿지 않을 때. `proceed`는 이 프로세스 안의 잠금만으로 롤백하고 배포 이벤트(`safety`), 감사(`lease.unavailable`), 경고 알림을 남깁니다. 롤백 도중 저장소가 돌아오면 lease를 다시 잡고, 다른 프로세스가 이미 잡고 있으면 `lease.conflict`로 알립니다. `fail`은 롤백을 시작하지 않습니다(ROLLBACK_FAILED) |
+| `observer_guard.disabled` | `false` | 관측 장치 자체가 불안정할 때 프로브 실패 기반 위반을 롤백 대신 HOLD하는 기능을 끕니다 |
+| `observer_guard.max_lag` | `1s` | 내부 250ms 타이머가 이보다 늦게 깨면 관측 장치 과부하(CPU 부족, GC, VM 정지) |
+| `observer_guard.loopback_timeout` | `1s` | 프로세스 안 TCP 에코 왕복이 이보다 길면 과부하(소켓·네트워크 스택 고갈) |
+| `observer_guard.timeout_share` / `min_services` | `0.5` / `3` | 관측 중인 대상의 이 비율 이상에서, 이 개수 이상의 서비스에 걸쳐 프로브가 시간 초과면 관측 쪽 문제로 봅니다. 서비스 하나의 불량 릴리스로는 걸리지 않습니다 |
+| `observer_guard.grace` | `1m` | 회복 후에도 이 시간 동안은 HOLD를 유지합니다. 과부하 중 쌓인 연속 실패 수와 윈도우 값이 빠질 시간입니다 |
+
+관측 장치 판별은 프로브 실패에서 나온 지표(`up`, `latency_ms`, `consecutive_failures`, `consecutive_timeouts`, `timeout`, `probe_error`)를 쓰는 규칙에만 적용합니다. 로그·액세스 로그·호스트·컨테이너 지표는 대상이 직접 보고한 값이라 그대로 판정합니다. 지표: `vigilante_observer_degraded`, `vigilante_observer_degradations_total{signal}`, `vigilante_observer_holds_total`.
 
 상세 동작은 [04-safety-circuit-breaker.md](04-safety-circuit-breaker.md).
 

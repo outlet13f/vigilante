@@ -27,6 +27,7 @@ import (
 	"vigilante/internal/metrics"
 	"vigilante/internal/model"
 	"vigilante/internal/notify"
+	"vigilante/internal/observer"
 	"vigilante/internal/probe"
 	"vigilante/internal/rules"
 	"vigilante/internal/safety"
@@ -55,10 +56,12 @@ type Engine struct {
 	Journal store.Store
 	Breaker *safety.Breaker
 	Guard   *safety.Guard
-	Notify  *notify.Notifier
-	ITSM    *itsm.ServiceNow // nil without itsm.servicenow
-	Log     *slog.Logger
-	DryRun  bool
+	// Observer judges whether this process's own measurements can be trusted.
+	Observer *observer.Guard
+	Notify   *notify.Notifier
+	ITSM     *itsm.ServiceNow // nil without itsm.servicenow
+	Log      *slog.Logger
+	DryRun   bool
 
 	// OnRecord sees every entry after it is durably stored (SIEM export).
 	OnRecord func(journal.Entry)
@@ -132,6 +135,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		cancels:   map[string]context.CancelFunc{},
 		lastEval:  map[string]decision.Evaluation{},
 	}
+	e.Observer = observer.New(cfg, log)
 	if sn := cfg.ITSM.ServiceNow; sn != nil {
 		e.ITSM = itsm.NewServiceNow(*sn, cfg.Credentials)
 	}
@@ -171,6 +175,9 @@ func (e *Engine) Reload(ctx context.Context) error {
 	}
 	guard := safety.NewGuard(e.Cfg.Safety.Flapping, st.Rollbacks)
 	guard.Leases, guard.Owner = e.Journal, e.owner
+	guard.LeaseWait = e.Cfg.Safety.RollbackLease.Wait
+	guard.ProceedUnleased = e.Cfg.Safety.RollbackLease.OnUnavailable != "fail"
+	guard.Unleased, guard.Conflict = e.rollbackUnleased, e.rollbackLeaseConflict
 	e.mu.Lock()
 	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
 	e.operations, e.idem = st.Operations, st.Idempotency
@@ -417,6 +424,41 @@ func (e *Engine) event(d *model.Deployment, kind, msg string, args ...any) {
 	d.AddEvent(kind, msg)
 	e.mu.Unlock()
 	e.Log.Info(msg, append([]any{"deployment", d.ID, "event", kind}, args...)...)
+}
+
+// rollbackUnleased reports a rollback that goes ahead without the
+// cross-process service lease because the state store is unreachable
+// (safety.rollback_lease.on_unavailable: proceed).
+func (e *Engine) rollbackUnleased(service string, err error) {
+	msg := fmt.Sprintf("state store unreachable (%v): rolling back under this process's lock only; another process could act on %s at the same time", err, service)
+	e.leaseNotice(service, "lease.unavailable", "Rollback without the service lease", msg)
+}
+
+// rollbackLeaseConflict reports that the store came back during an unleased
+// rollback and another process holds the service lease.
+func (e *Engine) rollbackLeaseConflict(service, holder string) {
+	msg := fmt.Sprintf("state store is back and %s holds the rollback lease for %s: two processes may be acting on it; check its targets", holder, service)
+	e.leaseNotice(service, "lease.conflict", "Concurrent rollback suspected", msg)
+}
+
+func (e *Engine) leaseNotice(service, action, title, msg string) {
+	var d *model.Deployment
+	e.mu.Lock()
+	for _, x := range e.deployments {
+		if x.Service == service && !x.State.Terminal() && (d == nil || x.CreatedAt.After(d.CreatedAt)) {
+			d = x
+		}
+	}
+	e.mu.Unlock()
+	en := journal.Entry{Actor: "system", Source: "system", Action: action, Service: service, Reason: msg}
+	if d != nil {
+		en.DeployID = d.ID
+		e.event(d, "safety", msg)
+	} else {
+		e.Log.Warn(msg, "service", service)
+	}
+	e.Audit(en)
+	e.Notify.Send(context.Background(), notify.Message{Level: notify.Warning, Title: fmt.Sprintf("%s: %s", service, title), Text: msg, Deployment: d})
 }
 
 func (e *Engine) setState(d *model.Deployment, s model.State, reason string) {
@@ -703,9 +745,12 @@ func (e *Engine) jobs(svc *config.Service, targets []string) []probe.Job {
 func (e *Engine) collector(d *model.Deployment) *probe.Collector {
 	return &probe.Collector{
 		Runners: e.runners,
-		Sink:    e.Store.Add,
-		Source:  model.SourceCentral,
-		Log:     e.Log,
+		Sink: func(s model.Sample) {
+			e.Store.Add(s)
+			e.Observer.Observe(s)
+		},
+		Source: model.SourceCentral,
+		Log:    e.Log,
 		Data: func(t config.Target) tmpl.Data {
 			if d == nil {
 				return tmpl.ForTarget(t)
@@ -776,6 +821,8 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	controls := svc.Controls(string(phase))
 	e.setState(d, model.StateObserving, fmt.Sprintf("phase %s: observing %v for %s (warmup %s, controls %v)", phase, d.Targets, pc.ObservationWindow, pc.Warmup, controls))
 
+	releaseObserver := e.Observer.Start()
+	defer releaseObserver()
 	collectCtx, stopCollect := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -792,6 +839,9 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 		Name: phase, Cfg: pc, Rules: svc.Rules, Deployed: d.Targets, Controls: controls,
 		Quorum: e.Cfg.Safety.ObserverQuorum,
 	}, e.Store, baseline)
+	if e.Observer.Enabled() {
+		eng.Observer = e.Observer
+	}
 	eng.OnEval = func(ev decision.Evaluation) {
 		e.mu.Lock()
 		e.lastEval[d.ID] = ev

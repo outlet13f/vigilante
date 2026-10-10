@@ -286,6 +286,28 @@ func (c *Config) applyDefaults() {
 	if c.Safety.Flapping.MaxRollbacksPerHour == 0 {
 		c.Safety.Flapping.MaxRollbacksPerHour = 3
 	}
+	if c.Safety.RollbackLease.Wait == 0 {
+		c.Safety.RollbackLease.Wait = 10 * time.Second
+	}
+	if c.Safety.RollbackLease.OnUnavailable == "" {
+		c.Safety.RollbackLease.OnUnavailable = "proceed"
+	}
+	og := &c.Safety.ObserverGuard
+	if og.MaxLag == 0 {
+		og.MaxLag = time.Second
+	}
+	if og.LoopbackTimeout == 0 {
+		og.LoopbackTimeout = time.Second
+	}
+	if og.TimeoutShare == 0 {
+		og.TimeoutShare = 0.5
+	}
+	if og.MinServices == 0 {
+		og.MinServices = 3
+	}
+	if og.Grace == 0 {
+		og.Grace = time.Minute
+	}
 }
 
 func defaultNode(n *Node) {
@@ -726,6 +748,13 @@ func (c *Config) Validate() error {
 		if rb.Approval.Timeout < time.Minute {
 			bad("service %q: rollback.approval.timeout must be at least 1m", s.Name)
 		}
+	}
+
+	if ou := c.Safety.RollbackLease.OnUnavailable; ou != "proceed" && ou != "fail" {
+		bad("safety.rollback_lease.on_unavailable must be proceed|fail, got %q", ou)
+	}
+	if og := c.Safety.ObserverGuard; og.TimeoutShare <= 0 || og.TimeoutShare > 1 || og.MinServices < 1 || og.Grace < 0 {
+		bad("safety.observer_guard: timeout_share must be in (0,1], min_services >= 1, grace >= 0")
 	}
 
 	switch st := c.Server.State; st.Backend {
