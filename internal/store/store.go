@@ -82,22 +82,35 @@ func Open(ctx context.Context, cfg *config.Config) (Store, error) {
 	case "", "file":
 		return OpenFile(cfg.Server.JournalPath)
 	case "postgres":
-		dsn := st.DSN
-		switch {
-		case st.DSNRef != "":
-			v, err := secrets.Resolve(ctx, st.DSNRef)
-			if err != nil {
-				return nil, fmt.Errorf("server.state: %w", err)
-			}
-			dsn = v
-		case st.DSNEnv != "":
-			dsn = os.Getenv(st.DSNEnv)
+		dsn, err := PostgresDSN(ctx, cfg)
+		if err != nil {
+			return nil, err
 		}
-		if dsn == "" {
-			return nil, fmt.Errorf("server.state: postgres DSN is empty (set %s)", st.DSNEnv)
-		}
-		return OpenPostgres(ctx, dsn)
+		return OpenPostgresWith(ctx, dsn, st.AutoMigrate == nil || *st.AutoMigrate)
 	default:
 		return nil, fmt.Errorf("unknown state backend %q", st.Backend)
 	}
+}
+
+// PostgresDSN resolves server.state's connection string.
+func PostgresDSN(ctx context.Context, cfg *config.Config) (string, error) {
+	st := cfg.Server.State
+	if st.Backend != "postgres" {
+		return "", fmt.Errorf("server.state.backend is %q, not postgres: the file store has no schema", st.Backend)
+	}
+	dsn := st.DSN
+	switch {
+	case st.DSNRef != "":
+		v, err := secrets.Resolve(ctx, st.DSNRef)
+		if err != nil {
+			return "", fmt.Errorf("server.state: %w", err)
+		}
+		dsn = v
+	case st.DSNEnv != "":
+		dsn = os.Getenv(st.DSNEnv)
+	}
+	if dsn == "" {
+		return "", fmt.Errorf("server.state: postgres DSN is empty (set %s)", st.DSNEnv)
+	}
+	return dsn, nil
 }

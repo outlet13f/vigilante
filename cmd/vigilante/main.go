@@ -60,6 +60,7 @@ Usage:
   vigilante whoami   --server URL
   vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
                      | query [--actor A] [--action X] [--service S] [--since DATE]
+  vigilante store    status | migrate [--down-to N --yes]   (PostgreSQL state store schema)
   vigilante plugins
   vigilante version
 
@@ -72,6 +73,7 @@ Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=deb
 
 func main() {
 	telemetry.Version, telemetry.Flavor = version, flavor
+	store.BinaryVersion = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -205,6 +207,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdToken(args)
 	case "audit":
 		return cmdAudit(ctx, args)
+	case "store":
+		return cmdStore(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":

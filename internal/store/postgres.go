@@ -7,10 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -38,63 +34,27 @@ type pgStore struct {
 
 // OpenPostgres connects, applies pending migrations and returns the store.
 func OpenPostgres(ctx context.Context, dsn string) (Store, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("postgres dsn: %w", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("postgres: %w", err)
-	}
-	if err := migrate(ctx, pool); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	desc := fmt.Sprintf("postgres://%s:%d/%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database)
-	return &pgStore{pool: pool, desc: desc}, nil
+	return OpenPostgresWith(ctx, dsn, true)
 }
 
-func migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	files, _ := fs.Glob(migrationsFS, "migrations/*.sql")
-	sort.Strings(files)
-	tx, err := pool.Begin(ctx)
+// OpenPostgresWith is OpenPostgres; without autoMigrate it refuses a schema
+// with pending migrations (server.state.auto_migrate: false).
+func OpenPostgresWith(ctx context.Context, dsn string, autoMigrate bool) (Store, error) {
+	pool, err := connect(ctx, dsn)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLock); err != nil {
-		return err
+	ms, err := loadMigrations(migrationsFS)
+	if err == nil {
+		_, err = migrateUp(ctx, pool, ms, autoMigrate)
 	}
-	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS vigilante_schema (
-		version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
-		return err
+	if err != nil {
+		pool.Close()
+		return nil, err
 	}
-	for _, f := range files {
-		base := strings.TrimPrefix(f, "migrations/")
-		v, err := strconv.Atoi(strings.SplitN(base, "_", 2)[0])
-		if err != nil {
-			return fmt.Errorf("migration %s: name must start with a number", base)
-		}
-		var exists bool
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM vigilante_schema WHERE version=$1)", v).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			continue
-		}
-		sql, _ := migrationsFS.ReadFile(f)
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("migration %s: %w", base, err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO vigilante_schema(version) VALUES ($1)", v); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
+	cfg := pool.Config()
+	desc := fmt.Sprintf("postgres://%s:%d/%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database)
+	return &pgStore{pool: pool, desc: desc}, nil
 }
 
 func (p *pgStore) Describe() string { return p.desc }

@@ -205,6 +205,9 @@ type State struct {
 	DSN     string `yaml:"dsn"`     // avoid inline passwords; prefer dsn_env
 	DSNEnv  string `yaml:"dsn_env"`
 	DSNRef  string `yaml:"dsn_ref"` // vault:/env:/file: reference
+	// AutoMigrate applies schema migrations at start (default true). Off:
+	// the server refuses to start until `vigilante store migrate` has run.
+	AutoMigrate *bool `yaml:"auto_migrate"`
 }
 
 // HA runs several `vigilante server` nodes against one postgres state store:
