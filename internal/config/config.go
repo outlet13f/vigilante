@@ -339,6 +339,11 @@ type Connection struct {
 	Bastion    string        `yaml:"bastion"` // name of another target used as jump host
 	Sudo       bool          `yaml:"sudo"`
 	Timeout    time.Duration `yaml:"timeout"`
+	// MaxSessions caps concurrent SSH sessions to this target (default 8,
+	// under sshd's MaxSessions of 10); ReservedSessions of them (default 2)
+	// are kept for rollback steps and traffic changes.
+	MaxSessions      int  `yaml:"max_sessions"`
+	ReservedSessions *int `yaml:"reserved_sessions"`
 }
 
 // Traffic is a traffic control layer (software LB, hardware ADC, cloud LB).

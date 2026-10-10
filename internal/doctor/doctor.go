@@ -608,12 +608,24 @@ func (d *run) capacity(services []*config.Service) []Check {
 		if t.Connection.Type != "ssh" {
 			continue
 		}
-		total := streams[tn] + polls[tn] + 2
+		budget, reserved := t.Connection.MaxSessions, transport.DefaultReservedSessions
+		if budget <= 0 {
+			budget = transport.DefaultMaxSessions
+		}
+		if t.Connection.ReservedSessions != nil {
+			reserved = *t.Connection.ReservedSessions
+		}
+		share := budget - reserved
 		c := Check{Scope: ScopeCapacity, Subject: tn, Name: "SSH 세션 수",
-			Detail: fmt.Sprintf("상시 로그 스트림 %d + 주기 명령 %d + 롤백 여유 2 = %d (OpenSSH 기본 MaxSessions %d)", streams[tn], polls[tn], total, sshMaxSessions)}
-		if total > sshMaxSessions {
-			c.Status, c.Hint = Warn, "sshd_config의 MaxSessions를 늘리거나, 로그가 많은 서버는 에이전트 모드를 쓰십시오. 세션이 모자라면 롤백 명령이 실행되지 못할 수 있습니다"
-		} else {
+			Detail: fmt.Sprintf("상시 로그 스트림 %d + 주기 명령 %d / 수집 몫 %d (세션 한도 %d 중 롤백 예약 %d)", streams[tn], polls[tn], share, budget, reserved)}
+		switch {
+		case streams[tn] >= share:
+			c.Status, c.Hint = Fail, "로그 스트림이 수집 몫을 다 차지해 일부 로그 프로브와 주기 명령이 세션을 얻지 못합니다. 이 서버는 에이전트 모드를 쓰거나, sshd MaxSessions와 함께 connection.max_sessions를 늘리십시오"
+		case streams[tn]+polls[tn] > share:
+			c.Status, c.Hint = Warn, "주기 명령이 세션을 기다리게 되어 수집 간격이 늘어날 수 있습니다(롤백용 예약 세션은 그대로). 에이전트 모드나 더 큰 max_sessions를 고려하십시오"
+		case budget > sshMaxSessions:
+			c.Status, c.Hint = Warn, fmt.Sprintf("max_sessions %d가 OpenSSH 기본 MaxSessions %d보다 큽니다. sshd_config의 MaxSessions도 함께 올리십시오", budget, sshMaxSessions)
+		default:
 			c.Status = OK
 		}
 		out = append(out, c)

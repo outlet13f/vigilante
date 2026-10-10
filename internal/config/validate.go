@@ -392,6 +392,11 @@ func (c *Config) Validate() error {
 		if t.Connection.Bastion != "" && !targets[t.Connection.Bastion] {
 			bad("target %q: unknown bastion %q", t.Name, t.Connection.Bastion)
 		}
+		if cn := t.Connection; cn.MaxSessions < 0 || (cn.ReservedSessions != nil && *cn.ReservedSessions < 0) {
+			bad("target %q: max_sessions and reserved_sessions cannot be negative", t.Name)
+		} else if cn.ReservedSessions != nil && cn.MaxSessions > 0 && *cn.ReservedSessions >= cn.MaxSessions {
+			bad("target %q: reserved_sessions (%d) must be below max_sessions (%d), or collection gets no session", t.Name, *cn.ReservedSessions, cn.MaxSessions)
+		}
 	}
 	checkHosts := func(kind, name string, hosts []string) {
 		if len(hosts) == 0 {

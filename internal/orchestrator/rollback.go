@@ -17,6 +17,7 @@ import (
 	"vigilante/internal/probe"
 	"vigilante/internal/safety"
 	"vigilante/internal/telemetry"
+	"vigilante/internal/transport"
 )
 
 type RollbackOptions struct {
@@ -88,6 +89,7 @@ func (e *Engine) Traffic(service string) (executor.TrafficController, error) {
 // deployment state tells the outcome: ROLLED_BACK, ROLLBACK_FAILED or
 // AWAITING_APPROVAL.
 func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt RollbackOptions) error {
+	ctx = transport.Urgent(ctx) // may use the SSH sessions reserved for rollback
 	if !e.Active() {
 		return ErrInactive
 	}
@@ -200,6 +202,7 @@ func (e *Engine) blocked(ctx context.Context, d *model.Deployment, svc *config.S
 // isolateBreaches drains the targets that breached rules, within the blast
 // radius. It returns the drained targets and a summary for the reason text.
 func (e *Engine) isolateBreaches(ctx context.Context, d *model.Deployment, svc *config.Service) ([]string, string) {
+	ctx = transport.Urgent(ctx)
 	tc, err := e.traffic(svc)
 	if err != nil {
 		return nil, "traffic controller error: " + err.Error()

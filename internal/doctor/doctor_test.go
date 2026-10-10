@@ -152,9 +152,20 @@ func TestDoctorAccessLogFormatMismatch(t *testing.T) {
 
 func TestDoctorWarnsOnSSHSessionBudget(t *testing.T) {
 	cs := runDoctor(t, testConfig(t, 8), "")
-	// 9 log streams + 1 host poll + 2 reserved = 12 > 10
-	if c := find(t, cs, ScopeCapacity, "app-2", "SSH 세션"); c.Status != Warn || !strings.Contains(c.Detail, "= 12") {
+	// 9 log streams hold sessions for good: more than the 6 collection may use (8 - 2 reserved).
+	if c := find(t, cs, ScopeCapacity, "app-2", "SSH 세션"); c.Status != Fail || !strings.Contains(c.Detail, "스트림 9") || !strings.Contains(c.Detail, "수집 몫 6") {
 		t.Errorf("session budget: %+v", c)
+	}
+	// A budget above sshd's default MaxSessions works only if sshd is raised too.
+	cfg := testConfig(t, 0)
+	for i := range cfg.Targets {
+		cfg.Targets[i].Connection.MaxSessions = 12
+	}
+	if c := find(t, runDoctor(t, cfg, ""), ScopeCapacity, "app-2", "SSH 세션"); c.Status != Warn || !strings.Contains(c.Hint, "MaxSessions") {
+		t.Errorf("max_sessions 12: %+v", c)
+	}
+	if c := find(t, runDoctor(t, testConfig(t, 0), ""), ScopeCapacity, "app-2", "SSH 세션"); c.Status != OK {
+		t.Errorf("default budget with few streams: %+v", c)
 	}
 }
 

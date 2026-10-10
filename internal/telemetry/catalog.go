@@ -24,6 +24,7 @@ var (
 	SSHConnections = NewGauge("vigilante_ssh_connections", "Pooled SSH connections.")
 	SSHSessions    = NewGauge("vigilante_ssh_sessions", "Open SSH sessions (commands and streams).")
 	SSHDials       = NewCounter("vigilante_ssh_dials_total", "SSH connection attempts.", "result")
+	SSHWaits       = NewCounter("vigilante_ssh_session_waits_total", "Commands that waited for a free SSH session on their target, by priority (normal, urgent).", "priority")
 
 	APIRequests = NewCounter("vigilante_api_requests_total", "API requests by route and status code.", "method", "route", "code")
 	APILatency  = NewHistogram("vigilante_api_request_seconds", "API request latency (excluding long-poll waits is up to the client).",
