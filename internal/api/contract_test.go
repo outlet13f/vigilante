@@ -418,3 +418,53 @@ func TestV2RoutesMatchSpec(t *testing.T) {
 		t.Fatalf("only %d v2 operations found in the spec", len(inSpec))
 	}
 }
+
+func TestV2ApproveModeDecisions(t *testing.T) {
+	s, base := newV2Server(t, "")
+	sv, _ := s.E.Cfg.Service("svc")
+	sv.Rollback.Mode = "approve"
+	c := &v2Client{t: t, base: base, token: "tok"}
+	c.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+
+	fail := func(id string) {
+		t.Helper()
+		c.do("POST", "/v2/deployments", `{"id":"`+id+`","service":"svc","version":"v2"}`, nil)
+		r := c.do("POST", "/v2/deployments/"+id+"/observations", `{"phase":"canary"}`, nil)
+		done := waitOp(t, c, r.JSON["id"].(string))
+		if res := done.JSON["result"].(map[string]any); res["state"] != "AWAITING_APPROVAL" || res["exit_code"].(float64) != 3 {
+			t.Fatalf("approve mode must wait: %s", done.Body)
+		}
+	}
+
+	fail("am1")
+	d := c.do("GET", "/v2/deployments/am1", "", nil)
+	pr, ok := d.JSON["pending_rollback"].(map[string]any)
+	if !ok || pr["targets"].([]any)[0] != "a" || pr["expires_at"] == nil {
+		t.Fatalf("pending rollback: %s", d.Body)
+	}
+	wantProblem(t, c.do("POST", "/v2/deployments/am1/approvals", `{"decision":"maybe"}`, nil), 422, "validation_failed")
+	r := c.do("POST", "/v2/deployments/am1/approvals", `{"decision":"reject","comment":"false positive"}`, nil)
+	if r.StatusCode != 202 || r.JSON["kind"] != "approval" {
+		t.Fatalf("reject: %d %s", r.StatusCode, r.Body)
+	}
+	if done := waitOp(t, c, r.JSON["id"].(string)); done.JSON["result"].(map[string]any)["state"] != "HELD" {
+		t.Fatalf("after reject: %s", done.Body)
+	}
+	if d := c.do("GET", "/v2/deployments/am1", "", nil); d.JSON["pending_rollback"] != nil || !strings.Contains(d.JSON["reason"].(string), "false positive") {
+		t.Fatalf("held deployment: %s", d.Body)
+	}
+	wantProblem(t, c.do("POST", "/v2/deployments/am1/approvals", `{}`, nil), 409, "conflict")
+
+	fail("am2")
+	r = c.do("POST", "/v2/deployments/am2/approvals", `{"comment":"go"}`, nil)
+	if done := waitOp(t, c, r.JSON["id"].(string)); done.JSON["result"].(map[string]any)["state"] != "ROLLED_BACK" {
+		t.Fatalf("after approve: %s", done.Body)
+	}
+	if d := c.do("GET", "/v2/deployments/am2", "", nil); d.JSON["approved_by"] != "token:legacy" {
+		t.Fatalf("approver not recorded: %s", d.Body)
+	}
+	r = c.do("GET", "/v2/audit-events?action=rollback.reject", "", nil)
+	if items := r.JSON["items"].([]any); len(items) != 1 || items[0].(map[string]any)["reason"] != "false positive" {
+		t.Fatalf("audit: %s", r.Body)
+	}
+}

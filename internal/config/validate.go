@@ -210,6 +210,12 @@ func (c *Config) applyDefaults() {
 		if r.Scope == "" {
 			r.Scope = "deployed"
 		}
+		if r.Approval.Timeout == 0 {
+			r.Approval.Timeout = 30 * time.Minute
+		}
+		if r.Approval.OnTimeout == "" {
+			r.Approval.OnTimeout = "hold"
+		}
 		if r.Parallelism == 0 {
 			r.Parallelism = 1
 		}
@@ -635,6 +641,20 @@ func (c *Config) Validate() error {
 				bad("service %q: rollback.escalation[%d] unknown executor %q", s.Name, i, e.Executor)
 			}
 		}
+		switch rb.Mode {
+		case "", "auto", "approve":
+		default:
+			bad("service %q: rollback.mode must be auto or approve", s.Name)
+		}
+		if rb.Approval.OnTimeout != "hold" && rb.Approval.OnTimeout != "rollback" {
+			bad("service %q: rollback.approval.on_timeout must be hold or rollback", s.Name)
+		}
+		if rb.Approval.DrainFirst && rb.Traffic == "" {
+			bad("service %q: rollback.approval.drain_first needs rollback.traffic", s.Name)
+		}
+		if rb.Approval.Timeout < time.Minute {
+			bad("service %q: rollback.approval.timeout must be at least 1m", s.Name)
+		}
 	}
 
 	switch st := c.Server.State; st.Backend {
@@ -916,4 +936,17 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 			bad("secrets.vault.auth must be token, approle or kubernetes")
 		}
 	}
+}
+
+// Warnings are findings that do not stop the config from loading but that
+// an operator should act on (printed by validate and doctor).
+func (c *Config) Warnings() []string {
+	var out []string
+	for _, s := range c.Services {
+		if s.Rollback.Mode == "" {
+			out = append(out, fmt.Sprintf("service %q: rollback.mode is not set, so a failing phase rolls back automatically (auto). "+
+				"Set mode: approve to have a person approve each rollback (recommended until the service has passed the pilot), or mode: auto to keep the current behaviour explicitly", s.Name))
+		}
+	}
+	return out
 }

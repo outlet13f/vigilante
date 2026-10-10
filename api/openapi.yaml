@@ -239,11 +239,20 @@ paths:
       tags: [deployments]
       operationId: approveEscalation
       security: [{bearerAuth: []}, {oauth2: [approvals:write]}]
-      summary: Approve a gated escalation
+      summary: Approve or reject a waiting rollback
       description: |
-        Allowed only while the deployment is `AWAITING_APPROVAL`. With four-eyes
-        enabled the approver must differ from whoever created the deployment or
-        requested its rollback.
+        Allowed only while the deployment is `AWAITING_APPROVAL`, which happens
+        in two cases:
+
+        * a phase failed for a service with `rollback.mode: approve`; the
+          prepared rollback (`pending_rollback`) runs when approved, and a
+          rejection keeps the new version, puts drained targets back into
+          traffic and holds the deployment;
+        * an escalation step marked `require_approval` (such as a VM snapshot
+          restore) is next; it can only be approved.
+
+        With four-eyes enabled the decider must differ from whoever created the
+        deployment or requested its rollback.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
         - {$ref: '#/components/parameters/IfMatch'}
@@ -1422,6 +1431,18 @@ components:
         created_by: {type: string}
         rollback_requested_by: {type: string}
         approved_by: {type: string}
+        pending_rollback:
+          type: object
+          description: The rollback prepared for a failed phase, waiting for a decision (approve mode).
+          required: [reason, targets, requested_at, expires_at]
+          properties:
+            reason: {type: string}
+            targets: {type: array, items: {type: string}}
+            drained: {type: array, items: {type: string}, description: 'Taken out of traffic while waiting (drain_first).'}
+            requested_at: {type: string, format: date-time}
+            expires_at: {type: string, format: date-time}
+            detected_at: {type: string, format: date-time}
+            escalated: {type: boolean, description: 'The timeout passed and operators were alerted again.'}
         last_evaluation: {$ref: '#/components/schemas/Evaluation'}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
@@ -1475,6 +1496,11 @@ components:
       type: object
       additionalProperties: false
       properties:
+        decision:
+          type: string
+          enum: [approve, reject]
+          default: approve
+          description: '`reject` applies only to a prepared rollback (approve mode).'
         comment: {type: string, maxLength: 1000}
 
     OperationStatus:

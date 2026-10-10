@@ -641,9 +641,17 @@ func (s *Server) v2Approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Comment string `json:"comment"`
+		Decision string `json:"decision"`
+		Comment  string `json:"comment"`
 	}
 	if !s.decodeStrict(w, r, &req, true) {
+		return
+	}
+	if req.Decision == "" {
+		req.Decision = "approve"
+	}
+	if req.Decision != "approve" && req.Decision != "reject" {
+		s.problem(w, r, 422, "validation_failed", "decision must be approve or reject", fieldError{"decision", "approve or reject"})
 		return
 	}
 	if d.State != model.StateAwaitApproval {
@@ -651,17 +659,39 @@ func (s *Server) v2Approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.E.Cfg.Auth.FourEyes && (p.ID == d.CreatedBy || p.ID == d.RollbackRequestedBy) {
-		err := fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must approve", p.ID)
+		err := fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must decide", p.ID)
 		s.denied(r, d.Service, err)
 		s.problem(w, r, http.StatusForbidden, "forbidden", err.Error())
 		return
 	}
+	_, pending := s.E.PendingRollback(d.ID)
+	if !pending && req.Decision == "reject" {
+		s.problem(w, r, http.StatusConflict, "conflict", "this deployment waits for an escalation step (e.g. a snapshot restore), which can only be approved; stop it with abort or roll back manually")
+		return
+	}
 	op := s.E.StartOperation(model.OpApproval, d.Service, d, "", p.ID)
-	s.audit(r, "escalation.approve", d.Service, d.ID, req.Comment)
-	s.background(func() {
-		s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
-	})
+	if pending {
+		approve := req.Decision == "approve"
+		s.audit(r, "rollback."+req.Decision, d.Service, d.ID, req.Comment)
+		s.background(func() { s.runDecisionOp(op, d, p.ID, approve, req.Comment) })
+	} else {
+		s.audit(r, "escalation.approve", d.Service, d.ID, req.Comment)
+		s.background(func() {
+			s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
+		})
+	}
 	s.accepted(w, op)
+}
+
+// runDecisionOp applies an approve-mode decision and records the outcome.
+func (s *Server) runDecisionOp(op *model.Operation, d *model.Deployment, actor string, approve bool, comment string) {
+	err := s.E.DecideRollback(s.ctx, d, actor, approve, comment)
+	cp, _ := s.E.Deployment(d.ID)
+	if err != nil && !rollbackOutcome(cp) {
+		s.E.FinishOperation(op.ID, model.OpFailed, model.ResultOf(cp), err.Error())
+		return
+	}
+	s.E.FinishOperation(op.ID, model.OpCompleted, model.ResultOf(cp), "")
 }
 
 func (s *Server) v2Abort(w http.ResponseWriter, r *http.Request) {

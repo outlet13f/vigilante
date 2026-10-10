@@ -657,6 +657,10 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 		e.Notify.Send(ctx, notify.Message{Level: notify.Warning, Title: fmt.Sprintf("%s %s HELD — human decision needed", d.Service, phase), Text: out.Reason, Deployment: d})
 	case model.VerdictFail:
 		e.event(d, "verdict", "FAIL: "+out.Reason)
+		if svc.Rollback.RollbackMode() == "approve" {
+			e.requestApproval(context.WithoutCancel(ctx), d, svc, out.Reason, out.EndedAt)
+			return nil
+		}
 		e.Rollback(context.WithoutCancel(ctx), d, RollbackOptions{Reason: out.Reason, DetectedAt: out.EndedAt})
 	}
 	return nil

@@ -272,3 +272,40 @@ services:
 		t.Fatalf("octavia defaults: %+v", oc)
 	}
 }
+
+func TestRollbackModeValidationAndWarning(t *testing.T) {
+	svc := func(rb string) string {
+		return `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x` + rb + `}
+`
+	}
+	for rb, want := range map[string]string{
+		", mode: manual": "rollback.mode must be auto or approve",
+		", mode: approve, approval: {on_timeout: x}":     "on_timeout must be hold or rollback",
+		", mode: approve, approval: {drain_first: true}": "drain_first needs rollback.traffic",
+		", mode: approve, approval: {timeout: 10s}":      "at least 1m",
+	} {
+		if _, err := Parse([]byte(svc(rb))); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", rb, err, want)
+		}
+	}
+	c, err := Parse([]byte(svc("")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := c.Warnings(); len(w) != 1 || !strings.Contains(w[0], "rollback.mode is not set") || c.Services[0].Rollback.RollbackMode() != "auto" {
+		t.Fatalf("unset mode: %v", w)
+	}
+	c, _ = Parse([]byte(svc(", mode: approve")))
+	if len(c.Warnings()) != 0 || c.Services[0].Rollback.Approval.Timeout != 30*time.Minute || c.Services[0].Rollback.Approval.OnTimeout != "hold" {
+		t.Fatalf("approve defaults: %+v %v", c.Services[0].Rollback.Approval, c.Warnings())
+	}
+}

@@ -186,9 +186,15 @@ func (b *Bus) Observe(en journal.Entry) {
 			b.publishLocked(typ, "circuit", "", map[string]any{"state": c.State, "reason": c.Reason})
 		}
 	case journal.KindAudit:
-		if en.Action == "escalation.approve" {
+		decision := map[string]string{"escalation.approve": "approved", "rollback.approve": "approved", "rollback.reject": "rejected"}[en.Action]
+		if decision != "" {
+			kind := "rollback"
+			if en.Action == "escalation.approve" {
+				kind = "escalation"
+			}
 			b.publishLocked(model.EvApprovalDecided, en.DeployID, en.Service,
-				map[string]any{"deployment_id": en.DeployID, "service": en.Service, "approved_by": en.Actor, "comment": en.Reason})
+				map[string]any{"deployment_id": en.DeployID, "service": en.Service, "kind": kind, "decision": decision,
+					"decided_by": en.Actor, "comment": en.Reason})
 		}
 	}
 }

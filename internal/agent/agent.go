@@ -217,7 +217,7 @@ func (a *Agent) failsafe(ctx context.Context) {
 	a.failed = true
 	a.mu.Unlock()
 	reason := fmt.Sprintf("orchestrator unreachable for %s and local rules fired: %s", since.Round(time.Second), strings.Join(fired, "; "))
-	if a.Cfg.Agent.Failsafe != "rollback" {
+	if a.Cfg.Agent.Failsafe != "rollback" || svc.Rollback.RollbackMode() == "approve" { // approve mode: a person decides, never the agent alone
 		a.Log.Error("FAILSAFE HOLD (no action taken; agent.failsafe=hold)", "deployment", active.ID, "reason", reason)
 		return
 	}

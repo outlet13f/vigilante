@@ -45,6 +45,7 @@ services:
     phases:
       canary: {observation_window: 20s, warmup: 3s, eval_interval: 1s, min_samples: 20}
     rollback:
+      mode: auto            # the demo shows automatic rollback
       executor: deploy-api
       step_timeout: 10s
       retry: {attempts: 2, backoff: 500ms}

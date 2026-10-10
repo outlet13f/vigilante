@@ -173,6 +173,9 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 			return 1, err
 		}
 		fmt.Printf("OK: %d targets, %d services, %d executors, %d traffic controllers\n", len(cfg.Targets), len(cfg.Services), len(cfg.Executors), len(cfg.Traffic))
+		for _, w := range cfg.Warnings() {
+			fmt.Println("WARN: " + w)
+		}
 		for _, s := range cfg.Services {
 			if s.Preset != "" {
 				fmt.Printf("  %s: preset %s -> %d probes, %d rules\n", s.Name, s.Preset, len(s.Probes), len(s.Rules))
@@ -366,7 +369,8 @@ func watchRemote(ctx context.Context, c *common, phase string) (int, error) {
 func cmdRollback(ctx context.Context, args []string) (int, error) {
 	c := newFlags("rollback")
 	exec := c.fs.String("executor", "", "override the rollback executor")
-	approve := c.fs.Bool("approve", false, "allow escalation steps that require approval")
+	approve := c.fs.Bool("approve", false, "approve the rollback waiting for approval (approve mode), or allow escalation steps that require approval")
+	reject := c.fs.Bool("reject", false, "reject the rollback waiting for approval: the deployment is held on the new version")
 	reason := c.fs.String("reason", "manual rollback (CLI)", "reason recorded in the journal")
 	targets := c.fs.String("targets", "", "comma-separated targets (default: deployment targets)")
 	if err := c.fs.Parse(args); err != nil {
@@ -393,6 +397,20 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 		}
 		e.SetCreatedBy(d, cliActor())
 		annotate(e, d, notes)
+	}
+	if _, pending := e.PendingRollback(d.ID); pending && (*approve || *reject) {
+		if *approve && *reject {
+			return 1, errors.New("--approve and --reject are exclusive")
+		}
+		action := map[bool]string{true: "rollback.approve", false: "rollback.reject"}[*approve]
+		cliAudit(e, c, action, d.Service, d.ID, *reason)
+		_ = e.DecideRollback(ctx, d, cliActor(), *approve, *reason)
+		cp, _ := e.Deployment(d.ID)
+		printJSON(cp)
+		return model.ExitCode(cp), nil
+	}
+	if *reject {
+		return 1, fmt.Errorf("deployment %s has no rollback waiting for approval", d.ID)
 	}
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err

@@ -552,6 +552,31 @@ type Rollback struct {
 	Retry       Retry         `yaml:"retry"`
 	Plan        []Step        `yaml:"plan"`
 	Escalation  []Escalation  `yaml:"escalation"`
+	// Mode: auto rolls back as soon as a phase fails; approve prepares the
+	// rollback and waits for a human (console, chat, API, CLI). Unset means
+	// auto for compatibility, and validate warns.
+	Mode     string   `yaml:"mode"`
+	Approval Approval `yaml:"approval"`
+}
+
+// RollbackMode returns the effective mode (auto when unset).
+func (r Rollback) RollbackMode() string {
+	if r.Mode == "" {
+		return "auto"
+	}
+	return r.Mode
+}
+
+// Approval governs rollbacks in approve mode.
+type Approval struct {
+	// Timeout is how long a rollback waits for a decision (default 30m).
+	Timeout time.Duration `yaml:"timeout"`
+	// OnTimeout: hold (default; keep waiting for a human, alert again) or
+	// rollback (roll back automatically, through the circuit breaker).
+	OnTimeout string `yaml:"on_timeout"`
+	// DrainFirst takes the failing targets out of traffic while the
+	// decision is pending (needs rollback.traffic and is blast-radius checked).
+	DrainFirst bool `yaml:"drain_first"`
 }
 
 type Retry struct {

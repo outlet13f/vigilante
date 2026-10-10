@@ -342,6 +342,7 @@ services:
         rules: [fatal-errors, latency-regression, db-pool]
         on_inconclusive: pass
     rollback:
+      mode: auto                 # roll back as soon as a phase fails
       executor: order-symlink
       traffic: nginx-edge
       scope: deployed
@@ -407,6 +408,7 @@ services:
       canary: {targets: [pay-vm-01], observation_window: 5m, warmup: 20s}
       full: {observation_window: 10m, warmup: 20s}
     rollback:
+      mode: auto
       executor: pay-container
       traffic: haproxy-pay
       plan:
@@ -439,6 +441,7 @@ services:
       canary: {targets: [web-ec2-a], observation_window: 5m, warmup: 15s}
       full: {observation_window: 10m}
     rollback:
+      mode: auto
       executor: web-console
       traffic: alb-web
       escalation:
@@ -456,6 +459,9 @@ services:
       access_log: /var/log/billing/access.log
       app_log: /var/log/billing/application.log
     rollback:
+      # A person approves each rollback until the service has passed the pilot.
+      mode: approve
+      approval: {timeout: 30m, on_timeout: hold, drain_first: true}
       executor: billing-os-snap
       traffic: billing-lb
 

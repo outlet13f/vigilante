@@ -126,7 +126,22 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 	}
 	s.Auth = a
 	s.bus = s.newBus()
+	s.background(s.sweepApprovals)
 	return s, nil
+}
+
+// sweepApprovals applies approval timeouts while this node is the leader.
+func (s *Server) sweepApprovals() {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-t.C:
+			s.E.ExpireApprovals(s.ctx, now)
+		}
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -613,6 +628,12 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.E.Cfg.Auth.FourEyes && (p.ID == d.CreatedBy || p.ID == d.RollbackRequestedBy) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must approve", p.ID))
+		return
+	}
+	if _, pending := s.E.PendingRollback(d.ID); pending {
+		s.audit(r, "rollback.approve", d.Service, d.ID, "")
+		s.background(func() { _ = s.E.DecideRollback(s.ctx, d, p.ID, true, "") })
+		writeJSON(w, 202, map[string]string{"status": "approved; rollback running"})
 		return
 	}
 	s.audit(r, "escalation.approve", d.Service, d.ID, "")

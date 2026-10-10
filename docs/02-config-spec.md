@@ -270,6 +270,8 @@ phases:
 
 ```yaml
 rollback:
+  mode: approve                    # auto | approve. 생략하면 auto(기존 동작)이고 validate가 경고
+  approval: {timeout: 30m, on_timeout: hold, drain_first: true}
   executor: order-symlink          # 1차 전략
   traffic: nginx-edge              # 선택: 트래픽 제어기
   scope: deployed                  # deployed(이번 단계까지 배포된 전 대상) | failed(위반 대상만)
@@ -294,6 +296,23 @@ rollback:
 | `probe.verify` | 지정 프로브의 `Check()`가 연속 `successes`회 성공해야 통과 (**헬스 확인**) |
 | `traffic.enable` | 풀 복귀. 앞 단계가 실패하면 실행되지 않음 → 대상은 **격리 상태 유지** |
 | `wait` | `duration` 대기 |
+
+### 롤백 모드 (`mode`)
+
+| 모드 | 단계가 FAIL이면 |
+|---|---|
+| `auto` | 즉시 롤백 플랜을 실행합니다. 생략하면 이 모드이며, `vigilante validate`가 명시하라고 경고합니다 |
+| `approve` | 롤백 대상·이유·만료 시각을 담은 계획(`pending_rollback`)을 만들고 `AWAITING_APPROVAL`(CI 종료 코드 3)로 멈춥니다. 콘솔, API(`POST /v2/deployments/{id}/approvals`), CLI(`vigilante rollback --id ID --approve` 또는 `--reject`)로 결정합니다 |
+
+`approve` 모드의 세부 동작:
+
+- **승인:** 준비한 계획대로 롤백합니다. 사람의 결정이므로 서킷브레이커와 플래핑 제한을 거치지 않습니다(수동 롤백과 같음). 승인자는 `approved_by`에 남습니다.
+- **거절:** 새 버전을 유지하고, `drain_first`로 빼 둔 대상을 다시 트래픽에 넣은 뒤 `HELD`로 둡니다. 오탐을 판정에서 걸러 내는 경로입니다.
+- **`drain_first: true`:** 결정을 기다리는 동안 위반한 대상을 트래픽에서 뺍니다(blast radius 적용). `rollback.traffic`이 필요합니다.
+- **`timeout`(기본 30m)과 `on_timeout`:** `hold`(기본)면 계속 기다리며 운영자에게 한 번 더 상위 호출하고, 그 뒤에도 승인할 수 있습니다. `rollback`이면 자동 롤백으로 넘어가며 이때는 서킷브레이커·플래핑 제한이 적용됩니다. 만료 처리는 서버(리더)가 15초마다 합니다. CI 단발 실행만 쓰는 경우에는 만료 처리가 없습니다.
+- **4-eyes(`auth.four_eyes`):** 배포를 만든 사람이나 롤백을 요청한 사람은 승인·거절할 수 없습니다.
+- **에이전트 failsafe:** `approve` 모드 서비스에서는 `agent.failsafe: rollback`이어도 에이전트가 혼자 롤백하지 않고 보류합니다.
+- 이벤트: `vigilante.approval.requested`(계획 생성), `vigilante.approval.decided`(`decision: approved|rejected`). 지표: `vigilante_rollback_approvals_total{decision}`.
 
 ## `executors.<name>` — 롤백 전략
 

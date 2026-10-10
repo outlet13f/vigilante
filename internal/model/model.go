@@ -99,12 +99,15 @@ type Deployment struct {
 	Checkpoints     map[string]map[string]string `json:"checkpoints,omitempty"` // target -> executor checkpoint
 	Breaches        []Breach                     `json:"breaches,omitempty"`
 	// Who acted (auth principal IDs such as user:alice or sa:ci-order).
-	CreatedBy           string    `json:"created_by,omitempty"`
-	RollbackRequestedBy string    `json:"rollback_requested_by,omitempty"`
-	ApprovedBy          string    `json:"approved_by,omitempty"`
-	Events              []Event   `json:"events,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	CreatedBy           string `json:"created_by,omitempty"`
+	RollbackRequestedBy string `json:"rollback_requested_by,omitempty"`
+	ApprovedBy          string `json:"approved_by,omitempty"`
+	// PendingRollback is the rollback prepared for a failed phase of a
+	// service in approve mode, waiting for a decision.
+	PendingRollback *PendingRollback `json:"pending_rollback,omitempty"`
+	Events          []Event          `json:"events,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.
@@ -130,4 +133,16 @@ func ExitCode(d *Deployment) int {
 		return 4
 	}
 	return 1
+}
+
+// PendingRollback is a rollback waiting for human approval.
+type PendingRollback struct {
+	Reason      string    `json:"reason"`
+	Targets     []string  `json:"targets"`
+	Drained     []string  `json:"drained,omitempty"` // isolated while waiting (drain_first)
+	RequestedAt time.Time `json:"requested_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	DetectedAt  time.Time `json:"detected_at"`
+	// Escalated is set once the timeout alert went out (on_timeout: hold).
+	Escalated bool `json:"escalated,omitempty"`
 }
