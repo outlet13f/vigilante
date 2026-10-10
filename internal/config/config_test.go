@@ -368,3 +368,31 @@ services:
 		t.Fatalf("defaults: %+v", sn)
 	}
 }
+
+func TestRemoteGrepHasNoLineCount(t *testing.T) {
+	cfg := func(rule string) string {
+		return `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: app, type: log, log: {path: /var/log/app.log, patterns: {fatal: FATAL}, remote_grep: "FATAL"}}]
+    rules: [{name: r, when: ` + rule + `}]
+    rollback: {executor: x, mode: auto}
+`
+	}
+	if _, err := Parse([]byte(cfg(`{metric: app.match.fatal, agg: sum, op: ">", value: 0}`))); err != nil {
+		t.Fatalf("match metric with remote_grep: %v", err)
+	}
+	for _, rule := range []string{
+		`{metric: app.lines, agg: rate, op: "<", value: 1}`,
+		`{any: [{metric: app.match.fatal, op: ">", value: 0}, {not: {metric: app.lines, op: ">", value: 0}}]}`,
+		`{metric: app.match.fatal, ratio_of: app.lines, op: ">", value: 5}`,
+	} {
+		if _, err := Parse([]byte(cfg(rule))); err == nil || !strings.Contains(err.Error(), "app.lines is not available") {
+			t.Errorf("%s: %v", rule, err)
+		}
+	}
+}

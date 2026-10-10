@@ -28,6 +28,17 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
 - `vigilante lab run|summary`: the real-equipment scenario (checkpoint, bad
   deployment, detection, drain, restore, back in traffic) with results for
   the compatibility matrix.
+- SSH session budget per target (`connection.max_sessions`,
+  `reserved_sessions`): rollback always finds a free session.
+- `connection.sudo_scope: changes` (sudo only for changing commands),
+  `vigilante sudoers` and doctor checks of each rule.
+- `log.remote_grep`: filter busy logs on the target before they cross SSH.
+
+### Changed
+- DB probe: every interval runs the query on one kept connection; the
+  full pool check (pool_size new connections at once) runs every
+  `pool_check_interval` (default 1m), so `pool_acquired` samples arrive once
+  a minute. `pool_check_interval: 0s` restores the previous behaviour.
 
 ### Fixed
 - Windows: local commands with quoted arguments reached the program with

@@ -28,15 +28,27 @@ func init() {
 // follow streams new lines appended to path. Locally (agent mode or local
 // targets) it follows the file in-process and survives logrotate (inode change
 // or truncation); remotely it runs `tail -n0 -F` over the SSH session.
-func follow(ctx context.Context, env Env, path string, onLine func(string)) error {
+//
+// grep (log.remote_grep) filters on the target, so only lines that can
+// match cross the network; a local file is read in-process anyway.
+func follow(ctx context.Context, env Env, path, grep string, onLine func(string)) error {
 	switch r := env.Runner.(type) {
 	case nil:
 		return errors.New("log probes need an ssh or local connection")
 	case *transport.Local:
 		return followLocal(ctx, path, onLine)
 	default:
-		return r.Stream(ctx, "tail -n0 -F "+transport.ShellQuote(path)+" 2>/dev/null", onLine)
+		return r.Stream(ctx, RemoteFollowCmd(path, grep), onLine)
 	}
+}
+
+// RemoteFollowCmd is the command a log probe streams over SSH.
+func RemoteFollowCmd(path, grep string) string {
+	cmd := "tail -n0 -F " + transport.ShellQuote(path) + " 2>/dev/null"
+	if grep != "" {
+		cmd += " | grep --line-buffered -E " + transport.ShellQuote(grep)
+	}
+	return cmd
 }
 
 func followLocal(ctx context.Context, path string, onLine func(string)) error {
@@ -166,9 +178,9 @@ func (b *bucketer) flush(emit Emit, zeroKeys []string) map[string]float64 {
 	return counts
 }
 
-func runBucketed(ctx context.Context, env Env, path string, b *bucketer, onLine func(string), onFlush func()) error {
+func runBucketed(ctx context.Context, env Env, path, grep string, b *bucketer, onLine func(string), onFlush func()) error {
 	errc := make(chan error, 1)
-	go func() { errc <- follow(ctx, env, path, onLine) }()
+	go func() { errc <- follow(ctx, env, path, grep, onLine) }()
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
@@ -215,9 +227,15 @@ func newLog(spec config.Probe, env Env) (Probe, error) {
 
 func (p *logProbe) Run(ctx context.Context, emit Emit) error {
 	b := newBucketer()
-	zero := append([]string{"lines"}, p.names...)
-	return runBucketed(ctx, p.env, p.path, b, func(line string) {
-		b.inc("lines", 1)
+	grep := p.spec.Log.RemoteGrep
+	zero := p.names
+	if grep == "" { // with remote_grep only matching lines arrive: no line count
+		zero = append([]string{"lines"}, p.names...)
+	}
+	return runBucketed(ctx, p.env, p.path, grep, b, func(line string) {
+		if grep == "" {
+			b.inc("lines", 1)
+		}
 		for name, re := range p.patterns {
 			if re.MatchString(line) {
 				b.inc("match."+name, 1)
@@ -297,7 +315,7 @@ func toFloat(v any) (float64, bool) {
 
 func (p *accessLogProbe) Run(ctx context.Context, emit Emit) error {
 	b := newBucketer()
-	return runBucketed(ctx, p.env, p.path, b, func(line string) {
+	return runBucketed(ctx, p.env, p.path, "", b, func(line string) { // every line counts for the 5xx ratio
 		status, lat, ok := parseAccessLine(p.spec.AccessLog, line)
 		if !ok {
 			b.inc("unparsed", 1)

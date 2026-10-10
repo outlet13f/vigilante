@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"vigilante/internal/config"
 	"vigilante/internal/secrets"
@@ -127,7 +128,14 @@ func TestDoctorFindsRealProblems(t *testing.T) {
 	if c := find(t, cs, ScopeTraffic, "edge", "풀에 있는지"); c.Status != Fail || !strings.Contains(c.Detail, "app-2(10.0.0.2:8080)") {
 		t.Errorf("app-2 missing from the nginx upstream must fail: %+v", c)
 	}
-	if c := find(t, cs, ScopeCapacity, "order", "DB 프로브"); c.Status != Warn {
+	// The full pool check runs once a minute by default: 5 x 2 / 60s is light.
+	if c := find(t, cs, ScopeCapacity, "order", "DB 프로브"); c.Status != OK || !strings.Contains(c.Detail, "0.2") {
+		t.Errorf("default pool check interval: %+v", c)
+	}
+	full := time.Duration(0) // a full check on every 1s interval
+	cfgFull := testConfig(t, 0)
+	cfgFull.Services[0].Probes[2].DB.PoolCheckInterval = &full
+	if c := find(t, runDoctor(t, cfgFull, "v1"), ScopeCapacity, "order", "DB 프로브"); c.Status != Warn {
 		t.Errorf("5 new connections/s x 2 targets must warn: %+v", c)
 	}
 	// Scopes come out in report order.

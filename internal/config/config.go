@@ -571,6 +571,10 @@ type DockerProbe struct {
 type LogProbe struct {
 	Path     string            `yaml:"path"`     // template
 	Patterns map[string]string `yaml:"patterns"` // name -> regex
+	// RemoteGrep (grep -E) filters lines on the target before they cross
+	// SSH: for busy logs where only a few lines matter. The patterns still
+	// apply to what arrives; the lines metric is not available.
+	RemoteGrep string `yaml:"remote_grep"`
 }
 
 type AccessLogProbe struct {
@@ -590,6 +594,10 @@ type DBProbe struct {
 	DSNRef   string `yaml:"dsn_ref"` // vault:/env:/file: reference
 	PoolSize int    `yaml:"pool_size"`
 	Query    string `yaml:"query"`
+	// PoolCheckInterval: how often the full-pool check opens pool_size new
+	// connections (default 1m). Every interval in between runs the query on
+	// one reused connection. 0s keeps the full check on every interval.
+	PoolCheckInterval *time.Duration `yaml:"pool_check_interval"`
 }
 
 type Baseline struct {

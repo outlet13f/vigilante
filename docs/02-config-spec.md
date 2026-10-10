@@ -189,9 +189,9 @@ credentials:
 | `tcp` | `address` | `up`, `latency_ms`(connect), `consecutive_*` | |
 | `host` | `devices[]`(생략 시 sd*/vd*/xvd*/nvme*/dm-*) | `load1`, `load_per_cpu`, `cpu_busy_pct`, `mem_available_pct`, `mem_available_mb`, `disk_util_pct`(최대 장치), `cpu_count`, `up` | `/proc` 1회 왕복. Linux 전용 |
 | `docker` | `container`, `socket`(기본 `/var/run/docker.sock`) 또는 `host` | `running`, `restart_count`, `restarts`(관측 시작 후 증가분), `oom_killed`, `health_ok`, 이벤트: `oom_events`, `die_events`, `restart_events` | SSH 터널로 원격 소켓 접근. Podman 호환 소켓 지원 |
-| `log` | `path`, `patterns{name: regex}` | 초당: `lines`, `match.<name>` | 원격 `tail -n0 -F`, 로컬은 로테이션(inode/truncate) 감지 |
+| `log` | `path`, `patterns{name: regex}`, `remote_grep`(선택, `grep -E` 식) | 초당: `lines`, `match.<name>` | 원격 `tail -n0 -F`, 로컬은 로테이션(inode/truncate) 감지. `remote_grep`이 있으면 대상에서 `grep --line-buffered -E`로 먼저 걸러 맞는 줄만 SSH로 보냄(대용량 로그). 이때 `lines`는 없으며 이를 쓰는 규칙은 `validate`가 거부. 대상 grep이 식과 `--line-buffered`를 받는지 `doctor`가 확인 |
 | `access_log` | `path`, `format`(combined\|json), `status_field`, `latency_field`, `latency_unit`(s\|ms) | 초당: `requests`, `count_5xx`, `count_4xx`, `error_rate_5xx`(%), 요청별 `latency_ms`(초당 256개 샘플링), `unparsed` | combined 뒤의 `$request_time` 자동 인식 |
-| `db` | `driver`(postgres\|mysql), `dsn` 또는 `dsn_env`, `pool_size`(기본 3), `query`(기본 `SELECT 1`) | `up`, `pool_acquired`, `pool_acquire_ms`, `query_ms`, `consecutive_*` | `pool_size`개 커넥션을 **동시에** 확보 → 풀 고갈/`max_connections` 문제 검출 |
+| `db` | `driver`(postgres\|mysql), `dsn` 또는 `dsn_env`, `pool_size`(기본 3), `query`(기본 `SELECT 1`), `pool_check_interval`(기본 `1m`) | `up`, `query_ms`, `pool_acquired`·`pool_acquire_ms`(전체 점검 때), `consecutive_*` | 매 주기는 열어 둔 커넥션 1개로 쿼리. `pool_check_interval`마다 `pool_size`개 새 커넥션을 **동시에** 확보 → 풀 고갈/`max_connections` 문제 검출. `0s`면 매 주기 전체 점검(이전 동작) |
 
 모든 프로브는 프로세스가 죽거나 시작 실패 시 `<id>.probe_error`를 남기고 지수 백오프로 재시작됩니다.
 

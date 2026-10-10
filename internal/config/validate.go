@@ -351,6 +351,39 @@ func set(xs ...string) map[string]bool {
 
 // Validate checks types and every cross reference so that a bad config is
 // rejected by `vigilante validate` in CI rather than at 3 a.m. mid-rollback.
+// validateRemoteGrep: a log probe filtered on the target has no lines metric.
+func validateRemoteGrep(s Service, bad func(string, ...any)) {
+	filtered := map[string]bool{}
+	for _, p := range s.Probes {
+		if p.Log != nil && p.Log.RemoteGrep != "" {
+			filtered[p.ID] = true
+		}
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	var walk func(n Node)
+	walk = func(n Node) {
+		for _, c := range n.Any {
+			walk(c)
+		}
+		for _, c := range n.All {
+			walk(c)
+		}
+		if n.Not != nil {
+			walk(*n.Not)
+		}
+		for _, m := range []string{n.Metric, n.RatioOf} {
+			if id, metric, ok := strings.Cut(m, "."); ok && filtered[id] && metric == "lines" {
+				bad("service %s: probe %s uses remote_grep, so %s.lines is not available (only matching lines reach Vigilante)", s.Name, id, id)
+			}
+		}
+	}
+	for _, r := range s.Rules {
+		walk(r.When)
+	}
+}
+
 func (c *Config) Validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -618,6 +651,7 @@ func (c *Config) Validate() error {
 				bad("service %q rule %q: %v", s.Name, r.Name, err)
 			}
 		}
+		validateRemoteGrep(s, bad)
 		// Without a rollback rule nothing can fail, so every deployment would PASS.
 		if len(rollbackRules) == 0 {
 			bad("service %q: at least one rule with action: rollback is required (without one every deployment passes)", s.Name)

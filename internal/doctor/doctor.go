@@ -445,6 +445,17 @@ func (d *run) logProbe(ctx context.Context, c Check, s *config.Service, t config
 	}
 	if p.AccessLog == nil {
 		c.Status, c.Detail = OK, fmt.Sprintf("읽기 가능, 최근 %d줄", len(lines))
+		if g := p.Log.RemoteGrep; g != "" {
+			if _, isLocal := r.(*transport.Local); !isLocal {
+				// exit 1 = no match (fine); 2 = bad expression or no --line-buffered
+				if _, err := r.Run(ctx, "printf 'vigilante\\n' | grep --line-buffered -E "+transport.ShellQuote(g)+"; test $? -le 1", nil); err != nil {
+					c.Status, c.Detail = Fail, "remote_grep을 대상의 grep이 실행하지 못함: "+err.Error()
+					c.Hint = "grep -E 문법(POSIX ERE)인지, 대상 grep이 --line-buffered를 지원하는지(GNU grep) 확인하십시오"
+				} else {
+					c.Detail += ", remote_grep 확인"
+				}
+			}
+		}
 		return c
 	}
 	if len(lines) == 0 {
@@ -700,9 +711,16 @@ func (d *run) capacity(services []*config.Service) []Check {
 			if p.Type != "db" || p.DB == nil || p.Interval <= 0 {
 				continue
 			}
-			perSec := float64(p.DB.PoolSize) / p.Interval.Seconds() * float64(len(s.Targets))
+			every := probe.DefaultPoolCheckInterval
+			if p.DB.PoolCheckInterval != nil {
+				every = *p.DB.PoolCheckInterval
+			}
+			if every <= 0 || every < p.Interval {
+				every = p.Interval // full check on every interval
+			}
+			perSec := float64(p.DB.PoolSize) / every.Seconds() * float64(len(s.Targets))
 			c := Check{Scope: ScopeCapacity, Subject: s.Name, Name: "DB 프로브 " + p.ID + " 새 커넥션",
-				Detail: fmt.Sprintf("초당 %.1f개 (pool_size %d × 대상 %d / %s)", perSec, p.DB.PoolSize, len(s.Targets), p.Interval)}
+				Detail: fmt.Sprintf("초당 %.1f개 (pool_size %d × 대상 %d / 전체 점검 주기 %s, 그 사이는 연결 1개 재사용)", perSec, p.DB.PoolSize, len(s.Targets), every)}
 			if perSec > 1 {
 				c.Status, c.Hint = Warn, "DB 인증·접속 부하가 됩니다. interval을 늘리거나 pool_size를 줄이십시오"
 			} else {
