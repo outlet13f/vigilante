@@ -80,6 +80,5 @@ vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--app
 - 판정 품질(오탐·미탐 비율)은 실제 서비스에서 측정한 적이 없습니다. 프리셋 임계치는 추정값이며, M8 파일럿에서 보정합니다.
 - `host` 프로브는 Linux `/proc` 전용입니다. AIX/Solaris/HP-UX는 `exec` 기반 프로브 추가가 필요합니다.
 - Azure Load Balancer / Application Gateway, Citrix ADC 등은 `TrafficController` 구현 추가가 필요합니다 (현재는 `exec`/`webhook`으로 우회).
-- 저널은 단일 노드 파일 — 오케스트레이터 이중화 시 리더 선출 필요.
 - 바이너리 크기 약 35MB (govmomi·AWS SDK·gRPC 포함). 플러그인별 빌드 태그 분리는 아직 구현하지 않았습니다.
 - Race detector(`go test -race`)는 이 개발 환경에 cgo 툴체인이 없어 실행하지 못했습니다.
