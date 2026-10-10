@@ -304,6 +304,7 @@ rollback:
 | `vsphere` | D. VM 스냅샷 | `url`, `credential`, `vm`, `snapshot`, `power_on`, `tls_skip_verify` | 스냅샷 생성 (`vsphere.snapshot`) |
 | `nutanix` | D. VM 스냅샷 | `url`, `credential`, `vm_uuid`, `snapshot` | 스냅샷 생성 (`nutanix.snapshot_uuid`) |
 | `kvm` | D. VM 스냅샷 | `hypervisor`(target), `domain`, `snapshot` | `virsh snapshot-create-as --atomic` |
+| `openstack` **(M7 예정, 미구현)** | D. 인스턴스 스냅샷 | `credential`(type `openstack`), `server_id`(기본 `{{.Labels.openstack_server_id}}`), `mode`(auto\|volume\|image), `snapshot`, `revert_timeout`, `power_on` | 볼륨 부팅: Cinder 볼륨 스냅샷(`openstack.volume_snapshot_id`) / 이미지 부팅: Nova 서버 스냅샷(`openstack.image_id`) |
 | `exec` | 범용 | `prepare`, `rollback`, `verify`, `on`(target\|local\|다른 target) | stdout |
 | `webhook` | 범용(사내 배포 콘솔) | `url`, `method`, `headers`, `body`, `verify_url`, `credential` | — |
 
@@ -316,8 +317,11 @@ rollback:
 | `envoy` | 파일 기반 EDS의 `health_status: DRAINING` + 원자적 `mv` | `hosts[]`, `eds_file`, `member_format` |
 | `f5` | iControl REST `PATCH .../pool/~P~pool/members/~P~ip:port` (`session: user-disabled`[, `state: user-down`]) | `url`, `credential`, `pool`, `member_format`, `force_offline`, `token_auth` |
 | `aws_alb` | `DeregisterTargets` → draining 완료 대기 / `RegisterTargets` → healthy 대기 | `credential`, `target_group_arn`, `target_id`(기본 `{{.Labels.instance_id}}`), `port`, `wait_timeout` |
+| `octavia` **(M7 예정, 미구현)** | Octavia v2 풀 멤버 `admin_state_up=false`(드레인) → LB `provisioning_status` ACTIVE 대기 / `admin_state_up=true` → 멤버 `operating_status` ONLINE 대기. `PENDING_*`·409는 재시도 | `credential`(type `openstack`), `pool_id`, `member_address`(기본 `{{.Address}}`), `member_port`, `wait_timeout` |
 
 공통: `drain_wait`(드레인 후 대기).
+
+OpenStack 자격증명(M7 예정): `credentials.<name>: {type: openstack, auth_url, region, application_credential_id, application_credential_secret_ref, cacert}`. Keystone v3 application credential을 권장하며, 사용자·비밀번호·프로젝트 방식은 대안으로 둡니다. `doctor`는 로그인, 스냅샷·rebuild·revert 권한, Octavia 풀 멤버 수정 권한, 스냅샷·이미지 쿼터를 점검합니다.
 
 ## `safety`
 
