@@ -412,7 +412,7 @@ safety:
 | `observer_guard.timeout_share` / `min_services` | `0.5` / `3` | 관측 중인 대상의 이 비율 이상에서, 이 개수 이상의 서비스에 걸쳐 프로브가 시간 초과면 관측 쪽 문제로 봅니다. 서비스 하나의 불량 릴리스로는 걸리지 않습니다 |
 | `observer_guard.grace` | `1m` | 회복 후에도 이 시간 동안은 HOLD를 유지합니다. 과부하 중 쌓인 연속 실패 수와 윈도우 값이 빠질 시간입니다 |
 
-관측 장치 판별은 프로브 실패에서 나온 지표(`up`, `latency_ms`, `consecutive_failures`, `consecutive_timeouts`, `timeout`, `probe_error`)를 쓰는 규칙에만 적용합니다. 로그·액세스 로그·호스트·컨테이너 지표는 대상이 직접 보고한 값이라 그대로 판정합니다. 지표: `vigilante_observer_degraded`, `vigilante_observer_degradations_total{signal}`, `vigilante_observer_holds_total`.
+관측 장치 판별은 오케스트레이터가 직접 재는 프로브(`http`, `tcp`, `grpc`, `db`, SSH로 읽는 `host`)의 `up`, `latency_ms`, `consecutive_failures`, `consecutive_timeouts`, `timeout`과, 모든 프로브의 `probe_error`를 쓰는 규칙에만 적용합니다. 로그·액세스 로그·컨테이너 프로브의 지표(액세스 로그의 `latency_ms` 포함)와 호스트 자원 값은 대상이 보고한 값이라 그대로 판정합니다. 지표: `vigilante_observer_degraded`, `vigilante_observer_degradations_total{signal}`, `vigilante_observer_holds_total`.
 
 상세 동작은 [04-safety-circuit-breaker.md](04-safety-circuit-breaker.md).
 

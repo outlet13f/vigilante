@@ -26,6 +26,11 @@ type Phase struct {
 	Deployed []string // targets running the new version
 	Controls []string // untouched targets (optional)
 	Quorum   bool     // require agreement between vantage points
+	// ObserverProbes names the probes whose results this orchestrator
+	// measures itself (http, tcp, grpc, db, host over SSH); only their
+	// failure metrics are held while the observer is degraded. nil = every
+	// probe.
+	ObserverProbes map[string]bool
 }
 
 // Evaluation is one tick's result.
@@ -189,9 +194,11 @@ func (e *Engine) evalTarget(rule config.Rule, target string, now time.Time) (rul
 	return rules.Result{State: rules.Unknown}, ""
 }
 
-// observerSensitive are the probe metrics a degraded observer distorts: a
-// starved orchestrator turns slow answers into timeouts and failures. Log,
-// host and container metrics report what the target said and are kept.
+// observerSensitive are the metrics a degraded observer distorts when they
+// come from a probe it measures itself (Phase.ObserverProbes): a starved
+// orchestrator turns slow answers into timeouts and failures. The same names
+// from log, access-log or container probes report what the target said and
+// are kept.
 var observerSensitive = []string{"up", "latency_ms", "consecutive_failures", "consecutive_timeouts", "timeout", "probe_error"}
 
 // observerDegraded returns why the rule's evidence is untrustworthy, or "".
@@ -201,8 +208,11 @@ func (e *Engine) observerDegraded(rule config.Rule, now time.Time) string {
 	}
 	sensitive := false
 	for _, m := range rules.Metrics(rule.When) {
+		probe, _, _ := strings.Cut(m, ".")
 		suffix := m[strings.LastIndex(m, ".")+1:]
-		sensitive = sensitive || slices.Contains(observerSensitive, suffix)
+		// probe_error (a probe that stopped) is about collection on any probe.
+		measured := e.Phase.ObserverProbes == nil || e.Phase.ObserverProbes[probe] || suffix == "probe_error"
+		sensitive = sensitive || (measured && slices.Contains(observerSensitive, suffix))
 	}
 	if !sensitive {
 		return ""

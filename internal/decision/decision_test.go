@@ -184,4 +184,25 @@ func TestObserverDegradedHoldsProbeFailures(t *testing.T) {
 	if out := eng.Run(ctx); out.Verdict != model.VerdictFail {
 		t.Fatalf("access-log breach must not be held for the observer: %s %s", out.Verdict, out.Reason)
 	}
+
+	// The same metric name from a probe the target reports through (an
+	// access log's latency_ms) is judged; from a probe the orchestrator
+	// measures (http) it is held.
+	slow := func(metric string) config.Rule {
+		return config.Rule{Name: "slow", Action: "rollback", When: config.Node{Condition: config.Condition{
+			Metric: metric, Agg: "last", Window: 10 * time.Second, Op: ">", Value: f(500), For: 1, ResetAfter: 1, Scope: "target", Absent: "unknown",
+		}}}
+	}
+	feed(ctx, s, "canary-1", "access.latency_ms", 900, "")
+	feed(ctx, s, "canary-1", "http.latency_ms", 900, "")
+	time.Sleep(20 * time.Millisecond)
+	for metric, want := range map[string]model.Verdict{"access.latency_ms": model.VerdictFail, "http.latency_ms": model.VerdictHold} {
+		p := phase([]config.Rule{slow(metric)}, []string{"canary-1"}, nil)
+		p.ObserverProbes = map[string]bool{"http": true}
+		eng = New(p, s, nil)
+		eng.Observer = fakeObserver{degraded: true}
+		if out := eng.Run(ctx); out.Verdict != want {
+			t.Fatalf("%s: got %s, want %s (%s)", metric, out.Verdict, want, out.Reason)
+		}
+	}
 }

@@ -742,6 +742,20 @@ func (e *Engine) jobs(svc *config.Service, targets []string) []probe.Job {
 	return jobs
 }
 
+// observerProbes lists the service's probes whose results depend on this
+// orchestrator answering in time: requests it sends (http, tcp, grpc, db) and
+// commands it runs over SSH (host).
+func observerProbes(svc *config.Service) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range svc.Probes {
+		switch p.Type {
+		case "http", "tcp", "grpc", "db", "host":
+			out[p.ID] = true
+		}
+	}
+	return out
+}
+
 func (e *Engine) collector(d *model.Deployment) *probe.Collector {
 	return &probe.Collector{
 		Runners: e.runners,
@@ -837,7 +851,7 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	baseline := rules.Chain{&rules.Control{Store: e.Store, Targets: controls}, snap}
 	eng := decision.New(decision.Phase{
 		Name: phase, Cfg: pc, Rules: svc.Rules, Deployed: d.Targets, Controls: controls,
-		Quorum: e.Cfg.Safety.ObserverQuorum,
+		Quorum: e.Cfg.Safety.ObserverQuorum, ObserverProbes: observerProbes(svc),
 	}, e.Store, baseline)
 	if e.Observer.Enabled() {
 		eng.Observer = e.Observer
