@@ -471,20 +471,39 @@ type createReq struct {
 	ChangeTicket string `json:"-"`
 }
 
+// createV1 is the v1 create body. freeze_override and change_ticket are
+// read here only, not in createReq, so webhook payloads cannot set them.
+type createV1 struct {
+	createReq
+	FreezeOverride string `json:"freeze_override"`
+	ChangeTicket   string `json:"change_ticket"`
+}
+
 func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
-	var req createReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	var body createV1
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
+	req := body.createReq
 	p, ok := s.allow(w, r, auth.ActDeploy, s.svc(req.Service))
 	if !ok {
 		return
 	}
-	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
+	if body.FreezeOverride != "" && !p.Can(auth.ActManage, auth.Service{}) {
+		err := fmt.Errorf("forbidden: only admins may override a change freeze (%s)", principalID(p))
+		s.denied(r, req.Service, err)
+		writeErr(w, http.StatusForbidden, err)
+		return
+	}
+	req.FreezeOverride = body.FreezeOverride
+	req.ChangeTicket = body.ChangeTicket
+	if req.ChangeTicket == "" {
+		req.ChangeTicket = r.Header.Get("X-Change-Ticket")
+	}
 	d, err := s.create(r.Context(), p, req)
 	if err != nil {
-		writeErr(w, gateStatus(err, 400), err)
+		writeGateErr(w, err)
 		return
 	}
 	s.audit(r, "deployment.create", d.Service, d.ID, fmt.Sprintf("%s %s -> %s", d.Service, d.PreviousVersion, d.Version))
@@ -849,7 +868,7 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
 	d, err := s.create(r.Context(), p, *req)
 	if err != nil {
-		writeErr(w, gateStatus(err, 400), err)
+		writeGateErr(w, err)
 		return
 	}
 	s.E.Audit(journal.Entry{Actor: p.ID, Source: "webhook", Action: "deployment.create", Service: d.Service, DeployID: d.ID,
@@ -988,4 +1007,18 @@ func gateCode(err error) string {
 		return "change_ticket_invalid"
 	}
 	return "circuit_open"
+}
+
+// writeGateErr answers a failed v1 create. A closed gate carries its problem
+// code next to the message ({"error": ..., "code": "change_frozen"}) so the
+// CLI can tell a refusal from a fault; other failures are 400.
+func writeGateErr(w http.ResponseWriter, err error) {
+	if !errors.Is(err, orchestrator.ErrBlocked) {
+		writeErr(w, 400, err)
+		return
+	}
+	if errors.Is(err, orchestrator.ErrITSMUnavailable) {
+		w.Header().Set("Retry-After", "30")
+	}
+	writeJSON(w, gateStatus(err, http.StatusConflict), map[string]string{"error": err.Error(), "code": gateCode(err)})
 }

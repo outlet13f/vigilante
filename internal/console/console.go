@@ -57,14 +57,22 @@ type Console struct {
 	oauth  *oauth2.Config // nil = token sign-in
 	verify Verify
 	secure bool
-	Now    func() time.Time
+	// hsts: the console is reached over HTTPS (server.tls, or an https
+	// console.redirect_url behind a TLS proxy).
+	hsts bool
+	Now  func() time.Time
 }
+
+// hstsValue is sent on console responses over HTTPS. No includeSubDomains:
+// sibling hosts of the console may still serve plain HTTP.
+const hstsValue = "max-age=31536000"
 
 // New builds the console. OIDC sign-in is used when auth.oidc is set and
 // console.redirect_url is given.
 func New(ctx context.Context, cfg *config.Config, verify Verify, log *slog.Logger) (*Console, error) {
 	c := &Console{log: log, verify: verify, Now: time.Now}
 	cc := cfg.Console
+	c.hsts = cfg.Server.TLS != nil || strings.HasPrefix(cc.RedirectURL, "https://")
 	key := make([]byte, 32)
 	if cc.SessionKeyRef != "" {
 		v, err := secrets.Resolve(ctx, cc.SessionKeyRef)
@@ -113,17 +121,22 @@ func New(ctx context.Context, cfg *config.Config, verify Verify, log *slog.Logge
 func (c *Console) Register(mux *http.ServeMux) {
 	sub, _ := fs.Sub(static, "static")
 	files := http.FileServer(http.FS(sub))
-	mux.HandleFunc("GET /console/", func(w http.ResponseWriter, r *http.Request) {
-		securityHeaders(w)
+	handle := func(pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			c.securityHeaders(w, r)
+			h(w, r)
+		})
+	}
+	handle("GET /console/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/console/" {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		http.StripPrefix("/console/", files).ServeHTTP(w, r)
 	})
-	mux.HandleFunc("GET /console", func(w http.ResponseWriter, r *http.Request) {
+	handle("GET /console", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/console/", http.StatusFound)
 	})
-	mux.HandleFunc("GET /console/auth/mode", func(w http.ResponseWriter, r *http.Request) {
+	handle("GET /console/auth/mode", func(w http.ResponseWriter, r *http.Request) {
 		mode := "token"
 		if c.oauth != nil {
 			mode = "oidc"
@@ -131,9 +144,18 @@ func (c *Console) Register(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"mode": mode, "signed_in": c.hasSession(r)})
 	})
-	mux.HandleFunc("GET /console/auth/login", c.login)
-	mux.HandleFunc("GET /console/auth/callback", c.callback)
-	mux.HandleFunc("POST /console/auth/logout", c.logout)
+	handle("GET /console/auth/login", c.login)
+	handle("GET /console/auth/callback", c.callback)
+	handle("POST /console/auth/logout", c.logout)
+}
+
+// securityHeaders goes on every console response; HSTS only when the
+// console is served over HTTPS (browsers ignore it over plain HTTP anyway).
+func (c *Console) securityHeaders(w http.ResponseWriter, r *http.Request) {
+	securityHeaders(w)
+	if c.hsts || r.TLS != nil {
+		w.Header().Set("Strict-Transport-Security", hstsValue)
+	}
 }
 
 func securityHeaders(w http.ResponseWriter) {

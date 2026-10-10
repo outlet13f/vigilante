@@ -151,12 +151,13 @@ exit "$(jq -r '.result.exit_code // 1' <<<"$R")"   # 0 통과, 2 롤백됨, 3 �
 | `vigilante.deployment.created`, `.marked_good` | 배포 등록, 정상 버전 등록 |
 | `vigilante.observation.started`, `.passed`, `.failed`, `.held`, `.aborted` | 단계 관측 시작과 판정 |
 | `vigilante.rollback.started`, `.completed`, `.failed` | 롤백 시작·완료·실패(사람 필요) |
-| `vigilante.approval.requested`, `.decided` | 상위 전략 승인 요청·승인 |
+| `vigilante.approval.requested`, `.decided` | 롤백·상위 전략 승인 요청, 결정(승인·거절) |
 | `vigilante.circuit.opened`, `.half_opened`, `.closed` | 서킷 상태 |
 | `vigilante.agent.lost` | 에이전트 하트비트 끊김 |
 | `vigilante.webhook.disabled` | 실패가 이어져 웹훅 구독이 꺼짐 |
 | `vigilante.ping` | 테스트 이벤트 (해당 구독에만) |
 
+- **`approval.decided`의 `data`:** `deployment_id`, `service`, `kind`(`rollback`|`escalation`), `decision`(`approved`|`rejected`), `decided_by`(결정한 사람), `comment`. 배포의 `approved_by` 필드와 이름이 다릅니다.
 - **순번:** 이벤트마다 클러스터 전체에서 증가하는 `sequence`가 있고, `id`·SSE `id`·`webhook-id`가 모두 이 값입니다. 리더가 바뀌어도 이어집니다.
 - **범위:** 서비스 이벤트는 그 서비스를 읽을 수 있는 호출자에게만, 서비스가 없는 이벤트(서킷, 에이전트)는 viewer 누구에게나 갑니다.
 - **보관:** 최근 10,000건을 보관합니다. 더 오래 끊겨 있었다면 보관된 가장 오래된 이벤트부터 받습니다.
@@ -205,6 +206,8 @@ def verify(secret: str, headers: dict, body: bytes) -> bool:
 | `POST /v1/circuit/reset?reason=` | `POST /v2/circuit/reset` 본문 `{"reason"}` (필수) |
 | `GET /v1/audit` | `GET /v2/audit-events` (커서 페이지) |
 | 오류 `{"error": "..."}` | problem+json |
+
+`POST /v1/deployments`도 본문에 `change_ticket`과 `freeze_override`(admin만)를 받습니다(`X-Change-Ticket` 헤더도 그대로). 게이트가 닫혀 거부하면 `409`(ITSM 장애는 `503` + `Retry-After`)와 함께 `{"error": "...", "code": "change_frozen"}`처럼 v2와 같은 코드(`circuit_open`, `change_frozen`, `change_ticket_invalid`, `itsm_unavailable`)를 줍니다. `vigilante watch --server`는 `--ticket`·`--freeze-override`를 이 필드로 보내고, 게이트 거부를 로컬 모드와 같은 종료 코드 3으로 끝냅니다.
 
 ## 오류 코드
 

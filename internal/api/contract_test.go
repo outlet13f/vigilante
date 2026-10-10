@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -20,9 +22,12 @@ import (
 
 	"vigilante/internal/auth"
 	"vigilante/internal/config"
+	"vigilante/internal/events"
 	"vigilante/internal/itsm"
 	"vigilante/internal/itsm/snowtest"
+	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
+	"vigilante/internal/telemetry"
 )
 
 var (
@@ -469,6 +474,55 @@ func TestV2ApproveModeDecisions(t *testing.T) {
 	if items := r.JSON["items"].([]any); len(items) != 1 || items[0].(map[string]any)["reason"] != "false positive" {
 		t.Fatalf("audit: %s", r.Body)
 	}
+
+	// approval.decided carries exactly the fields the spec lists for it.
+	want := specEventFields(t, "approval.decided")
+	evs, _ := s.bus.Since(0, events.Filter{Types: []string{model.EvApprovalDecided}}, 0)
+	if len(evs) != 2 {
+		t.Fatalf("approval.decided events: %d", len(evs))
+	}
+	for i, wantDecision := range []string{"rejected", "approved"} {
+		var data map[string]any
+		if err := json.Unmarshal(evs[i].Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for k := range data {
+			got = append(got, k)
+		}
+		sort.Strings(got)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("approval.decided data fields %v, spec lists %v", got, want)
+		}
+		if data["decision"] != wantDecision || data["decided_by"] != "token:legacy" || data["kind"] != "rollback" {
+			t.Errorf("approval.decided data: %s", evs[i].Data)
+		}
+	}
+}
+
+// specEventFields reads the data fields the spec's CloudEvent.data
+// description lists for an event type ("approval.decided: a, b (x | y), c.").
+func specEventFields(t *testing.T, typ string) []string {
+	t.Helper()
+	_, doc := spec(t)
+	m, err := doc.BuildV3Model()
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc := m.Model.Components.Schemas.GetOrZero("CloudEvent").Schema().Properties.GetOrZero("data").Schema().Description
+	desc = strings.Join(strings.Fields(desc), " ")
+	_, rest, ok := strings.Cut(desc, typ+": ")
+	if !ok {
+		t.Fatalf("CloudEvent.data description does not describe %s: %q", typ, desc)
+	}
+	list, _, _ := strings.Cut(rest, ".")
+	list = regexp.MustCompile(`\s*\([^)]*\)`).ReplaceAllString(list, "")
+	var fields []string
+	for _, f := range strings.Split(list, ",") {
+		fields = append(fields, strings.TrimSpace(f))
+	}
+	sort.Strings(fields)
+	return fields
 }
 
 func TestV2ChangeFreeze(t *testing.T) {
@@ -587,18 +641,23 @@ itsm:
 		t.Fatal("Retry-After missing")
 	}
 	// fail open: proceeds, marked unverified
-	s.E.ITSM = itsm.NewServiceNow(func() config.ServiceNow {
+	open := itsm.NewServiceNow(func() config.ServiceNow {
 		sn := *s.E.Cfg.ITSM.ServiceNow
 		sn.ChangeGate.OnError = "open"
 		return sn
 	}(), s.E.Cfg.Credentials)
+	open.Backoff = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond}
+	s.E.ITSM = open
 	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","change_ticket":"CHG100"}`, nil)
 	if r.StatusCode != 201 || r.JSON["change_ticket"].(map[string]any)["unverified"] != true {
 		t.Fatalf("fail open: %d %s", r.StatusCode, r.Body)
 	}
 	snow.SetDown(false)
 
-	// An open circuit raises one incident.
+	// An open circuit raises one incident, even when ServiceNow fails the
+	// first two attempts.
+	retries, oks := telemetry.ITSMCalls.Value("incident", "retry"), telemetry.ITSMCalls.Value("incident", "ok")
+	snow.FailIncidents(2)
 	c.do("POST", "/v2/circuit/trip", `{"reason":"two failed rollbacks"}`, nil)
 	deadline = time.Now().Add(10 * time.Second)
 	var inc []map[string]any
@@ -610,6 +669,23 @@ itsm:
 	}
 	if len(inc) != 1 || !strings.Contains(inc[0]["short_description"].(string), "circuit breaker OPEN") || inc[0]["assignment_group"] != "SRE" {
 		t.Fatalf("incident: %v", inc)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	var audited []any
+	for time.Now().Before(deadline) {
+		if audited = c.do("GET", "/v2/audit-events?action=itsm.incident", "", nil).JSON["items"].([]any); len(audited) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(audited) != 1 || !strings.Contains(audited[0].(map[string]any)["reason"].(string), "INC0000001") {
+		t.Fatalf("incident audit: %v", audited)
+	}
+	if d := telemetry.ITSMCalls.Value("incident", "retry") - retries; d != 2 {
+		t.Errorf("incident retries counted: %v", d)
+	}
+	if d := telemetry.ITSMCalls.Value("incident", "ok") - oks; d != 1 {
+		t.Errorf("incident ok counted: %v", d)
 	}
 }
 

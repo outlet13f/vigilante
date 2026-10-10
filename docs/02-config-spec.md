@@ -525,9 +525,9 @@ change_freeze:
     allow_rollback: true                  # 기본 true
 ```
 
-- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다. 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
+- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다(`watch --server`에서 서버가 거부해도 3). 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
 - **막지 않는 것:** 자동 롤백은 기본으로 허용합니다. 장애 복구는 변경이 아니기 때문입니다. `allow_rollback: false`인 기간에는 자동 롤백 대신 실패한 대상을 격리하고 사람에게 넘깁니다. 수동 롤백은 항상 가능합니다.
-- **예외(긴급 배포):** API는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다. 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
+- **예외(긴급 배포):** API(v1·v2)는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다(`watch --server`는 서버로 전달하므로 토큰이 admin이어야 함). 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
 - **실행 중 선언:** 장애 대응처럼 설정 파일 없이 동결해야 하면 admin이 `POST /v2/freezes`로 선언하고 `DELETE /v2/freezes/{id}`로 일찍 끝냅니다. 상태 저장소에 남아 리더가 바뀌어도 유지됩니다. `GET /v2/freezes`는 설정 창과 선언된 동결을 함께 보여 줍니다.
 - 주간 창의 시각은 `timezone`(생략 시 서버 지역 시간) 기준이며, 바이너리에 시간대 데이터가 들어 있어 호스트 설정과 무관하게 동작합니다.
 
@@ -565,7 +565,7 @@ console:
 - **CSRF:** 쿠키로 인증한 변경 요청은 `X-CSRF-Token` 헤더에 CSRF 쿠키 값을 담아야 합니다(double-submit). 없으면 `403 forbidden`입니다. `Authorization` 헤더가 있는 요청은 쿠키를 보지 않으므로 API 클라이언트에는 영향이 없습니다.
 - **토큰 로그인:** SSO가 없으면 콘솔이 서비스 계정 토큰이나 API 키를 묻습니다. 토큰은 그 브라우저 탭(sessionStorage)에만 남습니다.
 - **화면:** 현황(서킷·조치 필요·진행 중·최근 배포·실시간 이벤트), 배포 목록·상세(승인·거절, 롤백, 관측 중단, 규칙 위반, 작업, 타임라인), 서비스, 변경 동결(선언·종료), 감사 기록. 모든 조작은 사유를 받아 감사 기록에 남기며(출처 `ui`), 버튼은 역할에 맞는 것만 보입니다. 실시간 갱신은 `GET /v2/events`(SSE)를 씁니다.
-- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. API 데이터는 모두 텍스트로만 화면에 넣습니다.
+- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. HTTPS로 서비스하면(`server.tls`, `https://` `redirect_url`(TLS 프록시 뒤), 또는 TLS 요청) `Strict-Transport-Security: max-age=31536000`도 보냅니다(`includeSubDomains` 없음). 콘솔의 모든 응답(로그인·콜백·로그아웃 포함)에 붙습니다. API 데이터는 모두 텍스트로만 화면에 넣습니다.
 
 ## `secrets` — 비밀값 출처
 
@@ -641,9 +641,9 @@ itsm:
     work_notes: true                        # 변경 티켓에 진행 결과 기록 (기본 true)
 ```
 
-- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 v2 `change_ticket`, CLI는 `--ticket`입니다. 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
+- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 본문 `change_ticket`(v1·v2), CLI는 `--ticket`입니다(`watch --server`도 서버로 전달). 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
 - **ServiceNow 장애:** `on_error: closed`면 `503 itsm_unavailable`(Retry-After)로 새 배포를 받지 않고, `open`이면 진행하되 배포의 `change_ticket.unverified: true`와 이벤트에 남깁니다. **롤백은 어느 경우에도 ServiceNow를 기다리지 않습니다.**
-- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다.
+- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다. 생성은 백그라운드에서 하며, 실패하면(접속 오류, 시간 초과, 429, 5xx) 1초·2초·4초 뒤 최대 세 번 다시 시도합니다. 응답을 못 받은 생성이 실제로는 저장됐어도 재시도가 `correlation_id`로 찾아내므로 중복되지 않습니다. 그 밖의 4xx(인증 실패 등)는 재시도하지 않습니다. 작업 노트도 같은 재시도를 씁니다.
 - **작업 노트:** 검증된 티켓이 있는 배포는 관측 시작·판정·롤백 시작·완료·실패·승인 요청·결정을 변경 티켓의 work notes에 남깁니다.
 - 인시던트와 작업 노트는 서버(리더)가 이벤트를 따라가며 처리합니다. CI 단발 실행(`vigilante watch`)만 쓰는 구성에서는 게이트만 동작합니다.
-- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`.
+- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`(`result`: 호출마다 `ok` 또는 재시도 후 `error`, 다시 시도할 때마다 `retry`).

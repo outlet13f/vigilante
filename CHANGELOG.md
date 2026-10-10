@@ -70,6 +70,27 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   (`keyed_from`). No schema migration. With a key configured, every command
   that opens the store needs it (like `dsn_ref`).
 
+- The web console sends `Strict-Transport-Security: max-age=31536000` when
+  served over HTTPS, and applies its security headers to the sign-in
+  endpoints too.
+
+### Fixed (integration)
+- `vigilante watch --server` now forwards `--ticket` and `--freeze-override`,
+  and exits 3 (not 1) when the server refuses at a closed gate (circuit
+  open, change freeze, change ticket, ITSM unavailable).
+- `POST /v1/deployments` accepts `change_ticket` and `freeze_override`
+  (admins only) in the body, and gate refusals include a `code` field
+  (`circuit_open`, `change_frozen`, `change_ticket_invalid`,
+  `itsm_unavailable`).
+- OpenAPI: the `approval.decided` payload is documented as `deployment_id,
+  service, kind, decision, decided_by, comment` (it never carried
+  `approved_by`); a contract test keeps the two in step.
+- ServiceNow: retry decisions use the HTTP status instead of matching error
+  text; transient failures (connection errors, 429, 5xx) retry after 1s, 2s
+  and 4s; incidents are created in the background so a slow ServiceNow no
+  longer delays later work notes. `vigilante_itsm_calls_total` gains
+  `result="retry"`.
+
 ### Fixed (deployment)
 - Helm chart with server TLS: the HA advertise URL, probes, port names,
   Ingress backend port and ServiceMonitor scheme use https (the advertise
