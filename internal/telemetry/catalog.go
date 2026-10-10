@@ -19,7 +19,8 @@ var (
 
 	StoreAppend = NewHistogram("vigilante_store_append_seconds", "State store write latency.",
 		[]float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5}, "backend")
-	StoreErrors = NewCounter("vigilante_store_errors_total", "Failed state store writes (fenced = leadership lost).", "reason")
+	StoreErrors  = NewCounter("vigilante_store_errors_total", "Failed state store writes (fenced = leadership lost, error = queued for retry, dropped = queue full).", "reason")
+	StorePending = NewGauge("vigilante_store_pending_writes", "Writes queued while the state store is unreachable.")
 
 	SSHConnections = NewGauge("vigilante_ssh_connections", "Pooled SSH connections.")
 	SSHSessions    = NewGauge("vigilante_ssh_sessions", "Open SSH sessions (commands and streams).")

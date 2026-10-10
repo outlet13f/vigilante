@@ -64,6 +64,12 @@ type Engine struct {
 	OnRecord func(journal.Entry)
 	// hooks also see every stored entry (event bus); reloadHooks see the
 	// state after every Reload (HA election).
+	// pending holds writes the store refused while unreachable, in order.
+	pendMu   sync.Mutex
+	pending  []journal.Entry
+	flushing bool
+	closing  bool
+
 	hookMu      sync.RWMutex
 	hooks       []func(journal.Entry)
 	reloadHooks []func(*journal.State)
@@ -235,6 +241,18 @@ func (e *Engine) Audit(en journal.Entry) {
 
 // record appends to the store. A fenced write means another node is leader
 // now: this node stops acting at once.
+// Writes that fail while the state store is unreachable are kept in order
+// and written when it is back (write-behind), so an outage loses no
+// decision, rollback step or audit record and the hash chain stays in
+// order. Decisions and rollbacks go on meanwhile: the store is not on the
+// rollback path. What is queued lives in memory only; a crash during the
+// outage loses it (the deployment snapshot written after recovery carries
+// the state again).
+const (
+	appendTimeout   = 5 * time.Second
+	maxPendingWrite = 100_000
+)
+
 func (e *Engine) record(en journal.Entry) {
 	if en.Time.IsZero() {
 		en.Time = time.Now()
@@ -242,39 +260,141 @@ func (e *Engine) record(en journal.Entry) {
 	if en.Actor == "" {
 		en.Actor, en.Source = "system", "system"
 	}
+	e.pendMu.Lock()
+	if len(e.pending) > 0 { // keep order: queue behind what is waiting
+		e.queue(en)
+		e.pendMu.Unlock()
+		return
+	}
+	err := e.appendOne(en)
+	if err != nil && !errors.Is(err, store.ErrFenced) {
+		telemetry.StoreErrors.Inc("error")
+		e.Log.Error("state write failed; queued until the store is back", "err", err, "store", e.Journal.Describe())
+		e.queue(en)
+	}
+	e.pendMu.Unlock()
+	// Hooks run unlocked: they may record entries themselves (event bus).
+	switch {
+	case err == nil:
+		e.stored(en)
+	case errors.Is(err, store.ErrFenced):
+		e.fenced()
+	}
+}
+
+func (e *Engine) appendOne(en journal.Entry) error {
 	backend := e.Cfg.Server.State.Backend
 	if backend == "" {
 		backend = "file"
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), appendTimeout)
+	defer cancel()
 	started := time.Now()
-	err := e.Journal.Append(context.Background(), en)
+	err := e.Journal.Append(ctx, en)
 	telemetry.StoreAppend.Since(started, backend)
-	if err == nil {
-		if e.OnRecord != nil {
-			e.OnRecord(en)
-		}
-		e.hookMu.RLock()
-		hooks := e.hooks
-		e.hookMu.RUnlock()
-		for _, h := range hooks {
-			h(en)
-		}
+	return err
+}
+
+// stored runs the hooks of an entry that reached the store.
+func (e *Engine) stored(en journal.Entry) {
+	if e.OnRecord != nil {
+		e.OnRecord(en)
 	}
-	if err != nil {
-		if errors.Is(err, store.ErrFenced) {
-			telemetry.StoreErrors.Inc("fenced")
-			if e.active.Load() {
-				e.Log.Error("leadership lost: state writes are fenced, standing down")
-			}
-			e.SetActive(false)
-			return
-		}
-		telemetry.StoreErrors.Inc("error")
-		e.Log.Error("state write failed", "err", err, "store", e.Journal.Describe())
+	e.hookMu.RLock()
+	hooks := e.hooks
+	e.hookMu.RUnlock()
+	for _, h := range hooks {
+		h(en)
 	}
 }
 
+func (e *Engine) fenced() {
+	telemetry.StoreErrors.Inc("fenced")
+	if e.active.Load() {
+		e.Log.Error("leadership lost: state writes are fenced, standing down")
+	}
+	e.SetActive(false)
+}
+
+// queue holds an entry for the flusher (caller holds pendMu).
+func (e *Engine) queue(en journal.Entry) {
+	if len(e.pending) >= maxPendingWrite {
+		telemetry.StoreErrors.Inc("dropped")
+		return
+	}
+	e.pending = append(e.pending, en)
+	telemetry.StorePending.Set(float64(len(e.pending)))
+	if !e.flushing {
+		e.flushing = true
+		go e.flush()
+	}
+}
+
+// flush writes queued entries in order, retrying until the store answers.
+func (e *Engine) flush() {
+	wait := 200 * time.Millisecond
+	for {
+		e.pendMu.Lock()
+		if len(e.pending) == 0 || e.closing {
+			e.flushing = false
+			e.pendMu.Unlock()
+			return
+		}
+		en := e.pending[0]
+		err := e.appendOne(en)
+		switch {
+		case err == nil:
+			e.pending = e.pending[1:]
+			telemetry.StorePending.Set(float64(len(e.pending)))
+			if len(e.pending) == 0 {
+				e.Log.Info("state store is back: queued writes stored")
+			}
+			wait = 200 * time.Millisecond
+			e.pendMu.Unlock()
+			e.stored(en)
+			continue
+		case errors.Is(err, store.ErrFenced):
+			// Another node leads now: what we queued is no longer ours to write.
+			telemetry.StoreErrors.Add(float64(len(e.pending)), "fenced")
+			e.pending = nil
+			telemetry.StorePending.Set(0)
+			e.flushing = false
+			e.pendMu.Unlock()
+			e.fenced()
+			return
+		}
+		e.pendMu.Unlock()
+		time.Sleep(wait)
+		wait = min(wait*2, 5*time.Second)
+	}
+}
+
+// PendingWrites reports entries waiting for the state store.
+func (e *Engine) PendingWrites() int {
+	e.pendMu.Lock()
+	defer e.pendMu.Unlock()
+	return len(e.pending)
+}
+
+// Flush waits up to d for queued writes to reach the store.
+func (e *Engine) Flush(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for e.PendingWrites() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
 func (e *Engine) Close() {
+	if n := e.PendingWrites(); n > 0 && !e.Flush(10*time.Second) {
+		e.Log.Error("state writes still queued at shutdown are lost", "count", e.PendingWrites())
+	}
+	e.pendMu.Lock()
+	e.closing = true
+	e.pendMu.Unlock()
 	e.transport.Close()
 	if e.ownsStore {
 		e.Journal.Close()
