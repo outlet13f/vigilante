@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"vigilante/internal/compat"
 	"vigilante/internal/config"
 	"vigilante/internal/executor"
 	"vigilante/internal/probe"
@@ -42,6 +43,28 @@ func buildInfo() string {
 	}
 	parts = append(parts, runtime.Version()+" "+runtime.GOOS+"/"+runtime.GOARCH)
 	return fmt.Sprintf("vigilante %s (%s)", version, strings.Join(parts, ", "))
+}
+
+// printPlugins lists the plugins in this binary with their verification
+// level (docs/09-compatibility.md).
+func printPlugins() {
+	execs, traffic := executor.Types()
+	fmt.Printf("%s build; verified = run against the real system, experimental = tests against mocks/simulators only\n\n", flavor)
+	for _, k := range []struct {
+		title, kind string
+		have        []string
+	}{{"probes", "probe", probe.Types()}, {"executors", "executor", execs}, {"traffic", "traffic", traffic}} {
+		fmt.Println(k.title + ":")
+		for _, t := range k.have {
+			e := compat.Lookup(k.kind, t)
+			fmt.Printf("  %-11s %-13s %s\n", t, e.Level, e.Against)
+		}
+		for _, e := range compat.Kinds(k.kind) {
+			if !slices.Contains(k.have, e.Type) {
+				fmt.Printf("  %-11s %-13s %s\n", e.Type, "-", "not in this build (full build only)")
+			}
+		}
+	}
 }
 
 // checkBuild reports plugins the config uses that this binary does not

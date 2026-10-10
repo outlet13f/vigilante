@@ -26,11 +26,10 @@ import (
 	"vigilante/internal/agent"
 	"vigilante/internal/api"
 	"vigilante/internal/audit"
+	"vigilante/internal/compat"
 	"vigilante/internal/config"
-	"vigilante/internal/executor"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
-	"vigilante/internal/probe"
 	"vigilante/internal/safety"
 	"vigilante/internal/secrets"
 	"vigilante/internal/store"
@@ -165,8 +164,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		fmt.Print(usage)
 		return 0, nil
 	case "plugins":
-		ex, tr := executor.Types()
-		fmt.Printf("probes:    %s\nexecutors: %s\ntraffic:   %s\n", strings.Join(probe.Types(), ", "), strings.Join(ex, ", "), strings.Join(tr, ", "))
+		printPlugins()
 		return 0, nil
 	case "validate":
 		c := newFlags(cmd)
@@ -179,6 +177,9 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		}
 		fmt.Printf("OK: %d targets, %d services, %d executors, %d traffic controllers\n", len(cfg.Targets), len(cfg.Services), len(cfg.Executors), len(cfg.Traffic))
 		for _, w := range cfg.Warnings() {
+			fmt.Println("WARN: " + w)
+		}
+		if w := compat.Warning(cfg); w != "" {
 			fmt.Println("WARN: " + w)
 		}
 		for _, s := range cfg.Services {
@@ -578,6 +579,9 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	}
 	if srv.Auth.Disabled() {
 		e.Log.Warn("API authentication disabled: configure auth (service accounts / OIDC) or server.auth_token_env")
+	}
+	if w := compat.Warning(e.Cfg); w != "" {
+		e.Log.Warn(w)
 	}
 	if sl := e.Cfg.Audit.Syslog; sl != nil {
 		x, err := audit.NewExporter(*sl, e.Log)

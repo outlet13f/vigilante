@@ -53,7 +53,7 @@ jobs:
           [ -f packaging/cosign.pub ] || { echo "packaging/cosign.pub is missing: commit the release public key first"; exit 1; }
 
       - name: tests
-        run: go test -count=1 ./... && go test -count=1 -tags minimal ./cmd/vigilante ./internal/executor ./internal/probe
+        run: go test -count=1 ./... && go test -count=1 -tags minimal ./cmd/vigilante ./internal/executor ./internal/probe ./internal/compat
 
       - name: build binaries, SBOMs, packages, chart
         run: bash scripts/release.sh build "${{ steps.v.outputs.version }}"
