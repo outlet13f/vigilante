@@ -40,38 +40,35 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 
 전용 계정(예: `vigilante`)을 만들고, 키는 Vault SSH CA 단기 인증서를 권장합니다(`credentials.<name>.ssh_ca`). 읽기(로그, `/proc`, `readlink`, `systemctl is-active`)는 권한 상승이 필요 없습니다.
 
-**`connection.sudo: true`는 쓰지 않기를 권장합니다.** 이 설정은 모든 명령을 `sudo -n sh -c '<명령>'`로 실행하므로 sudoers에 사실상 무제한 권한(`ALL`)이 필요하고, 그 호스트의 root와 같습니다. 명령별 sudo 분리는 로드맵 M5-3에서 다룹니다. 지금은 아래처럼 **필요한 명령만 sudo로 허용하고 실행기에서 그 명령을 지정**하십시오.
-
-```
-# /etc/sudoers.d/vigilante (대상 호스트)
-Defaults:vigilante !requiretty
-Cmnd_Alias VGL_APP   = /usr/bin/systemctl restart order-api.service
-Cmnd_Alias VGL_NGINX = /usr/sbin/nginx -t, /usr/sbin/nginx -s reload
-vigilante ALL=(root) NOPASSWD: VGL_APP, VGL_NGINX
-```
+**sudo가 필요하면 `sudo_scope: changes`를 쓰십시오.** `connection.sudo: true`만 두면(`sudo_scope: all`) 모든 명령을 `sudo -n sh -c '<명령>'`로 실행하므로 sudoers에 사실상 무제한 권한(`ALL`)이 필요하고, 그 호스트의 root와 같습니다. `changes`이면 읽기는 sudo 없이, 바꾸는 명령만 하나씩 `sudo -n`으로 실행하므로 그 명령들만 허용하면 됩니다.
 
 ```yaml
 targets:
-  - {name: order-01, address: 10.0.1.11, connection: {type: ssh, credential: ssh-vigilante}}   # sudo 없음
-executors:
-  order-symlink:
-    type: symlink
-    symlink:
-      link: /opt/order/current
-      releases_dir: /opt/order/releases
-      restart_cmd: "sudo -n /usr/bin/systemctl restart order-api.service"
-traffic:
-  web-nginx:
-    type: nginx
-    nginx: {test_cmd: "sudo -n /usr/sbin/nginx -t", reload_cmd: "sudo -n /usr/sbin/nginx -s reload", ...}
+  - {name: order-01, address: 10.0.1.11, connection: {type: ssh, credential: ssh-vigilante, sudo: true, sudo_scope: changes}}
 ```
 
-- **symlink:** `/opt/order`(링크가 있는 디렉토리)에 `vigilante` 그룹 쓰기 권한을 줍니다(`ln -sfn` 후 `mv -Tf`로 원자 교체). 릴리스 디렉토리는 읽기만.
-- **nginx:** upstream 파일(`upstream_file`)과 그 디렉토리에 그룹 쓰기 권한. 설정 시험과 reload만 sudo.
+```bash
+vigilante sudoers -c vigilante.yaml --target order-01 > vigilante.sudoers   # 대상에 접속해 명령 경로까지 확인
+visudo -cf vigilante.sudoers && install -m 0440 vigilante.sudoers /etc/sudoers.d/vigilante   # 대상 호스트에서
+vigilante doctor -c vigilante.yaml      # 규칙마다 sudo -n -l로 허용 여부 확인 (실행하지 않음)
+```
+
+생성되는 규칙의 예(symlink 실행기, systemd):
+
+```
+Defaults:vigilante !requiretty
+vigilante ALL=(root) NOPASSWD: /usr/bin/ln -sfn /opt/order/releases/* /opt/order/current.vigilante-tmp
+vigilante ALL=(root) NOPASSWD: /usr/bin/mv -Tf /opt/order/current.vigilante-tmp /opt/order/current
+vigilante ALL=(root) NOPASSWD: /usr/bin/systemctl restart order-api
+```
+
+- sudoers의 `*`는 공백을 포함한 아무 문자열과 맞습니다. 릴리스·스냅샷 경로를 신뢰할 수 있는 계정만 쓸 수 있게 두십시오. 더 엄격하게 하려면 고정 인자를 받는 래퍼 스크립트를 만들어 그것만 허용하고 `restart_cmd`로 부르십시오.
+- **sudo 없이:** 링크 디렉토리(`/opt/order`)와 nginx upstream 파일에 `vigilante` 그룹 쓰기 권한을 주고, 재시작·reload만 `restart_cmd`·`reload_cmd`에 `sudo -n`을 넣어 허용하는 방법도 있습니다(`connection.sudo` 없음).
 - **HAProxy:** sudo 대신 runtime API 소켓 권한: `stats socket /run/haproxy/admin.sock mode 660 group vigilante level admin`.
 - **container:** Docker 소켓 접근은 root와 같습니다. 전용 호스트 계정과 감사를 두고, 가능하면 rootless Podman을 쓰십시오.
 - **kvm:** 하이퍼바이저에서 `libvirt` 그룹(polkit)으로 `virsh snapshot-*`·`domstate`를 허용합니다. 이 그룹은 그 호스트의 모든 VM을 제어할 수 있으므로 하이퍼바이저 접근 자체를 제한하십시오.
 - **에이전트의 자율 롤백(`agent.failsafe: rollback`)**은 대상 호스트에서 위 명령을 직접 실행하므로 같은 sudoers가 필요하고, systemd 유닛에 쓰기 경로를 추가해야 합니다(유닛 파일의 주석 참고).
+- **SSH 세션:** 대상마다 동시 세션을 `connection.max_sessions`(기본 8)로 제한하고 그중 `reserved_sessions`(기본 2)는 롤백에만 씁니다. 로그 프로브가 많아도 롤백 명령이 세션을 얻지 못하는 일이 없습니다.
 
 ## 외부 시스템 계정 (최소 역할)
 

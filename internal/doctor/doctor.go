@@ -26,6 +26,7 @@ import (
 	"vigilante/internal/executor"
 	"vigilante/internal/probe"
 	"vigilante/internal/secrets"
+	"vigilante/internal/sudoers"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -56,10 +57,11 @@ const (
 	ScopeProbe      = "프로브"
 	ScopeExecutor   = "실행기"
 	ScopeTraffic    = "트래픽"
+	ScopeSudo       = "sudo"
 	ScopeCapacity   = "용량"
 )
 
-var scopeOrder = map[string]int{ScopeCredential: 0, ScopeTarget: 1, ScopeProbe: 2, ScopeExecutor: 3, ScopeTraffic: 4, ScopeCapacity: 5}
+var scopeOrder = map[string]int{ScopeCredential: 0, ScopeTarget: 1, ScopeProbe: 2, ScopeExecutor: 3, ScopeTraffic: 4, ScopeSudo: 5, ScopeCapacity: 6}
 
 type Options struct {
 	Service     string // "" = every service
@@ -128,6 +130,9 @@ func Run(ctx context.Context, cfg *config.Config, opt Options) ([]Check, error) 
 		}
 	}
 	jobs = append(jobs, func(context.Context) []Check { return d.capacity(services) })
+	for _, job := range d.sudoJobs(services) {
+		jobs = append(jobs, job)
+	}
 
 	results := make([][]Check, len(jobs))
 	sem := make(chan struct{}, 8)
@@ -576,6 +581,66 @@ func (d *run) traffic(ctx context.Context, s *config.Service, first bool) []Chec
 		}
 	}
 	return out
+}
+
+// sudoJobs checks, per host with sudo_scope: changes, that every command
+// Vigilante will run with sudo is allowed (`sudo -n -l`, which runs nothing).
+// Hosts with plain connection.sudo get a warning: that needs unrestricted sudo.
+func (d *run) sudoJobs(services []*config.Service) []func(context.Context) []Check {
+	selected := map[string]bool{}
+	for _, s := range services {
+		selected[s.Name] = true
+	}
+	rules, _ := sudoers.Rules(d.cfg)
+	var mine []sudoers.Rule
+	for _, r := range rules {
+		if selected[r.Service] {
+			mine = append(mine, r)
+		}
+	}
+	var jobs []func(context.Context) []Check
+	for _, h := range sudoers.Group(d.cfg, mine) {
+		h := h
+		if !h.Sudo {
+			continue // commands run as the login user: file permissions decide
+		}
+		if h.Scope != "changes" {
+			jobs = append(jobs, func(context.Context) []Check {
+				return []Check{{Scope: ScopeSudo, Subject: h.Name, Name: "sudo 범위", Status: Warn,
+					Detail: "connection.sudo가 모든 명령을 `sudo -n sh -c`로 실행합니다 (무제한 sudo 필요)",
+					Hint:   "connection.sudo_scope: changes로 바꾸고 `vigilante sudoers --target " + h.Name + "`가 만든 규칙만 허용하십시오"}}
+			})
+			continue
+		}
+		jobs = append(jobs, func(ctx context.Context) []Check {
+			r, err := d.opt.Runners(h.Name)
+			if err != nil {
+				return []Check{{Scope: ScopeSudo, Subject: h.Name, Name: "sudo 규칙", Status: Fail, Detail: err.Error()}}
+			}
+			var out []Check
+			for _, rule := range h.Rules {
+				c := Check{Scope: ScopeSudo, Subject: h.Name, Name: rule.Command + " " + rule.Args}
+				path, found := sudoers.Resolve(ctx, r, rule.Command)
+				args := strings.Fields(sudoers.Example(rule.Args))
+				for i := range args {
+					args[i] = transport.ShellQuote(args[i])
+				}
+				_, err := r.Run(ctx, "sudo -n -l "+transport.ShellQuote(path)+" "+strings.Join(args, " "), nil)
+				switch {
+				case err == nil:
+					c.Status, c.Detail = OK, path+" 허용됨"
+				case !found:
+					c.Status, c.Detail = Fail, rule.Command+"를 찾지 못했습니다 ("+rule.Why+")"
+				default:
+					c.Status, c.Detail = Fail, "sudo가 허용하지 않습니다: "+rule.Why
+					c.Hint = "`vigilante sudoers --target " + h.Name + "`가 만든 규칙을 /etc/sudoers.d에 설치하십시오"
+				}
+				out = append(out, c)
+			}
+			return out
+		})
+	}
+	return jobs
 }
 
 // OpenSSH's default MaxSessions is 10 sessions per connection.

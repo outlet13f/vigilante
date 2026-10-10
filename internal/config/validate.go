@@ -392,6 +392,11 @@ func (c *Config) Validate() error {
 		if t.Connection.Bastion != "" && !targets[t.Connection.Bastion] {
 			bad("target %q: unknown bastion %q", t.Name, t.Connection.Bastion)
 		}
+		switch t.Connection.SudoScope {
+		case "", "all", "changes":
+		default:
+			bad("target %q: connection.sudo_scope must be all or changes", t.Name)
+		}
 		if cn := t.Connection; cn.MaxSessions < 0 || (cn.ReservedSessions != nil && *cn.ReservedSessions < 0) {
 			bad("target %q: max_sessions and reserved_sessions cannot be negative", t.Name)
 		} else if cn.ReservedSessions != nil && cn.MaxSessions > 0 && *cn.ReservedSessions >= cn.MaxSessions {
@@ -1035,6 +1040,16 @@ func (c *Config) Warnings() []string {
 			out = append(out, fmt.Sprintf("service %q: rollback.mode is not set, so a failing phase rolls back automatically (auto). "+
 				"Set mode: approve to have a person approve each rollback (recommended until the service has passed the pilot), or mode: auto to keep the current behaviour explicitly", s.Name))
 		}
+	}
+	var rootSudo []string
+	for _, t := range c.Targets {
+		if t.Connection.Sudo && t.Connection.SudoScope != "changes" {
+			rootSudo = append(rootSudo, t.Name)
+		}
+	}
+	if len(rootSudo) > 0 {
+		out = append(out, fmt.Sprintf("connection.sudo runs every command as `sudo -n sh -c` on %s, which needs unrestricted sudo (root). "+
+			"Set connection.sudo_scope: changes and install the rules from `vigilante sudoers` (docs/10-security.md)", strings.Join(rootSudo, ", ")))
 	}
 	if cc := c.Console; !cc.Disabled && cc.RedirectURL != "" {
 		if cc.SessionKeyRef == "" {

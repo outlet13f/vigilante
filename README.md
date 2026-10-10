@@ -75,6 +75,7 @@ vigilante store status -c vigilante.yaml                               # Postgre
 vigilante support-bundle -c vigilante.yaml --server https://vigilante:8088   # 진단 zip (비밀값 제거)
 vigilante feedback --id $BUILD --outcome false_positive --note "..."       # 판정 평가 (오탐·미탐 측정)
 vigilante pilot report -c vigilante.yaml --since 2026-11-01            # 판정 품질 보고서와 출시 게이트 (미달 시 종료 코드 4)
+vigilante sudoers -c vigilante.yaml --target order-bm-01                # sudo_scope: changes용 sudoers 규칙 (필요한 명령만)
 vigilante lab run -c lab.yaml --service S --label "F5 VE 17.1" --inject "..."   # 실장비 시나리오 (docs/09)
 ```
 
@@ -93,5 +94,5 @@ vigilante lab run -c lab.yaml --service S --label "F5 VE 17.1" --inject "..."   
 - 판정 품질(오탐·미탐 비율)은 실제 서비스에서 측정한 적이 없습니다. 프리셋 임계치는 추정값이며, M8 파일럿에서 보정합니다.
 - `host` 프로브는 Linux `/proc` 전용입니다. AIX/Solaris/HP-UX는 `exec` 기반 프로브 추가가 필요합니다.
 - Azure Load Balancer / Application Gateway, Citrix ADC 등은 `TrafficController` 구현 추가가 필요합니다 (현재는 `exec`/`webhook`으로 우회).
-- `connection.sudo: true`는 모든 명령을 `sudo sh -c`로 실행해 사실상 root 권한이 필요합니다. 명령별로 좁히는 방법은 [docs/10-security.md](docs/10-security.md), 근본 해결은 로드맵 M5-3입니다.
+- sudo가 필요한 대상은 `connection.sudo_scope: changes`와 `vigilante sudoers`로 바꾸는 명령만 허용하십시오. `sudo_scope`를 두지 않으면 기존처럼 모든 명령을 `sudo sh -c`로 실행해 사실상 root 권한이 필요합니다([docs/10-security.md](docs/10-security.md)).
 - CI(`.github/workflows/ci.yml`)가 PR마다 `go test -race`, 명세 린트, API 하위호환 검사, govulncheck, E2E 데모를 실행합니다.

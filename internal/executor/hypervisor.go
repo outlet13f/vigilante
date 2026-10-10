@@ -222,8 +222,8 @@ func (k *kvmExec) Prepare(ctx context.Context, rc *RunContext) (map[string]strin
 	if err != nil {
 		return nil, err
 	}
-	cmd := fmt.Sprintf("virsh snapshot-create-as --domain %s --name %s --description %s --atomic",
-		q.ShellQuote(dom), q.ShellQuote(snap), q.ShellQuote("vigilante pre-deploy checkpoint"))
+	cmd := fmt.Sprintf("%svirsh snapshot-create-as --domain %s --name %s --description %s --atomic",
+		q.Sudo(r), q.ShellQuote(dom), q.ShellQuote(snap), q.ShellQuote("vigilante pre-deploy checkpoint"))
 	if _, err := r.Run(ctx, cmd, nil); err != nil {
 		return nil, err
 	}
@@ -239,9 +239,22 @@ func (k *kvmExec) Rollback(ctx context.Context, rc *RunContext) error {
 	if err != nil {
 		return err
 	}
-	_, err = r.Run(ctx, fmt.Sprintf("virsh snapshot-revert --domain %s --snapshotname %s --running --force",
-		q.ShellQuote(dom), q.ShellQuote(snap)), nil)
+	_, err = r.Run(ctx, fmt.Sprintf("%svirsh snapshot-revert --domain %s --snapshotname %s --running --force",
+		q.Sudo(r), q.ShellQuote(dom), q.ShellQuote(snap)), nil)
 	return err
+}
+
+// SudoRules: snapshot and revert on the hypervisor host (an account in the
+// libvirt group needs no sudo at all).
+func (k *kvmExec) SudoRules(rc *RunContext) ([]SudoRule, error) {
+	dom, err := rc.render(k.spec.Domain)
+	if err != nil {
+		return nil, err
+	}
+	return []SudoRule{
+		{k.spec.Hypervisor, "virsh", "snapshot-create-as --domain " + dom + " --name * --description vigilante pre-deploy checkpoint --atomic", "checkpoint before the deployment"},
+		{k.spec.Hypervisor, "virsh", "snapshot-revert --domain " + dom + " --snapshotname * --running --force", "revert to the checkpoint"},
+	}, nil
 }
 
 func (k *kvmExec) Verify(ctx context.Context, rc *RunContext) error {

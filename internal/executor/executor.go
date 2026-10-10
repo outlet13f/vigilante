@@ -41,6 +41,27 @@ type Executor interface {
 	Verify(ctx context.Context, rc *RunContext) error
 }
 
+// SudoRule is a command a strategy runs with sudo when the host's
+// connection.sudo_scope is "changes". Args are as sudo sees them (after
+// the shell removed quotes); "*" stands for values only known at rollback
+// time (a release directory, a snapshot name).
+type SudoRule struct {
+	Host    string `json:"host"` // target the command runs on
+	Command string `json:"command"`
+	Args    string `json:"args"`
+	Why     string `json:"why"`
+}
+
+// SudoRules is implemented by executors that change things with commands.
+type SudoRules interface {
+	SudoRules(rc *RunContext) ([]SudoRule, error)
+}
+
+// TrafficSudoRules is the same for traffic controllers.
+type TrafficSudoRules interface {
+	SudoRules() []SudoRule
+}
+
 // Preparer is implemented by strategies that must capture state before the
 // deployment (VM snapshots, current symlink target). `vigilante prepare`
 // calls it; the result is stored as the deployment checkpoint.

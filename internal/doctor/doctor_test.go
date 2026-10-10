@@ -213,3 +213,31 @@ func TestDoctorChecksVaultReferences(t *testing.T) {
 		t.Fatalf("hint should point at the vault policy: %+v", got)
 	}
 }
+
+func TestDoctorChecksSudoRules(t *testing.T) {
+	cfg := testConfig(t, 0)
+	// app-1 keeps plain sudo (warned); app-2 runs only the changes with sudo.
+	cfg.Targets[1].Connection.Sudo, cfg.Targets[1].Connection.SudoScope = true, "changes"
+	m := runners()
+	m["app-2"].
+		On("command -v 'systemctl'", "/usr/bin/systemctl\n", nil).
+		On("command -v", "/usr/bin/x\n", nil).
+		On("sudo -n -l '/usr/bin/systemctl' 'restart' 'app'", "", errors.New("exit status 1")).
+		On("sudo -n -l", "", nil)
+	cs, err := Run(context.Background(), cfg, Options{Runners: func(n string) (transport.Runner, error) { return m[n], nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := find(t, cs, ScopeSudo, "app-1", "sudo 범위"); c.Status != Warn || !strings.Contains(c.Hint, "sudo_scope: changes") {
+		t.Errorf("plain sudo must warn: %+v", c)
+	}
+	if c := find(t, cs, ScopeSudo, "app-2", "ln -sfn /opt/app/releases/* /opt/app/current.vigilante-tmp"); c.Status != OK {
+		t.Errorf("allowed ln: %+v", c)
+	}
+	if c := find(t, cs, ScopeSudo, "app-2", "systemctl restart app"); c.Status != Fail || !strings.Contains(c.Hint, "vigilante sudoers --target app-2") {
+		t.Errorf("refused restart: %+v", c)
+	}
+	if !strings.Contains(m["app-2"].Joined(), "sudo -n -l '/usr/bin/x' '-sfn' '/opt/app/releases/vigilante-check' '/opt/app/current.vigilante-tmp'") {
+		t.Errorf("wildcards must be checked with a sample value:\n%s", m["app-2"].Joined())
+	}
+}

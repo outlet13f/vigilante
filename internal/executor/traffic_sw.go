@@ -133,17 +133,59 @@ func (n *nginxTraffic) set(ctx context.Context, ms []Member, down bool) error {
 		}
 		bak := transport.ShellQuote(n.spec.UpstreamFile + ".vigilante-bak")
 		tmp := transport.ShellQuote(n.spec.UpstreamFile + ".vigilante-new")
+		sudo := transport.Sudo(w)
+		test, reload := n.spec.TestCmd, n.spec.ReloadCmd
+		if test == defaultNginxTest {
+			test = sudo + test
+		}
+		if reload == defaultNginxReload {
+			reload = sudo + reload
+		}
 		script := fmt.Sprintf(`set -e
-cp -p %[1]s %[2]s
-cat > %[3]s
-mv %[3]s %[1]s
-if ! %[4]s 2>&1; then cp -p %[2]s %[1]s; echo "config test failed; restored previous upstream file" >&2; exit 1; fi
-%[5]s`, f, bak, tmp, n.spec.TestCmd, n.spec.ReloadCmd)
+%[6]scp -p %[1]s %[2]s
+%[7]s
+%[6]smv %[3]s %[1]s
+if ! %[4]s 2>&1; then %[6]scp -p %[2]s %[1]s; echo "config test failed; restored previous upstream file" >&2; exit 1; fi
+%[5]s`, f, bak, tmp, test, reload, sudo, writeFile(sudo, tmp))
 		if _, err := w.Run(ctx, script, strings.NewReader(next)); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", host, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// The built-in commands; customised test_cmd / reload_cmd are run as written.
+const (
+	defaultNginxTest   = "nginx -t"
+	defaultNginxReload = "nginx -s reload"
+)
+
+// writeFile writes stdin to a file, through sudo tee when the file needs it.
+func writeFile(sudo, quotedPath string) string {
+	if sudo == "" {
+		return "cat > " + quotedPath
+	}
+	return sudo + "tee " + quotedPath + " > /dev/null"
+}
+
+// SudoRules: replace the upstream file, test and reload nginx on each LB host.
+func (n *nginxTraffic) SudoRules() []SudoRule {
+	f := n.spec.UpstreamFile
+	var out []SudoRule
+	for _, h := range n.spec.Hosts {
+		out = append(out,
+			SudoRule{h, "cp", "-p " + f + " " + f + ".vigilante-bak", "keep the current upstream file"},
+			SudoRule{h, "tee", f + ".vigilante-new", "write the new upstream file"},
+			SudoRule{h, "mv", f + ".vigilante-new " + f, "replace the upstream file"},
+			SudoRule{h, "cp", "-p " + f + ".vigilante-bak " + f, "restore it when the config test fails"})
+		if n.spec.TestCmd == defaultNginxTest {
+			out = append(out, SudoRule{h, "nginx", "-t", "test the configuration"})
+		}
+		if n.spec.ReloadCmd == defaultNginxReload {
+			out = append(out, SudoRule{h, "nginx", "-s reload", "apply it"})
+		}
+	}
+	return out
 }
 
 func (n *nginxTraffic) Drain(ctx context.Context, ms []Member) error  { return n.set(ctx, ms, true) }
@@ -375,12 +417,25 @@ func (e *envoyTraffic) set(ctx context.Context, ms []Member, draining bool) erro
 			w = &transport.DryRun{Inner: r, Log: e.env.Log}
 		}
 		tmp := transport.ShellQuote(e.spec.EDSFile + ".vigilante-new")
-		script := fmt.Sprintf("set -e\ncat > %[2]s\nmv %[2]s %[1]s", f, tmp)
+		sudo := transport.Sudo(w)
+		script := fmt.Sprintf("set -e\n%[3]s\n%[4]smv %[2]s %[1]s", f, tmp, writeFile(sudo, tmp), sudo)
 		if _, err := w.Run(ctx, script, strings.NewReader(string(next))); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", host, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// SudoRules: replace the EDS file on each Envoy host.
+func (e *envoyTraffic) SudoRules() []SudoRule {
+	f := e.spec.EDSFile
+	var out []SudoRule
+	for _, h := range e.spec.Hosts {
+		out = append(out,
+			SudoRule{h, "tee", f + ".vigilante-new", "write the new endpoints file"},
+			SudoRule{h, "mv", f + ".vigilante-new " + f, "replace the endpoints file (Envoy reloads it)"})
+	}
+	return out
 }
 
 func (e *envoyTraffic) Drain(ctx context.Context, ms []Member) error  { return e.set(ctx, ms, true) }

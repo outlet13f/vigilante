@@ -52,7 +52,7 @@ func (m *Manager) ForTarget(name string) (Runner, error) {
 	}
 	switch t.Connection.Type {
 	case "local":
-		return &Local{Sudo: t.Connection.Sudo}, nil
+		return &Local{Sudo: t.Connection.Sudo, Scope: t.Connection.SudoScope}, nil
 	case "ssh":
 		return &SSH{m: m, target: t}, nil
 	}
@@ -284,11 +284,13 @@ type SSH struct {
 func (s *SSH) String() string { return "ssh://" + s.target.Name }
 
 func (s *SSH) wrap(cmd string) string {
-	if s.target.Connection.Sudo {
+	if wrapAll(s.target.Connection) {
 		return "sudo -n sh -c " + ShellQuote(cmd)
 	}
 	return cmd
 }
+
+func (s *SSH) SudoPrefix() string { return sudoPrefix(s.target.Connection) }
 
 func (m *Manager) limiter(t *config.Target) *sessionLimiter {
 	m.mu.Lock()

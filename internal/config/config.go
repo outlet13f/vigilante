@@ -333,12 +333,17 @@ type Target struct {
 }
 
 type Connection struct {
-	Type       string        `yaml:"type"` // ssh | local | none
-	Credential string        `yaml:"credential"`
-	Port       int           `yaml:"port"`
-	Bastion    string        `yaml:"bastion"` // name of another target used as jump host
-	Sudo       bool          `yaml:"sudo"`
-	Timeout    time.Duration `yaml:"timeout"`
+	Type       string `yaml:"type"` // ssh | local | none
+	Credential string `yaml:"credential"`
+	Port       int    `yaml:"port"`
+	Bastion    string `yaml:"bastion"` // name of another target used as jump host
+	Sudo       bool   `yaml:"sudo"`
+	// SudoScope: "all" (default with sudo: true) runs every command as
+	// `sudo -n sh -c`, which needs unrestricted sudo; "changes" runs reads
+	// without sudo and prefixes only the changing commands, so sudoers can
+	// allow exactly those (`vigilante sudoers` writes the rules).
+	SudoScope string        `yaml:"sudo_scope"`
+	Timeout   time.Duration `yaml:"timeout"`
 	// MaxSessions caps concurrent SSH sessions to this target (default 8,
 	// under sshd's MaxSessions of 10); ReservedSessions of them (default 2)
 	// are kept for rollback steps and traffic changes.

@@ -78,28 +78,28 @@ targets:
   - name: order-bm-01
     kind: baremetal
     address: 10.10.1.11
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   - name: order-bm-02
     kind: baremetal
     address: 10.10.1.12
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   - name: order-bm-03
     kind: baremetal
     address: 10.10.1.13
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   - name: order-bm-04
     kind: baremetal
     address: 10.10.1.14
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   # --- software load balancers -----------------------------------------------
   - name: lb-nginx-01
     kind: vm
     address: 10.10.0.21
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   - name: lb-nginx-02
     kind: vm
     address: 10.10.0.22
-    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, bastion: bastion-dc1, sudo: true, sudo_scope: changes}
   - name: lb-haproxy-01
     kind: vm
     address: 10.10.0.31
@@ -118,7 +118,7 @@ targets:
   - name: kvm-host-01
     kind: baremetal
     address: 10.20.0.5
-    connection: {type: ssh, credential: ssh-deploy, sudo: true}
+    connection: {type: ssh, credential: ssh-deploy, sudo: true, sudo_scope: changes}
   # --- public cloud IaaS (EC2 behind an ALB) ----------------------------------
   - name: web-ec2-a
     kind: cloud_vm

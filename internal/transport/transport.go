@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"vigilante/internal/config"
 )
 
 // Runner executes shell commands on a target.
@@ -62,15 +64,46 @@ func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
+// Sudoer is implemented by runners that elevate single commands
+// (connection.sudo with sudo_scope: changes).
+type Sudoer interface {
+	SudoPrefix() string
+}
+
+// Sudo returns what to put before a changing command on r: "sudo -n " or "".
+// Reads never take it; with sudo_scope all the whole command line is
+// already wrapped by the runner.
+func Sudo(r Runner) string {
+	if s, ok := r.(Sudoer); ok {
+		return s.SudoPrefix()
+	}
+	return ""
+}
+
+func sudoPrefix(c config.Connection) string {
+	if c.Sudo && c.SudoScope == "changes" {
+		return "sudo -n "
+	}
+	return ""
+}
+
+func wrapAll(c config.Connection) bool { return c.Sudo && c.SudoScope != "changes" }
+
 // Local runs commands on the machine executing vigilante.
 type Local struct {
 	Sudo bool
+	// Scope is connection.sudo_scope ("" or "all": wrap every command).
+	Scope string
+}
+
+func (l *Local) SudoPrefix() string {
+	return sudoPrefix(config.Connection{Sudo: l.Sudo, SudoScope: l.Scope})
 }
 
 func (l *Local) String() string { return "local" }
 
 func (l *Local) command(ctx context.Context, cmd string) *exec.Cmd {
-	if l.Sudo && runtime.GOOS != "windows" {
+	if wrapAll(config.Connection{Sudo: l.Sudo, SudoScope: l.Scope}) && runtime.GOOS != "windows" {
 		return exec.CommandContext(ctx, "sudo", "-n", "sh", "-c", cmd)
 	}
 	return shellCommand(ctx, cmd)
@@ -122,6 +155,8 @@ type DryRun struct {
 }
 
 func (d *DryRun) String() string { return "dry-run(" + d.Inner.String() + ")" }
+
+func (d *DryRun) SudoPrefix() string { return Sudo(d.Inner) }
 
 var readOnlyPrefixes = []string{"readlink ", "cat ", "test ", "systemctl is-active ", "virsh domstate ", "virsh snapshot-list ", "ls "}
 

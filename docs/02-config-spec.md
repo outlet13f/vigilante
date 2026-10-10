@@ -168,9 +168,15 @@ credentials:
     credential: ssh-deploy
     port: 22
     bastion: bastion-dc1     # 다른 target을 점프 호스트로 (다단 가능)
-    sudo: true               # 모든 명령을 sudo -n sh -c 로 감쌈
+    sudo: true               # 변경 명령에 sudo 사용
+    sudo_scope: changes      # changes: 변경 명령만 하나씩 sudo -n (권장) | all(기본): 모든 명령을 sudo -n sh -c 로 감쌈
     timeout: 10s
+    max_sessions: 8          # 이 대상에 동시에 여는 SSH 세션 상한 (sshd MaxSessions 기본 10보다 작게)
+    reserved_sessions: 2     # 그중 롤백·트래픽 변경만 쓰는 몫
 ```
+
+- **`sudo_scope`:** `all`(기존 동작, 기본값)은 모든 명령을 `sudo -n sh -c '...'`로 실행하므로 sudoers에 무제한 권한이 필요하고, `validate`가 경고합니다. `changes`는 읽기(`readlink`, `cat`, `tail`, `systemctl is-active`, `virsh domstate` 등)를 sudo 없이 실행하고, 바꾸는 명령(`ln`, `mv`, `systemctl restart`, `nginx -s reload`, `virsh snapshot-revert` 등)에만 하나씩 `sudo -n`을 붙입니다. 필요한 sudoers 규칙은 `vigilante sudoers`가 대상별로 만들어 주고, `vigilante doctor`가 규칙마다 `sudo -n -l`로 허용 여부를 확인합니다(실행하지 않음). 직접 쓴 명령(`exec` 실행기, `restart_cmd`, 바꾼 `test_cmd`·`reload_cmd`)은 쓴 그대로 실행되므로 필요하면 명령 안에 `sudo -n`을 넣고 규칙을 직접 추가합니다.
+- **SSH 세션 예산:** 로그 스트림은 실행되는 동안 세션을 하나씩 쥡니다. 세션이 모자라 롤백 명령이 막히지 않도록, 수집은 `max_sessions - reserved_sessions`까지만 쓰고 기다리며, 롤백 단계와 트래픽 드레인·복귀만 예약분을 씁니다. 대기는 `vigilante_ssh_session_waits_total{priority}`로 보이고, `doctor`가 로그 스트림 수와 수집 몫을 비교합니다.
 
 ## `services[].probes[]` — 수집 플러그인
 
