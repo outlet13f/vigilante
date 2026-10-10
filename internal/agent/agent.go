@@ -23,6 +23,7 @@ import (
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/probe"
 	"vigilante/internal/rules"
+	"vigilante/internal/tlsconf"
 	"vigilante/internal/transport"
 )
 
@@ -68,7 +69,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	local := *t
 	local.Connection.Type = "local"
 	a.store = metrics.NewStore(30 * time.Minute)
+	tc, err := tlsconf.Client(a.Cfg.Agent.TLS)
+	if err != nil {
+		return err
+	}
 	a.client = &http.Client{Timeout: 10 * time.Second}
+	if tc != nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = tc
+		a.client.Transport = tr
+	}
 	a.lastOK = time.Now()
 
 	var jobs []probe.Job

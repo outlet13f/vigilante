@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -47,21 +48,21 @@ func buildInfo() string {
 
 // printPlugins lists the plugins in this binary with their verification
 // level (docs/09-compatibility.md).
-func printPlugins() {
+func printPlugins(w io.Writer) {
 	execs, traffic := executor.Types()
-	fmt.Printf("%s build; verified = run against the real system, experimental = tests against mocks/simulators only\n\n", flavor)
+	fmt.Fprintf(w, "%s build; verified = run against the real system, experimental = tests against mocks/simulators only\n\n", flavor)
 	for _, k := range []struct {
 		title, kind string
 		have        []string
 	}{{"probes", "probe", probe.Types()}, {"executors", "executor", execs}, {"traffic", "traffic", traffic}} {
-		fmt.Println(k.title + ":")
+		fmt.Fprintln(w, k.title+":")
 		for _, t := range k.have {
 			e := compat.Lookup(k.kind, t)
-			fmt.Printf("  %-11s %-13s %s\n", t, e.Level, e.Against)
+			fmt.Fprintf(w, "  %-11s %-13s %s\n", t, e.Level, e.Against)
 		}
 		for _, e := range compat.Kinds(k.kind) {
 			if !slices.Contains(k.have, e.Type) {
-				fmt.Printf("  %-11s %-13s %s\n", e.Type, "-", "not in this build (full build only)")
+				fmt.Fprintf(w, "  %-11s %-13s %s\n", e.Type, "-", "not in this build (full build only)")
 			}
 		}
 	}

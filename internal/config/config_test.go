@@ -349,6 +349,10 @@ services:
 		"itsm: {servicenow: {url: u, credential: snow, incidents: {urgency: 9}}}\n":                  "urgency and impact must be 1..3",
 		"console: {redirect_url: https://v.example/console/auth/callback}\n":                         "needs auth.oidc",
 		"auth: {oidc: {issuer: i, audience: a}}\nconsole: {redirect_url: https://v.example/login}\n": "/console/auth/callback",
+		"server: {tls: {cert_file: a.crt}}\n":                                                        "cert_file and key_file required",
+		"server: {tls: {cert_file: a.crt, key_file: a.key, client_auth: require}}\n":                 "needs client_ca_file",
+		"server: {tls: {cert_file: a.crt, key_file: a.key, min_version: \"1.1\"}}\n":                 "min_version must be 1.2 or 1.3",
+		"agent: {tls: {cert_file: a.crt}}\n":                                                         "cert_file and key_file go together",
 		"console: {session_key_ref: plain-text-key}\n":                                               "console.session_key_ref",
 	} {
 		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {

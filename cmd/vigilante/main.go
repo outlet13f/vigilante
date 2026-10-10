@@ -34,6 +34,7 @@ import (
 	"vigilante/internal/secrets"
 	"vigilante/internal/store"
 	"vigilante/internal/telemetry"
+	"vigilante/internal/tlsconf"
 )
 
 var version = "0.1.0-dev"
@@ -60,6 +61,7 @@ Usage:
   vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
                      | query [--actor A] [--action X] [--service S] [--since DATE]
   vigilante store    status | migrate [--down-to N --yes]   (PostgreSQL state store schema)
+  vigilante support-bundle -c FILE [--server URL] [--log FILE]... [--out F.zip]   (diagnostics, secrets removed)
   vigilante plugins
   vigilante version
 
@@ -164,7 +166,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		fmt.Print(usage)
 		return 0, nil
 	case "plugins":
-		printPlugins()
+		printPlugins(os.Stdout)
 		return 0, nil
 	case "validate":
 		c := newFlags(cmd)
@@ -210,6 +212,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdAudit(ctx, args)
 	case "store":
 		return cmdStore(ctx, args)
+	case "support-bundle":
+		return cmdSupportBundle(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":
@@ -603,15 +607,23 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 			}
 		}()
 	}
-	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	tc, err := tlsconf.Server(e.Cfg.Server.TLS)
+	if err != nil {
+		return 1, err
+	}
+	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, TLSConfig: tc}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = hs.Shutdown(sctx)
 	}()
-	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
-	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "tls", tc != nil, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
+	serve := hs.ListenAndServe
+	if tc != nil {
+		serve = func() error { return hs.ListenAndServeTLS("", "") } // certificates come from TLSConfig
+	}
+	if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return 1, err
 	}
 	srv.Close() // let in-flight observations and rollbacks record where they stopped

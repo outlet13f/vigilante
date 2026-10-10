@@ -704,6 +704,26 @@ func (c *Config) Validate() error {
 			bad("server.ha.lease_ttl must be at least 3s")
 		}
 	}
+	if t := c.Server.TLS; t != nil {
+		if t.CertFile == "" || t.KeyFile == "" {
+			bad("server.tls: cert_file and key_file required")
+		}
+		switch t.ClientAuth {
+		case "", "none":
+		case "optional", "require":
+			if t.ClientCAFile == "" {
+				bad("server.tls.client_auth %s needs client_ca_file", t.ClientAuth)
+			}
+		default:
+			bad("server.tls.client_auth must be none, optional or require")
+		}
+		if t.MinVersion != "" && t.MinVersion != "1.2" && t.MinVersion != "1.3" {
+			bad("server.tls.min_version must be 1.2 or 1.3")
+		}
+	}
+	if t := c.Agent.TLS; t != nil && (t.CertFile == "") != (t.KeyFile == "") {
+		bad("agent.tls: cert_file and key_file go together")
+	}
 	c.validateAuth(services, bad)
 	c.validateSecrets(bad)
 	c.validateFreezes(bad)

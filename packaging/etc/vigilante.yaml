@@ -14,6 +14,8 @@ server:
   # Several servers sharing PostgreSQL (see the install guide, HA):
   # state: {backend: postgres, dsn_env: VIGILANTE_DSN}
   # ha: {enabled: true, advertise_url: "https://vigilante-1.example.internal:8088"}
+  # HTTPS directly (or put a TLS proxy in front):
+  # tls: {cert_file: /etc/vigilante/tls/server.crt, key_file: /etc/vigilante/tls/server.key}
 
 # Without auth.* every API call is anonymous admin: set it before exposing
 # the server. Service-account tokens: vigilante token create --name ci --role deployer

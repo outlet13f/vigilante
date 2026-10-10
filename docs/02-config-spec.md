@@ -57,6 +57,9 @@ console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 | `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름. 환경변수 `VIGILANTE_HA_NODE_ID`가 우선 |
 | `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
 | `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
+| `tls.cert_file` / `tls.key_file` | — | 있으면 HTTPS로 직접 서비스(TLS 1.2 이상). 파일이 바뀌면 재시작 없이 새 인증서를 씀(cert-manager·갱신 작업). 없으면 HTTP이므로 앞에 TLS 프록시·인그레스를 둠 |
+| `tls.client_ca_file` / `tls.client_auth` | —, `none` | 클라이언트 인증서 검증. `optional`: 제시된 인증서만 검증(에이전트는 인증서, 브라우저·CI는 토큰), `require`: 모든 클라이언트에 인증서 요구. 어느 경우든 API 토큰 인증은 그대로 |
+| `tls.min_version` | `1.2` | `1.3`으로 올릴 수 있음 |
 
 ```yaml
 server:
@@ -116,6 +119,8 @@ scrape_configs:
 | `heartbeat_interval` | `5s` | 오케스트레이터 생존 확인 + 활성 배포 정보 수신 |
 | `failsafe_after` | `30s` | 하트비트 단절 후 자율 판정 시작까지 |
 | `failsafe` | `hold` | `hold`(로그·알림만) \| `rollback`(자기 호스트만, 트래픽 단계 제외 플랜으로 롤백) |
+| `tls.ca_file` | 시스템 신뢰 저장소 | 서버 인증서를 발급한 사설 CA |
+| `tls.cert_file` / `tls.key_file` | — | 서버가 `client_auth: optional`·`require`일 때 제시할 에이전트 인증서. 파일이 바뀌면 다시 읽음 |
 
 ## `credentials.<name>`
 
