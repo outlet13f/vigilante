@@ -465,6 +465,16 @@ services:
       executor: billing-os-snap
       traffic: billing-lb
 
+# Change freezes: new deployments are refused, automatic rollback stays allowed.
+change_freeze:
+  - name: weekend
+    weekly: {from: "fri 18:00", to: "mon 09:00", timezone: Asia/Seoul}
+    services: [billing-api]
+  - name: year-end-closing
+    reason: financial year-end closing
+    start: "2026-12-28T00:00:00+09:00"
+    end: "2027-01-02T00:00:00+09:00"
+
 safety:
   observer_quorum: true                   # central and agent must agree before a rollback
   circuit_breaker:

@@ -85,6 +85,7 @@ type Engine struct {
 	operations  map[string]*model.Operation
 	liveOps     map[string]bool // operations this node is running
 	idem        map[string]*model.IdemRecord
+	freezes     map[string]*model.Freeze
 	clients     map[string]*model.APIClient
 	clientMu    sync.Mutex // orders client snapshots
 	tokens      map[string]*model.AccessToken
@@ -162,6 +163,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
 	e.operations, e.idem = st.Operations, st.Idempotency
 	e.clients, e.tokens = st.Clients, st.Tokens
+	e.freezes = st.Freezes
 	e.Breaker, e.Guard = breaker, guard
 	e.mu.Unlock()
 	e.hookMu.Lock()
@@ -587,8 +589,8 @@ func (e *Engine) Watch(ctx context.Context, d *model.Deployment, phase model.Pha
 	if len(svc.PhaseTargets(string(phase))) == 0 {
 		return fmt.Errorf("service %s phase %s resolves to no targets", svc.Name, phase)
 	}
-	if st := e.Breaker.State(); st.State == safety.Open {
-		return fmt.Errorf("%w: %w (%s); reset with `vigilante circuit reset` after investigation", ErrBlocked, safety.ErrCircuitOpen, st.Reason)
+	if err := e.Gate(d); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()

@@ -32,6 +32,8 @@ type Config struct {
 	Audit      Audit    `yaml:"audit"`
 	Secrets    Secrets  `yaml:"secrets"`
 	API        API      `yaml:"api"`
+	// ChangeFreeze windows refuse new deployments (see freeze.go).
+	ChangeFreeze []Freeze `yaml:"change_freeze"`
 }
 
 // API configures the public API: per-caller rate limits and OAuth tokens.

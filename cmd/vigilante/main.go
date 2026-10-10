@@ -217,6 +217,7 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 
 func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	c := newFlags("prepare")
+	override := c.fs.String("freeze-override", "", "reason to proceed during a change freeze (recorded in the audit trail)")
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
@@ -226,11 +227,10 @@ func cmdPrepare(ctx context.Context, args []string) (int, error) {
 	}
 	defer e.Close()
 	notes := autoFill(c, e)
-	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	d, code, err := createGated(e, c, *override)
 	if err != nil {
-		return 1, err
+		return code, err
 	}
-	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	cliAudit(e, c, "deployment.prepare", d.Service, d.ID, "")
 	err = e.Prepare(ctx, d)
@@ -267,6 +267,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	c := newFlags("watch")
 	phase := c.fs.String("phase", "canary", "canary | rolling | full")
 	baseline := c.fs.String("baseline", "", "baseline snapshot file from `vigilante baseline`")
+	override := c.fs.String("freeze-override", "", "reason to proceed during a change freeze (recorded in the audit trail)")
 	if err := c.fs.Parse(args); err != nil {
 		return 1, err
 	}
@@ -282,11 +283,10 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	notes := autoFill(c, e)
-	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	d, code, err := createGated(e, c, *override)
 	if err != nil {
-		return 1, err
+		return code, err
 	}
-	e.SetCreatedBy(d, cliActor())
 	annotate(e, d, notes)
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
@@ -294,7 +294,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 	cliAudit(e, c, "phase.start", d.Service, d.ID, *phase)
 	if err := e.Watch(ctx, d, model.Phase(*phase)); err != nil {
 		e.MarkBlocked(d, err)
-		if errors.Is(err, safety.ErrCircuitOpen) {
+		if errors.Is(err, orchestrator.ErrBlocked) || errors.Is(err, safety.ErrCircuitOpen) {
 			return 3, err
 		}
 		return 1, err
@@ -625,4 +625,25 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	return 0, nil
+}
+
+// createGated registers the deployment unless a change freeze refuses new
+// ones (exit code 3, like an open circuit). With an override reason it
+// proceeds and records who overrode which freeze.
+func createGated(e *orchestrator.Engine, c *common, override string) (*model.Deployment, int, error) {
+	if c.id == "" || e.Live(c.id) == nil {
+		if err := e.FreezeGate(c.service, override); err != nil {
+			return nil, 3, err
+		}
+	}
+	d, err := e.Create(c.id, c.service, c.ver, c.prev)
+	if err != nil {
+		return nil, 1, err
+	}
+	e.SetCreatedBy(d, cliActor())
+	if f := e.ActiveFreeze(d.Service, time.Now()); f != nil && override != "" && d.FreezeOverride == "" {
+		e.SetFreezeOverride(d, cliActor(), override)
+		cliAudit(e, c, "freeze.override", d.Service, d.ID, f.Name+": "+override)
+	}
+	return d, 0, nil
 }

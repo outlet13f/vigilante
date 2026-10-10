@@ -105,9 +105,12 @@ type Deployment struct {
 	// PendingRollback is the rollback prepared for a failed phase of a
 	// service in approve mode, waiting for a decision.
 	PendingRollback *PendingRollback `json:"pending_rollback,omitempty"`
-	Events          []Event          `json:"events,omitempty"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	// FreezeOverride records why this deployment may proceed during a
+	// change freeze, and who allowed it.
+	FreezeOverride string    `json:"freeze_override,omitempty"`
+	Events         []Event   `json:"events,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.
@@ -145,4 +148,21 @@ type PendingRollback struct {
 	DetectedAt  time.Time `json:"detected_at"`
 	// Escalated is set once the timeout alert went out (on_timeout: hold).
 	Escalated bool `json:"escalated,omitempty"`
+}
+
+// Freeze is a change freeze declared at runtime through the API (incident
+// freezes, ad-hoc holidays); config windows live in the config.
+type Freeze struct {
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Reason        string     `json:"reason,omitempty"`
+	StartsAt      time.Time  `json:"starts_at"`
+	EndsAt        time.Time  `json:"ends_at"`
+	Services      []string   `json:"services"`
+	Teams         []string   `json:"teams"`
+	AllowRollback bool       `json:"allow_rollback"`
+	CreatedBy     string     `json:"created_by,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	EndedBy       string     `json:"ended_by,omitempty"`
+	EndedAt       *time.Time `json:"ended_at,omitempty"` // ended early
 }

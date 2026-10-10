@@ -84,6 +84,10 @@ func (e *Engine) Rollback(ctx context.Context, d *model.Deployment, opt Rollback
 	svc, _ := e.Cfg.Service(d.Service)
 	targets := e.rollbackTargets(d, svc, opt)
 	if !opt.Manual {
+		if f := e.ActiveFreeze(svc.Name, time.Now()); f != nil && !f.AllowRollback {
+			return e.blocked(ctx, d, svc, fmt.Errorf("%w: change freeze %q forbids automatic rollback until %s",
+				ErrFrozen, f.Name, f.Until.Format(time.RFC3339)))
+		}
 		if err := e.Guard.Check(svc.Name); err != nil {
 			return e.blocked(ctx, d, svc, err)
 		}

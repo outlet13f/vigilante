@@ -468,3 +468,58 @@ func TestV2ApproveModeDecisions(t *testing.T) {
 		t.Fatalf("audit: %s", r.Body)
 	}
 }
+
+func TestV2ChangeFreeze(t *testing.T) {
+	depTok, dep := sa(t, "ci", "deployer", "*")
+	_, base := newV2Server(t, "auth:\n  service_accounts:\n"+dep)
+	admin := &v2Client{t: t, base: base, token: "tok"}
+	ci := &v2Client{t: t, base: base, token: depTok}
+	admin.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+	admin.do("POST", "/v2/deployments", `{"id":"before","service":"svc","version":"v2"}`, nil)
+
+	wantProblem(t, ci.do("POST", "/v2/freezes", `{"name":"x","ends_at":"2099-01-01T00:00:00Z"}`, nil), 403, "forbidden")
+	wantProblem(t, admin.do("POST", "/v2/freezes", `{"name":"x","ends_at":"2001-01-01T00:00:00Z"}`, nil), 422, "validation_failed")
+	r := admin.do("POST", "/v2/freezes", `{"name":"incident-7","reason":"payment outage","ends_at":"`+time.Now().Add(time.Hour).UTC().Format(time.RFC3339)+`","teams":["payments"]}`, nil)
+	if r.StatusCode != 201 || r.JSON["allow_rollback"] != true {
+		t.Fatalf("declare: %d %s", r.StatusCode, r.Body)
+	}
+	id := r.JSON["id"].(string)
+	if l := ci.do("GET", "/v2/freezes", "", nil); len(l.JSON["items"].([]any)) != 1 || l.JSON["items"].([]any)[0].(map[string]any)["active"] != true {
+		t.Fatalf("list: %s", l.Body)
+	}
+
+	// New deployments of the team's service are refused; others are not.
+	r = ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v3"}`, nil)
+	wantProblem(t, r, 409, "change_frozen")
+	if !strings.Contains(r.JSON["detail"].(string), "payment outage") {
+		t.Fatalf("detail: %s", r.Body)
+	}
+	admin.do("PUT", "/v2/services/zeta/last-good", `{"version":"z1"}`, nil)
+	if r := ci.do("POST", "/v2/deployments", `{"service":"zeta","version":"z2"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("another team's service is not frozen: %d %s", r.StatusCode, r.Body)
+	}
+	// A deployment registered before the freeze cannot start a phase either.
+	wantProblem(t, ci.do("POST", "/v2/deployments/before/observations", `{"phase":"canary"}`, nil), 409, "change_frozen")
+	// Only admins may override.
+	wantProblem(t, ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","freeze_override":"hotfix"}`, nil), 403, "forbidden")
+	r = admin.do("POST", "/v2/deployments", `{"id":"hotfix-1","service":"svc","version":"v3","freeze_override":"fix for incident-7"}`, nil)
+	if r.StatusCode != 201 || !strings.Contains(r.JSON["freeze_override"].(string), "fix for incident-7") {
+		t.Fatalf("override: %d %s", r.StatusCode, r.Body)
+	}
+	if r := admin.do("POST", "/v2/deployments/hotfix-1/observations", `{"phase":"canary"}`, nil); r.StatusCode != 202 {
+		t.Fatalf("overridden deployment may observe: %d %s", r.StatusCode, r.Body)
+	} else {
+		waitOp(t, admin, r.JSON["id"].(string))
+	}
+	if a := admin.do("GET", "/v2/audit-events?action=freeze.override", "", nil); len(a.JSON["items"].([]any)) != 1 {
+		t.Fatalf("override not audited: %s", a.Body)
+	}
+
+	if r := admin.do("DELETE", "/v2/freezes/"+id, "", nil); r.StatusCode != 200 || r.JSON["ended_at"] == nil {
+		t.Fatalf("end: %d %s", r.StatusCode, r.Body)
+	}
+	if r := ci.do("POST", "/v2/deployments", `{"service":"svc","version":"v4"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("after the freeze: %d %s", r.StatusCode, r.Body)
+	}
+	wantProblem(t, admin.do("DELETE", "/v2/freezes/nope", "", nil), 404, "not_found")
+}

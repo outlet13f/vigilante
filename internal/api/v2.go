@@ -64,6 +64,9 @@ func (s *Server) v2Routes() []route {
 		{pattern: "POST /v2/circuit/reset", handler: s.v2ResetCircuit, write: true, class: classEmergency},
 		{pattern: "POST /v2/circuit/trip", handler: s.v2TripCircuit, write: true, class: classEmergency},
 		{pattern: "GET /v2/audit-events", handler: s.v2ListAuditEvents},
+		{pattern: "GET /v2/freezes", handler: s.v2ListFreezes},
+		{pattern: "POST /v2/freezes", handler: s.v2CreateFreeze, write: true},
+		{pattern: "DELETE /v2/freezes/{id}", handler: s.v2EndFreeze, write: true},
 		{pattern: "GET /v2/api-clients", handler: s.v2ListClients},
 		{pattern: "POST /v2/api-clients", handler: s.v2CreateClient},
 		{pattern: "GET /v2/api-clients/{id}", handler: s.v2GetClient},
@@ -463,6 +466,7 @@ type createV2 struct {
 	Version         string `json:"version"`
 	PreviousVersion string `json:"previous_version"`
 	Prepare         bool   `json:"prepare"`
+	FreezeOverride  string `json:"freeze_override"`
 }
 
 func (s *Server) v2CreateDeployment(w http.ResponseWriter, r *http.Request) {
@@ -501,9 +505,18 @@ func (s *Server) v2CreateDeployment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	d, err := s.create(r.Context(), p, createReq{ID: req.ID, Service: req.Service, Version: req.Version, PreviousVersion: req.PreviousVersion, Prepare: req.Prepare})
+	if req.FreezeOverride != "" && !p.Can(auth.ActManage, auth.Service{}) {
+		err := fmt.Errorf("forbidden: only admins may override a change freeze (%s)", principalID(p))
+		s.denied(r, req.Service, err)
+		s.problem(w, r, http.StatusForbidden, "forbidden", err.Error())
+		return
+	}
+	d, err := s.create(r.Context(), p, createReq{ID: req.ID, Service: req.Service, Version: req.Version, PreviousVersion: req.PreviousVersion,
+		Prepare: req.Prepare, FreezeOverride: req.FreezeOverride})
 	if err != nil {
-		if d == nil {
+		if errors.Is(err, orchestrator.ErrBlocked) {
+			s.problem(w, r, http.StatusConflict, gateCode(err), err.Error())
+		} else if d == nil {
 			s.problem(w, r, http.StatusConflict, "conflict", err.Error())
 		} else {
 			s.problem(w, r, 422, "validation_failed", err.Error())
@@ -555,6 +568,10 @@ func (s *Server) v2StartObservation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := checkLaunch(d); err != nil {
 		s.problem(w, r, http.StatusConflict, "conflict", err.Error())
+		return
+	}
+	if err := s.E.Gate(d); err != nil {
+		s.problem(w, r, http.StatusConflict, gateCode(err), err.Error())
 		return
 	}
 	op := s.E.StartOperation(model.OpObservation, d.Service, d, phase, p.ID)
@@ -1160,4 +1177,84 @@ func (s *Server) v2ListAuditEvents(w http.ResponseWriter, r *http.Request) {
 		next = &c
 	}
 	writeJSON(w, 200, page[auditEventV2]{Items: items, NextCursor: next})
+}
+
+// ---------------------------------------------------------------- change freezes
+
+func (s *Server) v2ListFreezes(w http.ResponseWriter, r *http.Request) {
+	if p := auth.FromContext(r.Context()); !p.CanSomewhere(auth.ActRead) {
+		s.problem(w, r, http.StatusForbidden, "forbidden", fmt.Sprintf("forbidden: %s has no viewer role", p.ID))
+		return
+	}
+	items := s.E.Freezes(time.Now())
+	if items == nil {
+		items = []orchestrator.FreezeWindow{}
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) v2CreateFreeze(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.allow(w, r, auth.ActManage, auth.Service{})
+	if !ok {
+		return
+	}
+	var req struct {
+		Name          string     `json:"name"`
+		Reason        string     `json:"reason"`
+		StartsAt      *time.Time `json:"starts_at"`
+		EndsAt        time.Time  `json:"ends_at"`
+		Services      []string   `json:"services"`
+		Teams         []string   `json:"teams"`
+		AllowRollback *bool      `json:"allow_rollback"`
+	}
+	if !s.decodeStrict(w, r, &req, false) {
+		return
+	}
+	now := time.Now().UTC()
+	starts := now
+	if req.StartsAt != nil {
+		starts = req.StartsAt.UTC()
+	}
+	var errs []fieldError
+	if strings.TrimSpace(req.Name) == "" {
+		errs = append(errs, fieldError{"name", "required"})
+	}
+	if req.EndsAt.IsZero() || !req.EndsAt.After(starts) || !req.EndsAt.After(now) {
+		errs = append(errs, fieldError{"ends_at", "required, after starts_at and in the future"})
+	}
+	for _, sv := range req.Services {
+		if _, ok := s.E.Cfg.Service(sv); !ok {
+			errs = append(errs, fieldError{"services", "unknown service " + sv})
+		}
+	}
+	if len(errs) > 0 {
+		s.problem(w, r, 422, "validation_failed", "invalid freeze", errs...)
+		return
+	}
+	f := &model.Freeze{Name: req.Name, Reason: req.Reason, StartsAt: starts, EndsAt: req.EndsAt.UTC(),
+		Services: req.Services, Teams: req.Teams, AllowRollback: req.AllowRollback == nil || *req.AllowRollback, CreatedBy: p.ID}
+	if f.Services == nil {
+		f.Services = []string{}
+	}
+	if f.Teams == nil {
+		f.Teams = []string{}
+	}
+	s.E.CreateFreeze(f)
+	s.audit(r, "freeze.create", "", "", fmt.Sprintf("%s (%s) %s .. %s: %s", f.Name, f.ID, f.StartsAt.Format(time.RFC3339), f.EndsAt.Format(time.RFC3339), f.Reason))
+	w.Header().Set("Location", "/v2/freezes/"+f.ID)
+	writeJSON(w, http.StatusCreated, f)
+}
+
+func (s *Server) v2EndFreeze(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.allow(w, r, auth.ActManage, auth.Service{})
+	if !ok {
+		return
+	}
+	f, err := s.E.EndFreeze(r.PathValue("id"), p.ID)
+	if err != nil {
+		s.problem(w, r, 404, "not_found", err.Error())
+		return
+	}
+	s.audit(r, "freeze.end", "", "", f.Name+" ("+f.ID+")")
+	writeJSON(w, 200, f)
 }

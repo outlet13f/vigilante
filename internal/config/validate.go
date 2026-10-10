@@ -679,6 +679,7 @@ func (c *Config) Validate() error {
 	}
 	c.validateAuth(services, bad)
 	c.validateSecrets(bad)
+	c.validateFreezes(bad)
 	if sl := c.Audit.Syslog; sl != nil {
 		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
 			bad("audit.syslog.address must be tcp://host:port or udp://host:port")

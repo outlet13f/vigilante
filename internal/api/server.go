@@ -401,6 +401,9 @@ type createReq struct {
 	PreviousVersion string `json:"previous_version"`
 	Prepare         bool   `json:"prepare"`
 	Phase           string `json:"phase"` // optional: start observing immediately
+	// FreezeOverride (admins only, checked by the caller) lets a new
+	// deployment proceed during a change freeze; it is the reason.
+	FreezeOverride string `json:"-"`
 }
 
 func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -415,7 +418,7 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := s.create(r.Context(), p, req)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, gateStatus(err, 400), err)
 		return
 	}
 	s.audit(r, "deployment.create", d.Service, d.ID, fmt.Sprintf("%s %s -> %s", d.Service, d.PreviousVersion, d.Version))
@@ -426,8 +429,14 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	if req.Service == "" || req.Version == "" {
 		return nil, errors.New("service and version are required")
 	}
+	existing := req.ID != "" && s.E.Live(req.ID) != nil
+	if !existing {
+		if err := s.E.FreezeGate(req.Service, req.FreezeOverride); err != nil {
+			return nil, err
+		}
+	}
 	var note string
-	if req.PreviousVersion == "" && (req.ID == "" || s.E.Live(req.ID) == nil) {
+	if req.PreviousVersion == "" && !existing {
 		if v, from, ok := s.E.LastGoodVersion(req.Service); ok {
 			req.PreviousVersion = v
 			note = fmt.Sprintf("auto-filled previous=%s (last good deployment %s)", v, from)
@@ -440,6 +449,13 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	s.E.SetCreatedBy(d, p.ID)
 	if note != "" {
 		s.E.Annotate(d, "input", note)
+	}
+	if req.FreezeOverride != "" && !existing {
+		if f := s.E.ActiveFreeze(d.Service, time.Now()); f != nil {
+			s.E.SetFreezeOverride(d, p.ID, req.FreezeOverride)
+			s.E.Audit(journal.Entry{Actor: p.ID, Source: "api", Action: "freeze.override", Service: d.Service, DeployID: d.ID,
+				Reason: f.Name + ": " + req.FreezeOverride})
+		}
 	}
 	if req.Prepare {
 		if err := s.E.Prepare(ctx, d); err != nil {
@@ -552,6 +568,9 @@ func (s *Server) launch(d *model.Deployment, phase model.Phase) error {
 		return fmt.Errorf("unknown phase %q", phase)
 	}
 	if err := checkLaunch(d); err != nil {
+		return err
+	}
+	if err := s.E.Gate(d); err != nil {
 		return err
 	}
 	s.background(func() {
@@ -757,7 +776,7 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := s.create(r.Context(), p, *req)
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, gateStatus(err, 400), err)
 		return
 	}
 	s.E.Audit(journal.Entry{Actor: p.ID, Source: "webhook", Action: "deployment.create", Service: d.Service, DeployID: d.ID,
@@ -871,4 +890,21 @@ func firstNonEmpty(vs ...string) string {
 		}
 	}
 	return ""
+}
+
+// gateStatus maps a closed deployment gate (circuit open, change freeze) to
+// 409 Conflict and anything else to def.
+func gateStatus(err error, def int) int {
+	if errors.Is(err, orchestrator.ErrBlocked) {
+		return http.StatusConflict
+	}
+	return def
+}
+
+// gateCode is the problem code for a closed gate.
+func gateCode(err error) string {
+	if errors.Is(err, orchestrator.ErrFrozen) {
+		return "change_frozen"
+	}
+	return "circuit_open"
 }

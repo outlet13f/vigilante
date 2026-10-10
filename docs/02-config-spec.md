@@ -35,6 +35,7 @@ auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
 audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
+change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
 ```
 
 ## `server`
@@ -470,6 +471,26 @@ audit:
 - **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
 - **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
 - **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+
+## `change_freeze` — 변경 동결
+
+```yaml
+change_freeze:
+  - name: weekend
+    weekly: {from: "fri 18:00", to: "mon 09:00", timezone: Asia/Seoul}   # 매주 반복
+  - name: year-end-closing
+    reason: 결산 기간
+    start: "2026-12-28T00:00:00+09:00"    # 기간 지정 (RFC 3339)
+    end: "2027-01-02T00:00:00+09:00"
+    teams: [payments]                     # services/teams 생략 시 전 서비스
+    allow_rollback: true                  # 기본 true
+```
+
+- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다. 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
+- **막지 않는 것:** 자동 롤백은 기본으로 허용합니다. 장애 복구는 변경이 아니기 때문입니다. `allow_rollback: false`인 기간에는 자동 롤백 대신 실패한 대상을 격리하고 사람에게 넘깁니다. 수동 롤백은 항상 가능합니다.
+- **예외(긴급 배포):** API는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다. 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
+- **실행 중 선언:** 장애 대응처럼 설정 파일 없이 동결해야 하면 admin이 `POST /v2/freezes`로 선언하고 `DELETE /v2/freezes/{id}`로 일찍 끝냅니다. 상태 저장소에 남아 리더가 바뀌어도 유지됩니다. `GET /v2/freezes`는 설정 창과 선언된 동결을 함께 보여 줍니다.
+- 주간 창의 시각은 `timezone`(생략 시 서버 지역 시간) 기준이며, 바이너리에 시간대 데이터가 들어 있어 호스트 설정과 무관하게 동작합니다.
 
 ## `api` — 오픈 API
 
