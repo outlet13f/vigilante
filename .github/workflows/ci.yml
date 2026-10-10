@@ -134,13 +134,36 @@ jobs:
           go test -count=1 -tags minimal ./cmd/vigilante ./internal/executor ./internal/probe ./internal/compat
       - name: build binaries, SBOMs, packages, chart
         run: bash scripts/release.sh build "$V"
-      - name: chart renders (single node and HA)
+      - name: chart renders (single node, HA, TLS)
         run: |
-          helm template t deploy/helm/vigilante > /dev/null
-          helm template t deploy/helm/vigilante --set replicaCount=3 --set persistence.enabled=false > /dev/null
-          if helm template t deploy/helm/vigilante --set replicaCount=3 > /dev/null 2>&1; then
+          c=deploy/helm/vigilante
+          dev="--set auth.allowAnonymous=true"
+          helm template t $c $dev > /dev/null
+          helm template t $c $dev --set replicaCount=3 --set persistence.enabled=false > /dev/null
+          if helm template t $c $dev --set replicaCount=3 > /dev/null 2>&1; then
             echo "HA with the file store must be refused"; exit 1
           fi
+          if helm template t $c > /dev/null 2>&1; then
+            echo "a config without auth must be refused"; exit 1
+          fi
+          cat > "$RUNNER_TEMP/ha-tls.yaml" <<'EOF'
+          replicaCount: 3
+          persistence: {enabled: false}
+          tls: {secretName: vigilante-tls}
+          config: |
+            version: v1
+            server:
+              state: {backend: postgres, dsn_env: VIGILANTE_PG_DSN}
+              ha: {enabled: true}
+              tls: {cert_file: /etc/vigilante-tls/tls.crt, key_file: /etc/vigilante-tls/tls.key}
+            auth:
+              service_accounts:
+                - {name: ci, token_sha256: fb4afd06a1bdd94f9f3febfaa8b22a2d3fd2db9d10bf0c51ab3a75ba8e9fd8a9, roles: [{role: deployer}]}
+          EOF
+          helm template t $c -f "$RUNNER_TEMP/ha-tls.yaml" > "$RUNNER_TEMP/ha-tls.out"
+          grep -qF 'value: "https://$(POD_IP):8088"' "$RUNNER_TEMP/ha-tls.out"
+          grep -qF 'scheme: HTTPS' "$RUNNER_TEMP/ha-tls.out"
+          grep -qF 'value: "1843MiB"' "$RUNNER_TEMP/ha-tls.out"   # GOMEMLIMIT: 90% of 2Gi
       - name: image
         run: |
           docker buildx build -f packaging/container/Dockerfile --build-arg VERSION="$V" \

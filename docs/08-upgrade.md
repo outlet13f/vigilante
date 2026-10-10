@@ -77,6 +77,7 @@ helm upgrade vigilante ./vigilante-<new>.tgz -f my-values.yaml
 
 - `replicaCount` 2 이상(PostgreSQL·HA): 롤링 업데이트와 PodDisruptionBudget으로 위 절차가 자동으로 진행됩니다.
 - `replicaCount: 1`(파일 저장소): 저널 쓰기는 한 프로세스만 해야 하므로 `Recreate`로 교체되며, 수 초간 중단됩니다.
+- 차트는 `config`에 인증 설정이 없으면 렌더링을 거부합니다. 인증 없이 쓰던 설치는 업그레이드 전에 `auth`를 설정하거나, 개발용이면 `auth.allowAnonymous: true`를 줍니다. 메모리 한도를 values에 직접 준 설치는 그 값을 그대로 쓰므로(기본 2Gi) [07-install.md](07-install.md)의 크기 기준과 비교해 봅니다.
 
 ### 에이전트
 
