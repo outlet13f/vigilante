@@ -130,12 +130,30 @@ type Audit struct {
 	// Retention is the default for `vigilante audit prune` (e.g. 8760h).
 	// Nothing is deleted automatically.
 	Retention time.Duration `yaml:"retention"`
+	// ChainKeyRef (vault:/env:/file:, at least 32 bytes) keys the hash
+	// chain: every new journal entry also carries an HMAC of its chain hash,
+	// so someone who can write to the store but has not got the key cannot
+	// rewrite entries and recompute the chain. `vigilante audit verify` checks
+	// the MACs with the same key. Shared by every node writing to the store.
+	ChainKeyRef string `yaml:"chain_key_ref"`
 }
 
 // SyslogExport ships audit records to a SIEM.
 type SyslogExport struct {
-	Address string `yaml:"address"` // tcp://host:port or udp://host:port
-	Format  string `yaml:"format"`  // rfc5424 (default, JSON message) | cef
+	// Address: tcp://host:port, udp://host:port, or tls://host[:port]
+	// (RFC 5425: octet-counted frames over TLS, default port 6514).
+	Address string     `yaml:"address"`
+	Format  string     `yaml:"format"` // rfc5424 (default, JSON message) | cef
+	TLS     *SyslogTLS `yaml:"tls"`    // tls:// only; without it the system roots verify the collector
+}
+
+// SyslogTLS: how the exporter verifies the collector and authenticates to it.
+type SyslogTLS struct {
+	CAFile     string `yaml:"ca_file"` // private CA of the collector certificate
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	ServerName string `yaml:"server_name"` // default: the address host
+	MinVersion string `yaml:"min_version"` // 1.2 (default) | 1.3
 }
 
 // Auth configures who may call the API and what they may do.

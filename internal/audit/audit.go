@@ -4,6 +4,9 @@
 // Every journal entry carries Prev and Hash (see journal.Entry.Chain), so
 // changing or deleting any stored entry breaks the chain at that point;
 // Verify walks the store (or an archive file) and reports the first break.
+// The chain alone only proves consistency: whoever can write to the store
+// can also recompute it. With audit.chain_key_ref every entry also carries
+// an HMAC of its hash, which only holders of the key can produce.
 package audit
 
 import (
@@ -27,11 +30,20 @@ type Report struct {
 	Head    string `json:"head"`    // hash of the last entry
 	OK      bool   `json:"ok"`
 	Broken  string `json:"broken,omitempty"`
+
+	// With a chain key (audit.chain_key_ref): MACs checked, chained entries
+	// written before the key was configured, and the position from which
+	// the key protects the chain (0 = no entry carries a MAC).
+	KeyChecked bool  `json:"key_checked"`
+	Keyed      int   `json:"keyed,omitempty"`
+	Unkeyed    int   `json:"unkeyed,omitempty"`
+	KeyedFrom  int64 `json:"keyed_from,omitempty"`
 }
 
-// Verify checks the whole chain in a store.
-func Verify(ctx context.Context, st store.Store) (Report, error) {
-	var v journal.Verifier
+// Verify checks the whole chain in a store; with key, also every entry's
+// MAC (see journal.Verifier).
+func Verify(ctx context.Context, st store.Store, key []byte) (Report, error) {
+	v := journal.Verifier{Key: key}
 	r := Report{}
 	err := st.Scan(ctx, func(pos int64, e journal.Entry) error {
 		r.Entries++
@@ -41,17 +53,17 @@ func Verify(ctx context.Context, st store.Store) (Report, error) {
 }
 
 // VerifyFile checks a JSONL archive written by Prune or Export.
-func VerifyFile(path string) (Report, error) {
+func VerifyFile(path string, key []byte) (Report, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Report{}, err
 	}
 	defer f.Close()
-	return VerifyReader(f)
+	return VerifyReader(f, key)
 }
 
-func VerifyReader(rd io.Reader) (Report, error) {
-	var v journal.Verifier
+func VerifyReader(rd io.Reader, key []byte) (Report, error) {
+	v := journal.Verifier{Key: key}
 	r := Report{}
 	sc := bufio.NewScanner(rd)
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
@@ -77,6 +89,7 @@ func VerifyReader(rd io.Reader) (Report, error) {
 
 func finish(r Report, v *journal.Verifier, err error) (Report, error) {
 	r.Checked, r.Legacy, r.Head = v.Checked, v.Legacy, v.Head()
+	r.KeyChecked, r.Keyed, r.Unkeyed, r.KeyedFrom = len(v.Key) > 0, v.Keyed, v.Unkeyed, v.KeyedFrom
 	var broken *journal.ErrChainBroken
 	switch {
 	case errors.As(err, &broken):

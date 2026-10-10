@@ -32,7 +32,7 @@ services:    [...]   # 서비스 = 대상 + 프로브 + 규칙 + 단계 + 롤백
 safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼럼
 notify:      [...]   # 알림
 auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
-audit:       {...}   # SIEM 전송(syslog)과 보존 기간
+audit:       {...}   # SIEM 전송(syslog·TLS), 체인 키, 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
 change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
@@ -481,27 +481,35 @@ auth:
 - **작업자:** 기록마다 `actor`(예: `user:alice`, `sa:ci-order`, `cli:bob@host`, 자동 조치는 `system`), `source`(api·cli·webhook·system), `action`, 대상 서비스·배포, `reason`이 남습니다.
 - **변경 티켓:** API는 `X-Change-Ticket` 헤더, CLI는 `--ticket`으로 받은 값을 `ticket`에 남깁니다.
 - **권한 거부:** 거부(403)된 요청도 `action: denied`로 남습니다. 반복되는 거부는 권한 탐색 시도의 신호입니다.
-- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. DB 관리자가 SQL로 직접 바꿔도 검출됩니다.
+- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. 단, 체인만으로는 저장소에 쓸 수 있는 사람이 기록을 고친 뒤 해시를 처음부터 다시 계산하는 것을 막지 못합니다.
+- **체인 키(`chain_key_ref`):** 설정하면 새 기록마다 체인 해시의 HMAC-SHA256(`mac`)이 붙습니다. 키가 없으면 MAC을 만들 수 없으므로, 기록을 고치고 체인을 다시 계산해도 `audit verify`가 MAC 불일치·누락으로 검출합니다. 키는 32바이트 이상, 모든 노드가 같은 키를 씁니다. 키를 설정하기 전 기록은 `unkeyed`로 세고 변조로 보지 않으며, 결과의 `keyed_from`이 키가 보호하기 시작한 위치입니다(그 앞 기록을 고치면 첫 키 기록의 MAC이 맞지 않아 역시 검출됩니다). PostgreSQL은 기록 본문(JSON)에 담기므로 마이그레이션이 필요 없습니다.
 
 ```yaml
 audit:
   syslog:
-    address: tcp://siem.example.internal:6514   # 또는 udp://...
+    address: tls://siem.example.internal:6514   # tls://(RFC 5425, 포트 생략 시 6514) | tcp:// | udp://
     format: rfc5424                              # rfc5424(JSON 본문, 기본) | cef
+    tls:                                         # tls:// 전용. 없으면 시스템 루트 CA로 검증
+      ca_file: /etc/vigilante/siem-ca.pem        # 수집기 인증서의 사설 CA
+      cert_file: /etc/vigilante/siem-client.crt  # 수집기가 클라이언트 인증서를 요구할 때(key_file과 함께)
+      key_file: /etc/vigilante/siem-client.key
+      server_name: siem.example.internal         # 기본은 address의 호스트
+      min_version: "1.2"                         # 1.2(기본) | 1.3
+  chain_key_ref: vault:secret/prod/vigilante#audit_chain_key   # 또는 env:NAME, file:/path
   retention: 8760h                               # audit prune의 기본 보존 기간. 자동 삭제는 하지 않음
 ```
 
 | 명령 | 하는 일 |
 |---|---|
-| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증. 끊어지면 exit 1 |
-| `vigilante audit verify --file ARCHIVE.jsonl` | 아카이브 파일만 따로 검증 |
+| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증(`chain_key_ref`가 있으면 MAC도). 끊어지면 exit 1 |
+| `vigilante audit verify --file ARCHIVE.jsonl [-c FILE \| --key REF]` | 아카이브 파일만 따로 검증. `-c`나 `--key`를 주면 MAC도 검증 |
 | `vigilante audit query -c FILE [--actor A] [--action denied] [--service S] [--since 2026-10-01]` | 감사 기록 조회 |
 | `vigilante audit export -c FILE --out F.jsonl` | 전체 기록을 체인 그대로 내보내기 |
 | `vigilante audit prune -c FILE --out ARCHIVE.jsonl [--before 2025-10-01 \| --older-than 8760h]` | 보존 기간이 지난 기록을 아카이브로 옮기고 삭제 |
 
 - **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
-- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
-- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다. `tls://`는 RFC 5425 형식(`길이 공백 메시지`)으로 보내고 수집기 인증서와 이름을 검증합니다. 검증에 실패하면 보내지 않고 재시도합니다. `tcp://`·`udp://`는 평문(줄 단위)이므로 신뢰 망 안에서만 쓰십시오.
+- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다(앵커는 마지막으로 지운 기록의 MAC도 이어받습니다). 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
 
 ## `change_freeze` — 변경 동결
 

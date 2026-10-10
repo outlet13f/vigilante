@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -43,6 +44,17 @@ func (c *Config) applyDefaults() {
 		}
 		if sn.Incidents.Impact == 0 {
 			sn.Incidents.Impact = 2
+		}
+	}
+	if sl := c.Audit.Syslog; sl != nil {
+		if sl.Format == "" {
+			sl.Format = "rfc5424"
+		}
+		// RFC 5425 assigns 6514 to syslog over TLS.
+		if hp, ok := strings.CutPrefix(sl.Address, "tls://"); ok && hp != "" {
+			if _, _, err := net.SplitHostPort(hp); err != nil {
+				sl.Address = "tls://" + net.JoinHostPort(strings.Trim(hp, "[]"), "6514")
+			}
 		}
 	}
 	if c.Server.Listen == "" {
@@ -840,11 +852,25 @@ func (c *Config) Validate() error {
 		}
 	}
 	if sl := c.Audit.Syslog; sl != nil {
-		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
-			bad("audit.syslog.address must be tcp://host:port or udp://host:port")
+		n, a, ok := strings.Cut(sl.Address, "://")
+		if !ok || (n != "tcp" && n != "udp" && n != "tls") || a == "" {
+			bad("audit.syslog.address must be tcp://host:port, udp://host:port or tls://host[:port]")
+		} else if host, _, err := net.SplitHostPort(a); n == "tls" && (err != nil || host == "") {
+			bad("audit.syslog.address: tls needs a collector host name (tls://siem.example.internal:6514)")
 		}
 		if sl.Format != "" && sl.Format != "rfc5424" && sl.Format != "cef" {
 			bad("audit.syslog.format must be rfc5424 or cef")
+		}
+		if t := sl.TLS; t != nil {
+			if n != "tls" {
+				bad("audit.syslog.tls is only used with a tls:// address")
+			}
+			if (t.CertFile == "") != (t.KeyFile == "") {
+				bad("audit.syslog.tls: cert_file and key_file go together")
+			}
+			if t.MinVersion != "" && t.MinVersion != "1.2" && t.MinVersion != "1.3" {
+				bad("audit.syslog.tls.min_version must be 1.2 or 1.3")
+			}
 		}
 	}
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
@@ -1058,6 +1084,7 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 		}
 	}
 	check("server.state.dsn_ref", c.Server.State.DSNRef)
+	check("audit.chain_key_ref", c.Audit.ChainKeyRef)
 	check("api.webhook_signing_key_ref", c.API.WebhookSigningKeyRef)
 	check("console.session_key_ref", c.Console.SessionKeyRef)
 	check("console.client_secret_ref", c.Console.ClientSecretRef)

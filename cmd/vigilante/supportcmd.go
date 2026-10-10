@@ -189,7 +189,11 @@ func collectState(ctx context.Context, b *support.Bundle, cfg *config.Config, ve
 		"api_clients": len(s.Clients), "webhooks": len(s.Webhooks), "declared_freezes_in_force": active,
 	})
 	if verify {
-		r, err := audit.Verify(ctx, st)
+		key, err := store.ChainKey(ctx, &ro) // resolved once already by store.Open
+		var r audit.Report
+		if err == nil {
+			r, err = audit.Verify(ctx, st, key)
+		}
 		if err != nil {
 			b.Note("audit chain verification: %v", err)
 		} else {

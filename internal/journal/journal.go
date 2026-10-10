@@ -7,6 +7,7 @@ package journal
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -85,6 +86,10 @@ type Entry struct {
 	// Editing or deleting any entry breaks every hash after it.
 	Prev string `json:"prev,omitempty"`
 	Hash string `json:"hash,omitempty"`
+	// MAC = HMAC-SHA256(audit.chain_key_ref, Hash), set while a chain key is
+	// configured. It is not part of Hash; without the key nobody can rewrite
+	// entries and recompute a chain that still verifies.
+	MAC string `json:"mac,omitempty"`
 
 	// Compacted (anchor entries only): the state the pruned entries had
 	// built, replayed in place of them.
@@ -95,7 +100,7 @@ type Entry struct {
 // It hashes the canonical JSON of the entry (struct field order, sorted map
 // keys) with Hash cleared, so it can be recomputed from any stored copy.
 func (e Entry) ChainHash(prev string) string {
-	e.Prev, e.Hash = prev, ""
+	e.Prev, e.Hash, e.MAC = prev, "", ""
 	b, _ := json.Marshal(e)
 	sum := sha256.Sum256(append([]byte(prev+"\n"), b...))
 	return hex.EncodeToString(sum[:])
@@ -107,12 +112,37 @@ func (e *Entry) Chain(prev string) {
 	e.Hash = e.ChainHash(prev)
 }
 
+// Seal chains the entry after prev and, with a chain key, adds its MAC.
+func (e *Entry) Seal(prev string, key []byte) {
+	e.Chain(prev)
+	e.MAC = ""
+	if len(key) > 0 {
+		e.MAC = ChainMAC(key, e.Hash)
+	}
+}
+
+// ChainMAC is HMAC-SHA256(key, hash) in hex. The hash already covers the
+// entry and, through Prev, everything before it.
+func ChainMAC(key []byte, hash string) string {
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(hash))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
 // Verifier checks a sequence of entries in order.
 type Verifier struct {
-	prev    string
-	started bool
-	Checked int // chained entries verified
-	Legacy  int // entries written before the chain existed (no hash)
+	// Key, when set, also checks MACs: chained entries before the first one
+	// that carries a MAC count as Unkeyed (written before the key was
+	// configured); from that entry on, every entry needs a valid MAC.
+	Key []byte
+
+	prev      string
+	started   bool
+	Checked   int   // chained entries verified
+	Legacy    int   // entries written before the chain existed (no hash)
+	Keyed     int   // entries whose MAC matched (Key set)
+	Unkeyed   int   // chained entries before KeyedFrom (Key set)
+	KeyedFrom int64 // position of the first entry with a valid MAC (0 = none)
 }
 
 // ErrChainBroken describes the first entry whose hash does not match.
@@ -132,6 +162,9 @@ func (v *Verifier) Next(pos int64, e Entry) error {
 			return &ErrChainBroken{pos, "anchor in the middle of the chain"}
 		}
 		v.prev, v.started = e.Hash, true
+		if e.MAC != "" { // the last pruned entry's MAC
+			return v.checkMAC(pos, e)
+		}
 		return nil
 	}
 	if e.Hash == "" {
@@ -150,8 +183,35 @@ func (v *Verifier) Next(pos int64, e Entry) error {
 	if got := e.ChainHash(e.Prev); got != e.Hash {
 		return &ErrChainBroken{pos, "content does not match its hash (the entry was modified)"}
 	}
+	if err := v.checkMAC(pos, e); err != nil {
+		return err
+	}
 	v.prev = e.Hash
 	v.Checked++
+	return nil
+}
+
+// checkMAC checks a chained entry's MAC against Key (a no-op without one).
+func (v *Verifier) checkMAC(pos int64, e Entry) error {
+	switch {
+	case len(v.Key) == 0:
+		return nil
+	case e.MAC == "" && v.KeyedFrom == 0:
+		v.Unkeyed++ // written before the chain key was configured
+		return nil
+	case e.MAC == "":
+		return &ErrChainBroken{pos, fmt.Sprintf("entry has no MAC although the chain key protects the chain from entry %d on "+
+			"(written or rewritten without the key)", v.KeyedFrom)}
+	case !hmac.Equal([]byte(e.MAC), []byte(ChainMAC(v.Key, e.Hash))):
+		if v.KeyedFrom == 0 {
+			return &ErrChainBroken{pos, "MAC does not match (wrong chain key, or the entry was rewritten without it)"}
+		}
+		return &ErrChainBroken{pos, "MAC does not match (the entry was rewritten without the chain key)"}
+	}
+	if v.KeyedFrom == 0 {
+		v.KeyedFrom = pos
+	}
+	v.Keyed++
 	return nil
 }
 
