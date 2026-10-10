@@ -1,0 +1,115 @@
+# CI gates for every pull request and every push to master:
+#   test   gofmt, vet, go test -race (PostgreSQL store tests against a real
+#          server), cross-builds of the static binary
+#   api    OpenAPI lint (Spectral) and, on pull requests, a breaking-change
+#          check of the v2 contract against the base branch (oasdiff)
+#   vuln   govulncheck: known vulnerabilities reachable from our code
+#   demo   the end-to-end rollback demo (exit codes of all scenarios)
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with the toolchain line in go.mod.
+  GO_VERSION: "1.27.2"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      VIGILANTE_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: toolchain matches go.mod
+        run: |
+          want="go$(sed -n 's/^toolchain go//p' go.mod)"
+          got="$(go env GOVERSION)"
+          [ "$want" = "$got" ] || { echo "go.mod wants $want, CI runs $got: update GO_VERSION"; exit 1; }
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          [ -z "$out" ] || { echo "not gofmt-ed:"; echo "$out"; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: test (race detector)
+        run: go test -race -count=1 -timeout 20m ./...
+      - name: cross-build static binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/amd64 linux/arm64 linux/ppc64le windows/amd64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build -trimpath -o /dev/null ./cmd/vigilante
+            echo "built $target"
+          done
+
+  api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: lint the OpenAPI spec
+        run: npx -y @stoplight/spectral-cli@6.15.0 lint api/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn
+      - uses: actions/setup-go@v5
+        if: github.event_name == 'pull_request'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: no breaking changes to the v2 contract
+        if: github.event_name == 'pull_request'
+        run: |
+          if ! git show "origin/${{ github.base_ref }}:api/openapi.yaml" > "$RUNNER_TEMP/base.yaml" 2>/dev/null; then
+            echo "base branch has no api/openapi.yaml; nothing to compare"; exit 0
+          fi
+          go install github.com/oasdiff/oasdiff@v1.33.0
+          "$(go env GOPATH)/bin/oasdiff" breaking "$RUNNER_TEMP/base.yaml" api/openapi.yaml --fail-on ERR
+
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: end-to-end rollback demo
+        run: bash examples/demo/run-demo.sh

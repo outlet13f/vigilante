@@ -1,0 +1,16 @@
+# Lint rules for api/openapi.yaml. CI fails on any warning.
+extends: ["spectral:oas"]
+rules:
+  # A one-line summary is required instead; operations whose behaviour needs
+  # explaining carry a description as well.
+  operation-description: off
+  operation-summary:
+    description: Every operation has a one-line summary.
+    given: "$.paths[*][get,put,post,delete,patch]"
+    severity: error
+    then: {field: summary, function: truthy}
+  problem-errors:
+    description: v2 error responses use application/problem+json (the OAuth token endpoint follows RFC 6749 instead).
+    given: "$.paths[?(@property.startsWith('/v2/') && @property != '/v2/oauth/token')][*].responses[?(@property >= '400' && @property < '500')].content"
+    severity: error
+    then: {field: "application/problem+json", function: truthy}
