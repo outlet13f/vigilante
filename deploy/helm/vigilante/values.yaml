@@ -55,10 +55,12 @@ auth:
 # tls.client_auth: require is refused: kubelet probes and HA followers
 # forwarding to the leader present no client certificate. Use optional.
 #
-# HA followers forward to https://<leader pod IP>:8088 and verify the
-# certificate with the image's trust store: it needs the pod IP as a SAN
-# (e.g. cert-manager csi-driver) and a CA the pod trusts (SSL_CERT_DIR in
-# env can add a private CA directory).
+# HA followers forward to https://<leader pod IP>:8088. A pod IP is rarely
+# in the certificate, so verify against the Service name and the Secret's CA:
+#   server:
+#     ha:
+#       enabled: true
+#       tls: {ca_file: /etc/vigilante-tls/ca.crt, server_name: vigilante.<namespace>.svc}
 tls:
   enabled: false
   # A kubernetes.io/tls Secret (tls.crt, tls.key, optional ca.crt) mounted

@@ -56,6 +56,7 @@ console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 | `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달. 환경변수 `VIGILANTE_HA_ADVERTISE_URL`이 있으면 그 값을 씀(여러 노드가 설정 파일 하나를 공유할 때, 예: Helm 차트) |
 | `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름. 환경변수 `VIGILANTE_HA_NODE_ID`가 우선 |
 | `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
+| `ha.tls` | — | 팔로워가 https 주소의 리더로 전달할 때의 검증: `ca_file`(노드 인증서의 사설 CA), `server_name`(주소의 호스트 대신 인증서에서 확인할 이름. 파드 IP로 전달하는 Helm에서는 Service DNS 이름), `cert_file`·`key_file`(`server.tls.client_auth: require`일 때 클라이언트 인증서). 없으면 시스템 신뢰 저장소와 주소의 호스트로 검증 |
 | `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
 | `tls.cert_file` / `tls.key_file` | — | 있으면 HTTPS로 직접 서비스(TLS 1.2 이상). 파일이 바뀌면 재시작 없이 새 인증서를 씀(cert-manager·갱신 작업). 없으면 HTTP이므로 앞에 TLS 프록시·인그레스를 둠 |
 | `tls.client_ca_file` / `tls.client_auth` | —, `none` | 클라이언트 인증서 검증. `optional`: 제시된 인증서만 검증(에이전트는 인증서, 브라우저·CI는 토큰), `require`: 모든 클라이언트에 인증서 요구. 어느 경우든 API 토큰 인증은 그대로 |

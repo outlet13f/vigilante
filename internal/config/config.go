@@ -258,6 +258,22 @@ type HA struct {
 	AdvertiseURL string        `yaml:"advertise_url"` // how other nodes reach this node's API
 	NodeID       string        `yaml:"node_id"`       // default: hostname
 	LeaseTTL     time.Duration `yaml:"lease_ttl"`
+	// TLS is how followers verify the leader when they forward API calls to
+	// an https advertise URL (default: system trust store, host from the URL).
+	TLS *HATLS `yaml:"tls"`
+}
+
+// HATLS configures follower-to-leader forwarding over HTTPS.
+type HATLS struct {
+	CAFile string `yaml:"ca_file"` // private CA of the nodes' certificates
+	// ServerName is checked against the leader's certificate instead of the
+	// host in its advertise URL. Pod IPs are rarely in a certificate; the
+	// Service DNS name usually is.
+	ServerName string `yaml:"server_name"`
+	// CertFile/KeyFile: a client certificate, when server.tls.client_auth
+	// is require.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 // Agent configures the optional push agent (`vigilante agent`).

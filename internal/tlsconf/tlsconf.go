@@ -117,6 +117,20 @@ func Server(c *config.ServerTLS) (*tls.Config, error) {
 	return tc, nil
 }
 
+// HAClient returns the TLS config followers use to forward to the leader,
+// or nil to use the system defaults.
+func HAClient(c *config.HATLS) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	tc, err := Client(&config.AgentTLS{CAFile: c.CAFile, CertFile: c.CertFile, KeyFile: c.KeyFile})
+	if err != nil {
+		return nil, fmt.Errorf("server.ha.tls: %w", err)
+	}
+	tc.ServerName = c.ServerName
+	return tc, nil
+}
+
 // Client returns the agent's TLS config, or nil to use the system defaults.
 func Client(c *config.AgentTLS) (*tls.Config, error) {
 	if c == nil {

@@ -53,6 +53,23 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   escalations, `circuit reset|trip` and `--freeze-override` now need
   `--break-glass REASON`, which is audited (`breakglass.<action>`) and sent
   as a critical alert; local approval decisions also apply `four_eyes`.
+- Helm chart: refuses to render when the config has no authentication
+  (service accounts, OIDC, or `server.auth_token_env` supplied via
+  env/envFrom); set `auth.allowAnonymous=true` for development installs.
+  Previously every in-cluster caller was an anonymous admin.
+
+### Fixed (deployment)
+- Helm chart with server TLS: the HA advertise URL, probes, port names,
+  Ingress backend port and ServiceMonitor scheme use https (the advertise
+  URL was always `http://`, which broke forwarding); new `tls.enabled`,
+  `tls.secretName` and `serviceMonitor.tlsConfig` values.
+  `server.tls.client_auth: require` is refused (probes carry no certificate).
+- `server.ha.tls` (`ca_file`, `server_name`, client cert): followers verify
+  the leader by a name in its certificate rather than the pod IP they
+  forward to.
+- Helm chart memory defaults raised to 512Mi request / 2Gi limit (512Mi was
+  below the 1.1 GiB peak heap measured at 20,000 probes), with `GOMEMLIMIT`
+  at 90% of the limit (`goMemLimit` to override or turn off).
 
 ### Fixed (decisions)
 - An overloaded orchestrator read its own probe timeouts as target failures

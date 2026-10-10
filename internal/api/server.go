@@ -27,6 +27,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -60,6 +61,9 @@ type Server struct {
 	// HA is set when several nodes share a postgres store; followers forward
 	// every API call to the leader. nil = single node.
 	HA Leadership
+	// HATLS verifies the leader when forwarding to an https advertise URL
+	// (server.ha.tls); nil = system defaults.
+	HATLS *tls.Config
 
 	ctx      context.Context
 	mu       sync.Mutex
@@ -238,6 +242,11 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 				return
 			}
 			p = httputil.NewSingleHostReverseProxy(target)
+			if s.HATLS != nil {
+				tr := http.DefaultTransport.(*http.Transport).Clone()
+				tr.TLSClientConfig = s.HATLS
+				p.Transport = tr
+			}
 			p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 				w.Header().Set("Retry-After", "2")
 				s.fail(w, r, http.StatusBadGateway, "not_leader", fmt.Errorf("leader %s unreachable: %w", node, err))

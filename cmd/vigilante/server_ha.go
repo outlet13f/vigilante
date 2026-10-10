@@ -8,14 +8,20 @@ import (
 	"vigilante/internal/api"
 	"vigilante/internal/ha"
 	"vigilante/internal/orchestrator"
+	"vigilante/internal/tlsconf"
 )
 
 // startHA makes this server one of several nodes sharing a postgres store.
 // The node starts passive and fenced (its writes are refused unless it holds
 // the leader lease); when elected it reloads the shared state, starts acting
 // and resumes any rollback the previous leader left in flight.
-func startHA(ctx context.Context, e *orchestrator.Engine, srv *api.Server) *ha.Elector {
+func startHA(ctx context.Context, e *orchestrator.Engine, srv *api.Server) (*ha.Elector, error) {
 	cfg := e.Cfg.Server.HA
+	forwardTLS, err := tlsconf.HAClient(cfg.TLS)
+	if err != nil {
+		return nil, err
+	}
+	srv.HATLS = forwardTLS
 	node := cfg.NodeID
 	if node == "" {
 		node, _ = os.Hostname()
@@ -44,5 +50,5 @@ func startHA(ctx context.Context, e *orchestrator.Engine, srv *api.Server) *ha.E
 	e.Journal.Fence(ha.LeaderKey, el.Owner())
 	srv.HA = el
 	go el.Run(ctx)
-	return el
+	return el, nil
 }

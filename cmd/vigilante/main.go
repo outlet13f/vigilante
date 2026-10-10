@@ -633,7 +633,9 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	}
 	role := "single node"
 	if e.Cfg.Server.HA.Enabled {
-		startHA(ctx, e, srv)
+		if _, err := startHA(ctx, e, srv); err != nil {
+			return 1, err
+		}
 		role = "HA node " + e.Cfg.Server.HA.AdvertiseURL
 	} else {
 		go func() {
