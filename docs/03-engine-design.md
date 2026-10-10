@@ -160,7 +160,7 @@ Rollback(dep)
 | 하고 싶은 것 | 방법 |
 |---|---|
 | 새 수집기 (예: Oracle/Tibero 풀, JMX) | `internal/probe/xxx.go`에 Factory 구현 + `Register`. `config.Probe`에 설정 블록 추가, `validateProbe`에 필수 키 검사 추가 |
-| 새 롤백 전략 (예: Proxmox; OpenStack은 로드맵 M7에서 정식 구현) | `Executor`(+필요 시 `Preparer`) 구현 + `executor.Register` |
+| 새 롤백 전략 (예: Proxmox) | `Executor`(+필요 시 `Preparer`) 구현 + `executor.Register` |
 | 새 LB (예: Citrix ADC, Azure LB, A10) | `TrafficController` 구현 + `RegisterTraffic`. `Pool()`은 관리 외 멤버도 반환해야 blast radius가 정확 |
 | 사내 배포 콘솔 연동 | 코드 없이 `webhook`/`exec` 실행기로 가능 |
 

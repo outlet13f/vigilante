@@ -45,7 +45,7 @@
 │         │                │           │ Executor (A/B/D)          │ TrafficController (C)    │
 │         │                │           │ symlink container vsphere │ nginx haproxy envoy      │
 │         │                │           │ nutanix kvm exec webhook  │ f5 aws_alb               │
-│         │                │           │ openstack(M7)             │ octavia(M7)              │
+│         │                │           │ openstack                 │ octavia                  │
 │  ┌──────┴────────────────┴───────────┴───────────────────────────┴───────────────────────┐   │
 │  │ SAFETY: Circuit Breaker · Service Lock(파일 락) · Flapping/Cooldown · Blast Radius     │   │
 │  ├───────────────────────────────────────────────────────────────────────────────────────┤   │
@@ -59,7 +59,7 @@
  ┌───────────────────────┐ ┌──────────────────────────┐ ┌───────────────────────────────┐
  │ 1. 베어메탈/온프레미스   │ │ 2. 프라이빗 가상화         │ │ 3. 퍼블릭 클라우드 IaaS          │
  │  Linux/Unix 서버        │ │  OpenStack Nova/Cinder   │ │  EC2 / Azure VM (SSH)          │
- │  /proc, systemd, 로그   │ │   (Keystone v3, M7)      │ │  ALB/NLB Target Group API      │
+ │  /proc, systemd, 로그   │ │   (Keystone v3)          │ │  ALB/NLB Target Group API      │
  │  /opt/app/current ──▶  │ │  vCenter(SOAP/govmomi)   │ │                               │
  │                         │ │  Nutanix Prism REST      │ │                               │
  │                         │ │  KVM: virsh over SSH     │ │                               │
@@ -69,11 +69,11 @@
  │  docker.sock ⇐ SSH 터널 │ │  HAProxy Runtime API     │ │  heartbeat · failsafe 판정      │
  │  K8s Ingress 하단 VM     │ │  Envoy file-EDS          │ │                               │
  │                         │ │  F5 BIG-IP iControl REST │ │                               │
- │                         │ │  OpenStack Octavia (M7)  │ │                               │
+ │                         │ │  OpenStack Octavia       │ │                               │
  └───────────────────────┘ └──────────────────────────┘ └───────────────────────────────┘
 ```
 
-OpenStack은 사내 CMP가 관리하는 주력 프라이빗 클라우드이므로 **상용 1차 출시의 필수 지원 대상**입니다. 실행기 `openstack`(전략 D)과 트래픽 제어기 `octavia`(전략 C)는 로드맵 M7에서 구현하며, 구현 전까지는 `exec`/`webhook` 실행기로 우회합니다. 설계 요지는 docs/05 M7 절, 설정 키는 docs/02를 참고하십시오.
+OpenStack은 사내 CMP가 관리하는 주력 프라이빗 클라우드이므로 **상용 1차 출시의 필수 지원 대상**입니다. 실행기 `openstack`(전략 D: Cinder 볼륨 스냅샷 revert 또는 Nova rebuild)과 트래픽 제어기 `octavia`(전략 C)를 M7에서 구현했습니다. 실장비 검증(M8) 전까지는 "실험적"입니다. 설정은 docs/02 "OpenStack" 절을 참고하십시오.
 
 핵심 포인트
 

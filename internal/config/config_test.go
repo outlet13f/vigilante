@@ -217,3 +217,58 @@ secrets: {cache_ttl: 2m, vault: {address: https://vault:8200, auth: approle, rol
 		}
 	}
 }
+
+func TestOpenStackValidation(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x}
+`
+	ac := `  os: {type: openstack, auth_url: "https://keystone/v3", application_credential_id: ac, application_credential_secret_ref: "env:S"}` + "\n"
+	cases := map[string]string{
+		"credentials:\n  os: {type: openstack, application_credential_id: ac, application_credential_secret_ref: \"env:S\"}\n":                                            "needs auth_url",
+		"credentials:\n  os: {type: openstack, auth_url: u, application_credential_id: ac}\n":                                                                             "application_credential_secret_ref",
+		"credentials:\n  os: {type: openstack, auth_url: u}\n":                                                                                                            "application_credential_id (recommended)",
+		"credentials:\n  os: {type: openstack, auth_url: u, user: d, password_ref: \"env:P\"}\n":                                                                          "project_name or project_id",
+		"credentials:\n  os: {type: openstack, auth_url: u, user: d, project_name: p}\n":                                                                                  "password_ref or password_env",
+		"credentials:\n" + ac + "  os2: {type: openstack, auth_url: u, interface: private, application_credential_id: a, application_credential_secret_ref: \"env:S\"}\n": "interface must be",
+	}
+	for tail, want := range cases {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	withExec := func(execYAML, trafficYAML string) string {
+		return strings.Replace(base, "executors: {x: {type: exec, exec: {rollback: \"true\"}}}",
+			"executors:\n  x: {type: exec, exec: {rollback: \"true\"}}\n  "+execYAML+"\n"+trafficYAML, 1) +
+			"credentials:\n" + ac + "  b: {type: basic, user: u, password_env: P}\n"
+	}
+	for cfg, want := range map[string]string{
+		withExec("vm: {type: openstack, openstack: {credential: b}}", ""):                                                           "must be of type openstack",
+		withExec("vm: {type: openstack, openstack: {}}", ""):                                                                        "credential required",
+		withExec("vm: {type: openstack, openstack: {credential: os, mode: snapshot}}", ""):                                          "mode must be auto, volume or image",
+		withExec("vm: {type: openstack, openstack: {credential: os}}", "traffic: {lb: {type: octavia, octavia: {credential: os}}}"): "octavia.pool_id and octavia.member_port",
+	} {
+		if _, err := Parse([]byte(cfg)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("got %v, want %q", err, want)
+		}
+	}
+	c, err := Parse([]byte(withExec("vm: {type: openstack, openstack: {credential: os}}",
+		"traffic: {lb: {type: octavia, octavia: {credential: os, pool_id: p, member_port: 8080}}}")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := c.Executors["vm"].OpenStack
+	if o.Mode != "auto" || o.ServerID != "{{.Labels.openstack_server_id}}" || !*o.PowerOn || *o.KeepSnapshots != 3 || o.RevertTimeout != 15*time.Minute {
+		t.Fatalf("defaults: %+v", o)
+	}
+	if oc := c.Traffic["lb"].Octavia; oc.MemberAddress != "{{.Address}}" || oc.WaitTimeout != 5*time.Minute {
+		t.Fatalf("octavia defaults: %+v", oc)
+	}
+}

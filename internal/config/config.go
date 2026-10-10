@@ -167,7 +167,7 @@ type Agent struct {
 // Credential is resolved lazily; secrets are always read from env vars or files,
 // never stored inline in the YAML.
 type Credential struct {
-	Type              string `yaml:"type"` // ssh | basic | token | aws
+	Type              string `yaml:"type"` // ssh | basic | token | aws | openstack
 	User              string `yaml:"user"`
 	PrivateKeyFile    string `yaml:"private_key_file"`
 	PassphraseEnv     string `yaml:"passphrase_env"`
@@ -190,6 +190,20 @@ type Credential struct {
 	// SSHCA: short-lived SSH certificates from Vault's SSH secrets engine
 	// instead of a long-lived private key.
 	SSHCA *SSHCA `yaml:"ssh_ca"`
+
+	// OpenStack (type openstack): Keystone v3 auth URL plus either an
+	// application credential (preferred: project-scoped, no user password)
+	// or user + password_ref + project.
+	AuthURL                        string `yaml:"auth_url"`  // https://keystone.example.internal:5000/v3
+	Interface                      string `yaml:"interface"` // catalog endpoint: public (default) | internal | admin
+	ApplicationCredentialID        string `yaml:"application_credential_id"`
+	ApplicationCredentialSecretRef string `yaml:"application_credential_secret_ref"`
+	ProjectName                    string `yaml:"project_name"`
+	ProjectID                      string `yaml:"project_id"`
+	UserDomainName                 string `yaml:"user_domain_name"`    // default Default
+	ProjectDomainName              string `yaml:"project_domain_name"` // default Default
+	CACert                         string `yaml:"cacert"`              // PEM file for a private CA
+	TLSSkipVerify                  bool   `yaml:"tls_skip_verify"`
 }
 
 // SSHCA asks Vault to sign an ephemeral in-memory key for each connection set.
@@ -241,12 +255,13 @@ type Connection struct {
 
 // Traffic is a traffic control layer (software LB, hardware ADC, cloud LB).
 type Traffic struct {
-	Type    string          `yaml:"type"` // nginx | haproxy | envoy | f5 | aws_alb
+	Type    string          `yaml:"type"` // nginx | haproxy | envoy | f5 | aws_alb | octavia
 	Nginx   *NginxTraffic   `yaml:"nginx,omitempty"`
 	HAProxy *HAProxyTraffic `yaml:"haproxy,omitempty"`
 	Envoy   *EnvoyTraffic   `yaml:"envoy,omitempty"`
 	F5      *F5Traffic      `yaml:"f5,omitempty"`
 	AWSALB  *AWSALBTraffic  `yaml:"aws_alb,omitempty"`
+	Octavia *OctaviaTraffic `yaml:"octavia,omitempty"`
 	// DrainWait is how long to wait after draining before touching the app.
 	DrainWait time.Duration `yaml:"drain_wait"`
 }
@@ -284,6 +299,15 @@ type F5Traffic struct {
 	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
 }
 
+// OctaviaTraffic drains OpenStack Octavia pool members (admin_state_up).
+type OctaviaTraffic struct {
+	Credential    string        `yaml:"credential"` // type openstack
+	PoolID        string        `yaml:"pool_id"`
+	MemberAddress string        `yaml:"member_address"` // template, default "{{.Address}}"
+	MemberPort    int           `yaml:"member_port"`
+	WaitTimeout   time.Duration `yaml:"wait_timeout"` // load balancer ACTIVE / member ONLINE wait, default 5m
+}
+
 type AWSALBTraffic struct {
 	Credential     string        `yaml:"credential"`
 	TargetGroupARN string        `yaml:"target_group_arn"`
@@ -294,12 +318,13 @@ type AWSALBTraffic struct {
 
 // Executor is a rollback strategy instance.
 type Executor struct {
-	Type      string         `yaml:"type"` // symlink | container | vsphere | nutanix | kvm | exec | webhook
+	Type      string         `yaml:"type"` // symlink | container | vsphere | nutanix | kvm | openstack | exec | webhook
 	Symlink   *SymlinkExec   `yaml:"symlink,omitempty"`
 	Container *ContainerExec `yaml:"container,omitempty"`
 	VSphere   *VSphereExec   `yaml:"vsphere,omitempty"`
 	Nutanix   *NutanixExec   `yaml:"nutanix,omitempty"`
 	KVM       *KVMExec       `yaml:"kvm,omitempty"`
+	OpenStack *OpenStackExec `yaml:"openstack,omitempty"`
 	Exec      *ExecExec      `yaml:"exec,omitempty"`
 	Webhook   *WebhookExec   `yaml:"webhook,omitempty"`
 }
@@ -339,6 +364,23 @@ type NutanixExec struct {
 	VMUUID        string `yaml:"vm_uuid"`  // template
 	Snapshot      string `yaml:"snapshot"` // template
 	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
+}
+
+// OpenStackExec snapshots and restores an OpenStack server (strategy D).
+// Volume-booted servers: Cinder snapshot of the root volume, restored with
+// revert-to-snapshot. Image-booted servers: Nova server snapshot (Glance
+// image), restored with rebuild.
+type OpenStackExec struct {
+	Credential    string        `yaml:"credential"` // type openstack
+	ServerID      string        `yaml:"server_id"`  // template, default "{{.Labels.openstack_server_id}}"
+	Mode          string        `yaml:"mode"`       // auto (default) | volume | image
+	Snapshot      string        `yaml:"snapshot"`   // name template, default "vigilante-{{.DeploymentID}}"
+	RevertTimeout time.Duration `yaml:"revert_timeout"`
+	// PowerOn starts the server after a volume revert (default true).
+	PowerOn *bool `yaml:"power_on"`
+	// KeepSnapshots older vigilante snapshots of the server are kept; older
+	// ones are deleted at the next prepare (default 3, 0 = keep all).
+	KeepSnapshots *int `yaml:"keep_snapshots"`
 }
 
 type KVMExec struct {
