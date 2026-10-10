@@ -40,6 +40,7 @@ servers:
     description: Any node of the cluster; followers forward to the leader.
 security:
   - bearerAuth: []
+  - oauth2: []
 tags:
   - name: deployments
     description: Releases being watched, and the actions taken on them.
@@ -52,7 +53,7 @@ tags:
   - name: audit
     description: Who did what, with a tamper-evident hash chain.
   - name: identity
-    description: The caller as the server sees it.
+    description: The caller as the server sees it, OAuth tokens and API clients.
   - name: system
     description: Health, readiness and metrics of the node.
   - name: v1
@@ -71,11 +72,13 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Principal'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/deployments:
     get:
       tags: [deployments]
       operationId: listDeployments
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: List deployments
       description: Newest first. Only deployments of services the caller may read are listed.
       parameters:
@@ -95,9 +98,11 @@ paths:
               schema: {$ref: '#/components/schemas/DeploymentPage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
     post:
       tags: [deployments]
       operationId: createDeployment
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Register a deployment
       description: |
         Registers a release before (or right after) it is rolled out. When
@@ -129,6 +134,7 @@ paths:
               schema: {$ref: '#/components/schemas/Deployment'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/Unprocessable'}
@@ -139,6 +145,7 @@ paths:
     get:
       tags: [deployments]
       operationId: getDeployment
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Get a deployment
       parameters:
         - {$ref: '#/components/parameters/IfNoneMatch'}
@@ -152,6 +159,7 @@ paths:
               schema: {$ref: '#/components/schemas/Deployment'}
         '304': {description: Not modified since the ETag in If-None-Match.}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
 
@@ -161,6 +169,7 @@ paths:
     post:
       tags: [deployments]
       operationId: startObservation
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Observe a phase
       description: |
         Starts watching one phase. A failing phase is rolled back automatically;
@@ -177,6 +186,7 @@ paths:
         '202': {$ref: '#/components/responses/Accepted'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
@@ -189,6 +199,7 @@ paths:
     post:
       tags: [deployments]
       operationId: startRollback
+      security: [{bearerAuth: []}, {oauth2: [rollbacks:execute]}]
       summary: Roll back now
       description: |
         Operator decision. Cancels a running observation and runs the rollback
@@ -205,6 +216,7 @@ paths:
         '202': {$ref: '#/components/responses/Accepted'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
@@ -217,6 +229,7 @@ paths:
     post:
       tags: [deployments]
       operationId: approveEscalation
+      security: [{bearerAuth: []}, {oauth2: [approvals:write]}]
       summary: Approve a gated escalation
       description: |
         Allowed only while the deployment is `AWAITING_APPROVAL`. With four-eyes
@@ -233,6 +246,7 @@ paths:
         '202': {$ref: '#/components/responses/Accepted'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
@@ -245,6 +259,7 @@ paths:
     post:
       tags: [deployments]
       operationId: abortObservation
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Stop observing
       description: Cancels a running observation. A rollback already running is not interrupted.
       parameters:
@@ -256,6 +271,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Deployment'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/Unprocessable'}
@@ -264,6 +280,7 @@ paths:
     get:
       tags: [operations]
       operationId: listOperations
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: List operations
       parameters:
         - {$ref: '#/components/parameters/Limit'}
@@ -282,6 +299,7 @@ paths:
               schema: {$ref: '#/components/schemas/OperationPage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/operations/{id}:
     parameters:
@@ -292,6 +310,7 @@ paths:
     get:
       tags: [operations]
       operationId: getOperation
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Get an operation
       parameters:
         - {$ref: '#/components/parameters/IfNoneMatch'}
@@ -305,6 +324,7 @@ paths:
               schema: {$ref: '#/components/schemas/Operation'}
         '304': {description: Not modified since the ETag in If-None-Match.}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
 
@@ -312,6 +332,7 @@ paths:
     get:
       tags: [services]
       operationId: listServices
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: List services
       parameters:
         - {$ref: '#/components/parameters/Limit'}
@@ -327,6 +348,7 @@ paths:
               schema: {$ref: '#/components/schemas/ServicePage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/services/{name}:
     parameters:
@@ -334,6 +356,7 @@ paths:
     get:
       tags: [services]
       operationId: getService
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Get a service
       responses:
         '200':
@@ -342,6 +365,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Service'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
 
@@ -351,6 +375,7 @@ paths:
     post:
       tags: [services]
       operationId: captureBaseline
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Capture a baseline
       description: Observes the running (old) version for the window and keeps the result as the comparison baseline.
       parameters:
@@ -363,6 +388,7 @@ paths:
         '202': {$ref: '#/components/responses/Accepted'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/Unprocessable'}
@@ -373,6 +399,7 @@ paths:
     put:
       tags: [services]
       operationId: setLastGood
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
       summary: Register the known-good version
       description: The version rollbacks return to when a deployment does not name `previous_version`.
       parameters:
@@ -390,12 +417,14 @@ paths:
               schema: {$ref: '#/components/schemas/LastGood'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/Unprocessable'}
     get:
       tags: [services]
       operationId: getLastGood
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Get the known-good version
       responses:
         '200':
@@ -404,6 +433,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/LastGood'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
 
@@ -411,6 +441,7 @@ paths:
     get:
       tags: [services]
       operationId: listTargets
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: List targets
       parameters:
         - {$ref: '#/components/parameters/Limit'}
@@ -423,6 +454,7 @@ paths:
               schema: {$ref: '#/components/schemas/TargetPage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/targets/{name}:
     parameters:
@@ -433,6 +465,7 @@ paths:
     get:
       tags: [services]
       operationId: getTarget
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Get a target
       responses:
         '200':
@@ -441,6 +474,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Target'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
 
@@ -462,11 +496,13 @@ paths:
                     type: array
                     items: {$ref: '#/components/schemas/Preset'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /v2/circuit:
     get:
       tags: [safety]
       operationId: getCircuit
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Circuit breaker state
       responses:
         '200':
@@ -475,12 +511,14 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Circuit'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
 
   /v2/circuit/reset:
     post:
       tags: [safety]
       operationId: resetCircuit
+      security: [{bearerAuth: []}, {oauth2: [circuit:admin]}]
       summary: Close the circuit
       description: Admin only. Re-enables automatic rollbacks and the deployment gate after investigation.
       parameters:
@@ -498,6 +536,7 @@ paths:
               schema: {$ref: '#/components/schemas/Circuit'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '422': {$ref: '#/components/responses/Unprocessable'}
 
@@ -505,6 +544,7 @@ paths:
     post:
       tags: [safety]
       operationId: tripCircuit
+      security: [{bearerAuth: []}, {oauth2: [circuit:admin]}]
       summary: Open the circuit (kill switch)
       description: Admin only. Freezes every automatic destructive action and closes the deployment gate.
       parameters:
@@ -522,6 +562,7 @@ paths:
               schema: {$ref: '#/components/schemas/Circuit'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '422': {$ref: '#/components/responses/Unprocessable'}
 
@@ -529,6 +570,7 @@ paths:
     get:
       tags: [audit]
       operationId: listAuditEvents
+      security: [{bearerAuth: []}, {oauth2: [audit:read]}]
       summary: Query the audit trail
       description: Oldest first. Needs `viewer` on every service (`*`), because entries span services.
       parameters:
@@ -557,7 +599,191 @@ paths:
               schema: {$ref: '#/components/schemas/AuditEventPage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '403': {$ref: '#/components/responses/Forbidden'}
+
+  /v2/oauth/token:
+    post:
+      tags: [identity]
+      operationId: issueToken
+      summary: Get an access token (OAuth 2.0 client credentials)
+      description: |
+        RFC 6749 section 4.4. Authenticate the client with HTTP Basic (or
+        `client_id` / `client_secret` form fields). Errors use the OAuth error
+        format of RFC 6749 section 5.2, so standard OAuth libraries work. Tokens
+        stop working when the client's secret is rotated or the client is revoked.
+      security: [{clientBasic: []}, {}]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: {type: string, enum: [client_credentials]}
+                scope: {type: string, description: 'Space-separated subset of the client scopes. Defaults to all of them.'}
+                client_id: {type: string}
+                client_secret: {type: string}
+      responses:
+        '200':
+          description: Access token.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenResponse'}
+        '400':
+          description: Invalid request, unsupported grant type or scope.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OAuthError'}
+        '401':
+          description: Client authentication failed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OAuthError'}
+        '429':
+          description: Rate limited.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OAuthError'}
+
+  /v2/api-clients:
+    get:
+      tags: [identity]
+      operationId: listApiClients
+      summary: List API clients
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page of clients, by name.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClientPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [identity]
+      operationId: createApiClient
+      summary: Register an API client
+      description: |
+        Admin only. The response carries the secret (OAuth client secret or API
+        key) once; only its SHA-256 is stored. Not replayable with
+        Idempotency-Key, because the stored response would contain the secret;
+        a retry gets 409 while a client of that name is active.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ApiClientCreate'}
+      responses:
+        '201':
+          description: Created; store the secret now.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClientSecret'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/api-clients/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [identity]
+      operationId: getApiClient
+      summary: Get an API client
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      responses:
+        '200':
+          description: The client (never its secret).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClient'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [identity]
+      operationId: updateApiClient
+      summary: Change scopes, grants, expiry or rate limit
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ApiClientUpdate'}
+      responses:
+        '200':
+          description: The updated client.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClient'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [identity]
+      operationId: revokeApiClient
+      summary: Revoke an API client
+      description: The client and every token issued to it stop working at once. The record is kept for the audit trail.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '200':
+          description: The revoked client.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClient'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/api-clients/{id}/secret:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      tags: [identity]
+      operationId: rotateApiClientSecret
+      summary: Rotate the secret
+      description: Issues a new secret; the old secret and tokens issued with it stop working at once.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      responses:
+        '200':
+          description: The new secret, shown once.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiClientSecret'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /healthz:
     get:
@@ -592,6 +818,7 @@ paths:
     get:
       tags: [system]
       operationId: metrics
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
       summary: Prometheus metrics
       description: Needs `viewer` on `*` unless `server.metrics_public` is set.
       responses:
@@ -656,8 +883,30 @@ components:
       type: http
       scheme: bearer
       description: |
-        A service-account token (`vgl_…`), or an OIDC access token from the
-        corporate identity provider.
+        A service-account token (`vgl_…`), an API key (`vgk_…`), or an OIDC
+        access token from the corporate identity provider.
+    oauth2:
+      type: oauth2
+      description: |
+        Client credentials grant for server-to-server integrations. Exchange the
+        client ID and secret at `/v2/oauth/token` for a bearer token (`vat_…`).
+        Scopes narrow what the client may do; its role grants decide where.
+      flows:
+        clientCredentials:
+          tokenUrl: /v2/oauth/token
+          scopes:
+            deployments:read: Read deployments, operations, services, targets, circuit and metrics.
+            deployments:write: Register deployments, observe phases, abort, baselines, last good version.
+            rollbacks:execute: Start manual rollbacks.
+            approvals:write: Approve gated escalations.
+            circuit:admin: Reset or trip the circuit breaker.
+            audit:read: Read the audit trail.
+            metrics:write: Push samples (agents, external monitoring).
+            config:write: Manage API clients and server configuration.
+    clientBasic:
+      type: http
+      scheme: basic
+      description: OAuth client authentication at the token endpoint (client ID and secret).
 
   parameters:
     Limit:
@@ -741,6 +990,21 @@ components:
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
+    RateLimited:
+      description: |
+        Too many requests from this caller. Rollbacks, approvals, abort and the
+        circuit breaker use a separate bucket, so reads never exhaust them.
+      headers:
+        Retry-After:
+          description: Seconds to wait.
+          schema: {type: integer}
+        RateLimit-Limit:
+          schema: {type: integer}
+        RateLimit-Remaining:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
     Unprocessable:
       description: Well-formed but invalid (validation, or an Idempotency-Key reused with a different request).
       content:
@@ -777,8 +1041,9 @@ components:
       type: object
       required: [id, kind, grants]
       properties:
-        id: {type: string, examples: ['user:alice', 'sa:ci-order']}
-        kind: {type: string, enum: [user, service, legacy, webhook, anonymous]}
+        id: {type: string, examples: ['user:alice', 'sa:ci-order', 'client:deploy-console']}
+        kind: {type: string, enum: [user, service, client, legacy, webhook, anonymous]}
+        scopes: {type: [array, 'null'], items: {type: string}, description: 'OAuth scopes of an API client; null = not scope-limited.'}
         groups: {type: [array, 'null'], items: {type: string}}
         grants:
           type: array
@@ -1037,6 +1302,84 @@ components:
       required: [items, next_cursor]
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/AuditEvent'}}
+        next_cursor: {type: [string, 'null']}
+
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in, scope]
+      properties:
+        access_token: {type: string}
+        token_type: {type: string, enum: [Bearer]}
+        expires_in: {type: integer, description: Seconds.}
+        scope: {type: string}
+    OAuthError:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string, enum: [invalid_request, invalid_client, unsupported_grant_type, invalid_scope, slow_down, server_error]}
+        error_description: {type: string}
+
+    Scope:
+      type: string
+      enum: [deployments:read, deployments:write, rollbacks:execute, approvals:write, circuit:admin, audit:read, metrics:write, config:write]
+    RateLimit:
+      type: object
+      required: [rate, burst]
+      properties:
+        rate: {type: number, minimum: 0, description: 'Requests per second; 0 = no per-second limit.'}
+        burst: {type: integer, minimum: 0}
+        daily: {type: integer, minimum: 0, description: 'Requests per UTC day; 0 = no cap.'}
+    ApiClient:
+      type: object
+      required: [id, name, type, scopes, grants, secret_hint, created_at, status]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        type: {type: string, enum: [oauth, api_key]}
+        description: {type: string}
+        scopes: {type: array, items: {$ref: '#/components/schemas/Scope'}}
+        grants: {type: array, items: {type: string, examples: ['deployer@team=payments']}}
+        secret_hint: {type: string, description: 'First characters of the secret.'}
+        rate_limit: {$ref: '#/components/schemas/RateLimit'}
+        expires_at: {type: string, format: date-time}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        rotated_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time, description: 'Updated at most hourly.'}
+        status: {type: string, enum: [active, expired, revoked]}
+    ApiClientCreate:
+      type: object
+      required: [name, type, scopes, grants]
+      additionalProperties: false
+      properties:
+        name: {type: string, pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'}
+        type: {type: string, enum: [oauth, api_key]}
+        description: {type: string}
+        scopes: {type: array, minItems: 1, items: {$ref: '#/components/schemas/Scope'}}
+        grants: {type: array, minItems: 1, items: {type: string}, description: 'role@scope: viewer|deployer|operator|admin|agent @ * | team=X | service=Y'}
+        expires_at: {type: string, format: date-time}
+        rate_limit: {$ref: '#/components/schemas/RateLimit'}
+    ApiClientUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        description: {type: string}
+        scopes: {type: array, minItems: 1, items: {$ref: '#/components/schemas/Scope'}}
+        grants: {type: array, minItems: 1, items: {type: string}}
+        expires_at: {type: string, format: date-time}
+        rate_limit: {$ref: '#/components/schemas/RateLimit'}
+    ApiClientSecret:
+      type: object
+      required: [client, secret]
+      properties:
+        client: {$ref: '#/components/schemas/ApiClient'}
+        secret: {type: string, description: 'vcs_… (OAuth client secret) or vgk_… (API key). Shown once.'}
+    ApiClientPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/ApiClient'}}
         next_cursor: {type: [string, 'null']}
 
     Readiness:

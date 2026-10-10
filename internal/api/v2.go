@@ -31,44 +31,63 @@ import (
 type route struct {
 	pattern string
 	handler http.HandlerFunc
-	write   bool // honours Idempotency-Key
+	write   bool   // honours Idempotency-Key
+	class   string // rate-limit bucket; "" = default
+	public  bool   // no bearer token (OAuth token endpoint authenticates the client itself)
 }
 
 // v2Routes is the v2 route table; TestV2RoutesMatchSpec holds it to the spec.
+// Writes that return a secret are not idempotent-replayable: the stored
+// response would keep the secret in the state store.
 func (s *Server) v2Routes() []route {
 	return []route{
-		{"GET /v2/me", s.v2Me, false},
-		{"GET /v2/deployments", s.v2ListDeployments, false},
-		{"POST /v2/deployments", s.v2CreateDeployment, true},
-		{"GET /v2/deployments/{id}", s.v2GetDeployment, false},
-		{"POST /v2/deployments/{id}/observations", s.v2StartObservation, true},
-		{"POST /v2/deployments/{id}/rollbacks", s.v2StartRollback, true},
-		{"POST /v2/deployments/{id}/approvals", s.v2Approve, true},
-		{"POST /v2/deployments/{id}/abort", s.v2Abort, true},
-		{"GET /v2/operations", s.v2ListOperations, false},
-		{"GET /v2/operations/{id}", s.v2GetOperation, false},
-		{"GET /v2/services", s.v2ListServices, false},
-		{"GET /v2/services/{name}", s.v2GetService, false},
-		{"POST /v2/services/{name}/baselines", s.v2CaptureBaseline, true},
-		{"PUT /v2/services/{name}/last-good", s.v2SetLastGood, true},
-		{"GET /v2/services/{name}/last-good", s.v2GetLastGood, false},
-		{"GET /v2/targets", s.v2ListTargets, false},
-		{"GET /v2/targets/{name}", s.v2GetTarget, false},
-		{"GET /v2/presets", s.v2ListPresets, false},
-		{"GET /v2/circuit", s.v2GetCircuit, false},
-		{"POST /v2/circuit/reset", s.v2ResetCircuit, true},
-		{"POST /v2/circuit/trip", s.v2TripCircuit, true},
-		{"GET /v2/audit-events", s.v2ListAuditEvents, false},
+		{pattern: "GET /v2/me", handler: s.v2Me},
+		{pattern: "POST /v2/oauth/token", handler: s.v2Token, public: true},
+		{pattern: "GET /v2/deployments", handler: s.v2ListDeployments},
+		{pattern: "POST /v2/deployments", handler: s.v2CreateDeployment, write: true},
+		{pattern: "GET /v2/deployments/{id}", handler: s.v2GetDeployment},
+		{pattern: "POST /v2/deployments/{id}/observations", handler: s.v2StartObservation, write: true},
+		{pattern: "POST /v2/deployments/{id}/rollbacks", handler: s.v2StartRollback, write: true, class: classEmergency},
+		{pattern: "POST /v2/deployments/{id}/approvals", handler: s.v2Approve, write: true, class: classEmergency},
+		{pattern: "POST /v2/deployments/{id}/abort", handler: s.v2Abort, write: true, class: classEmergency},
+		{pattern: "GET /v2/operations", handler: s.v2ListOperations},
+		{pattern: "GET /v2/operations/{id}", handler: s.v2GetOperation},
+		{pattern: "GET /v2/services", handler: s.v2ListServices},
+		{pattern: "GET /v2/services/{name}", handler: s.v2GetService},
+		{pattern: "POST /v2/services/{name}/baselines", handler: s.v2CaptureBaseline, write: true},
+		{pattern: "PUT /v2/services/{name}/last-good", handler: s.v2SetLastGood, write: true},
+		{pattern: "GET /v2/services/{name}/last-good", handler: s.v2GetLastGood},
+		{pattern: "GET /v2/targets", handler: s.v2ListTargets},
+		{pattern: "GET /v2/targets/{name}", handler: s.v2GetTarget},
+		{pattern: "GET /v2/presets", handler: s.v2ListPresets},
+		{pattern: "GET /v2/circuit", handler: s.v2GetCircuit},
+		{pattern: "POST /v2/circuit/reset", handler: s.v2ResetCircuit, write: true, class: classEmergency},
+		{pattern: "POST /v2/circuit/trip", handler: s.v2TripCircuit, write: true, class: classEmergency},
+		{pattern: "GET /v2/audit-events", handler: s.v2ListAuditEvents},
+		{pattern: "GET /v2/api-clients", handler: s.v2ListClients},
+		{pattern: "POST /v2/api-clients", handler: s.v2CreateClient},
+		{pattern: "GET /v2/api-clients/{id}", handler: s.v2GetClient},
+		{pattern: "PATCH /v2/api-clients/{id}", handler: s.v2UpdateClient, write: true},
+		{pattern: "DELETE /v2/api-clients/{id}", handler: s.v2RevokeClient, write: true},
+		{pattern: "POST /v2/api-clients/{id}/secret", handler: s.v2RotateClient},
 	}
 }
 
 func (s *Server) routesV2(mux *http.ServeMux) {
 	for _, rt := range s.v2Routes() {
+		if rt.public {
+			mux.HandleFunc(rt.pattern, rt.handler)
+			continue
+		}
 		h := rt.handler
 		if rt.write {
 			h = s.idempotent(h)
 		}
-		mux.HandleFunc(rt.pattern, s.authn(h))
+		class := rt.class
+		if class == "" {
+			class = classDefault
+		}
+		mux.HandleFunc(rt.pattern, s.authn(s.limited(class, h)))
 	}
 	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, r, http.StatusNotFound, "not_found", "no such endpoint: "+r.Method+" "+r.URL.Path)
@@ -391,7 +410,7 @@ func (s *Server) v2Me(w http.ResponseWriter, r *http.Request) {
 	for i, b := range p.Bindings {
 		grants[i] = b.String()
 	}
-	writeJSON(w, 200, map[string]any{"id": p.ID, "kind": p.Kind, "groups": p.Groups, "grants": grants})
+	writeJSON(w, 200, map[string]any{"id": p.ID, "kind": p.Kind, "groups": p.Groups, "grants": grants, "scopes": p.Scopes})
 }
 
 // ---------------------------------------------------------------- deployments
@@ -1033,7 +1052,7 @@ type auditEventV2 struct {
 }
 
 func (s *Server) v2ListAuditEvents(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.allow(w, r, auth.ActRead, auth.Service{}); !ok {
+	if !s.auditAllowed(w, r) {
 		return
 	}
 	pr, ok := s.pageParams(w, r)

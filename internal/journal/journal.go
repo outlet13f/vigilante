@@ -23,15 +23,28 @@ import (
 )
 
 const (
-	KindDeployment    = "deployment"     // full deployment snapshot
-	KindCircuit       = "circuit"        // circuit breaker state
-	KindRollbackStart = "rollback.start" // service rollback begins (flapping history)
-	KindStepDone      = "rollback.step"  // target finished plan step N
-	KindAudit         = "audit"          // who did what (API/CLI actions, denials)
-	KindAnchor        = "anchor"         // chain start after pruning: Hash = last pruned entry's hash
-	KindOperation     = "operation"      // API long-running operation snapshot
-	KindIdempotency   = "idempotency"    // response remembered for an Idempotency-Key
+	KindDeployment    = "deployment"      // full deployment snapshot
+	KindCircuit       = "circuit"         // circuit breaker state
+	KindRollbackStart = "rollback.start"  // service rollback begins (flapping history)
+	KindStepDone      = "rollback.step"   // target finished plan step N
+	KindAudit         = "audit"           // who did what (API/CLI actions, denials)
+	KindAnchor        = "anchor"          // chain start after pruning: Hash = last pruned entry's hash
+	KindOperation     = "operation"       // API long-running operation snapshot
+	KindIdempotency   = "idempotency"     // response remembered for an Idempotency-Key
+	KindAPIClient     = "api-client"      // API client snapshot (secret stored as SHA-256)
+	KindAccessToken   = "access-token"    // OAuth access token issued (stored as SHA-256)
+	KindClientUsed    = "api-client.used" // Message = client ID; Time = last use (at most hourly)
 )
+
+// Bookkeeping reports kinds that only rebuild state; their meaning is
+// carried by audit entries, so audit queries and SIEM export skip them.
+func Bookkeeping(kind string) bool {
+	switch kind {
+	case KindDeployment, KindStepDone, KindOperation, KindIdempotency, KindAPIClient, KindAccessToken, KindClientUsed:
+		return true
+	}
+	return false
+}
 
 type Entry struct {
 	Time       time.Time            `json:"time"`
@@ -41,6 +54,8 @@ type Entry struct {
 	Circuit    *safety.CircuitState `json:"circuit,omitempty"`
 	Operation  *model.Operation     `json:"operation,omitempty"`
 	Idem       *model.IdemRecord    `json:"idempotency,omitempty"`
+	Client     *model.APIClient     `json:"api_client,omitempty"`
+	Token      *model.AccessToken   `json:"access_token,omitempty"`
 	DeployID   string               `json:"deployment_id,omitempty"`
 	Target     string               `json:"target,omitempty"`
 	Step       int                  `json:"step,omitempty"`
@@ -186,7 +201,9 @@ type State struct {
 	StepsDone   map[string]map[string]int // deployment -> target -> highest completed step index + 1
 	Operations  map[string]*model.Operation
 	Idempotency map[string]*model.IdemRecord // by IdemRecord.Key
-	Corrupt     int                          // unparsable lines skipped (e.g. torn final write)
+	Clients     map[string]*model.APIClient
+	Tokens      map[string]*model.AccessToken // by SHA256
+	Corrupt     int                           // unparsable lines skipped (e.g. torn final write)
 }
 
 // InFlight returns deployments whose rollback had started but not finished.
@@ -257,6 +274,25 @@ func Compact(pruned []Entry, cutoff time.Time) []Entry {
 			out = append(out, Entry{Kind: KindOperation, Time: op.CreatedAt, Operation: op})
 		}
 	}
+	// Every API client (revoked ones too, for the record) and unexpired tokens.
+	clientIDs := make([]string, 0, len(st.Clients))
+	for id := range st.Clients {
+		clientIDs = append(clientIDs, id)
+	}
+	sort.Strings(clientIDs)
+	for _, id := range clientIDs {
+		out = append(out, Entry{Kind: KindAPIClient, Time: st.Clients[id].CreatedAt, Client: st.Clients[id]})
+	}
+	toks := make([]string, 0, len(st.Tokens))
+	for h := range st.Tokens {
+		toks = append(toks, h)
+	}
+	sort.Strings(toks)
+	for _, h := range toks {
+		if t := st.Tokens[h]; t.ExpiresAt.After(cutoff) {
+			out = append(out, Entry{Kind: KindAccessToken, Time: cutoff, Token: t})
+		}
+	}
 	keys := make([]string, 0, len(st.Idempotency))
 	for k := range st.Idempotency {
 		keys = append(keys, k)
@@ -278,6 +314,8 @@ func NewState() *State {
 		StepsDone:   map[string]map[string]int{},
 		Operations:  map[string]*model.Operation{},
 		Idempotency: map[string]*model.IdemRecord{},
+		Clients:     map[string]*model.APIClient{},
+		Tokens:      map[string]*model.AccessToken{},
 	}
 }
 
@@ -298,6 +336,19 @@ func (st *State) Apply(e Entry) {
 	case KindIdempotency:
 		if e.Idem != nil {
 			st.Idempotency[e.Idem.Key] = e.Idem
+		}
+	case KindAPIClient:
+		if e.Client != nil {
+			st.Clients[e.Client.ID] = e.Client
+		}
+	case KindAccessToken:
+		if e.Token != nil {
+			st.Tokens[e.Token.SHA256] = e.Token
+		}
+	case KindClientUsed:
+		if c := st.Clients[e.Message]; c != nil {
+			t := e.Time
+			c.LastUsedAt = &t
 		}
 	case KindRollbackStart:
 		st.Rollbacks[e.Service] = append(st.Rollbacks[e.Service], e.Time)

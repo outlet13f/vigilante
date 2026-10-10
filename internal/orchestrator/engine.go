@@ -79,6 +79,9 @@ type Engine struct {
 	operations  map[string]*model.Operation
 	liveOps     map[string]bool // operations this node is running
 	idem        map[string]*model.IdemRecord
+	clients     map[string]*model.APIClient
+	clientMu    sync.Mutex // orders client snapshots
+	tokens      map[string]*model.AccessToken
 }
 
 // ErrInactive is returned when this node may not act (HA follower or demoted leader).
@@ -152,6 +155,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 	e.mu.Lock()
 	e.deployments, e.stepsDone, e.inflight = st.Deployments, st.StepsDone, st.InFlight()
 	e.operations, e.idem = st.Operations, st.Idempotency
+	e.clients, e.tokens = st.Clients, st.Tokens
 	e.Breaker, e.Guard = breaker, guard
 	e.mu.Unlock()
 	return nil

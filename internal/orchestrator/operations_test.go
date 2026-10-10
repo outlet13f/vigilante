@@ -108,3 +108,41 @@ func TestCompactKeepsRunningOperationsAndFreshKeys(t *testing.T) {
 		t.Error("stale idempotency key kept")
 	}
 }
+
+func TestAPIClientsSurviveRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "j.jsonl")
+	e1 := opsEngine(t, path)
+	key := &model.APIClient{Name: "siem", Type: model.ClientAPIKey, Scopes: []string{"audit:read"}, Grants: []string{"viewer@*"}}
+	keySecret, _ := e1.CreateClient(key)
+	oc := &model.APIClient{Name: "portal", Type: model.ClientOAuth, Scopes: []string{"deployments:read"}, Grants: []string{"viewer@*"}}
+	ocSecret, _ := e1.CreateClient(oc)
+	c, err := e1.CheckClientSecret(oc.ID, ocSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _, _ := e1.IssueToken(c, c.Scopes, time.Hour)
+	if _, _, err := e1.ResolveClientCredential(keySecret); err != nil { // records last use
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the last-use entry is written asynchronously
+	if _, err := e1.RevokeClient(key.ID); err != nil {
+		t.Fatal(err)
+	}
+	e1.Close()
+
+	e2 := opsEngine(t, path)
+	defer e2.Close()
+	if _, _, err := e2.ResolveClientCredential(keySecret); err == nil {
+		t.Fatal("revocation lost on restart")
+	}
+	got, _ := e2.Client(key.ID)
+	if got.LastUsedAt == nil || got.RevokedAt == nil {
+		t.Fatalf("client state after restart: %+v", got)
+	}
+	if cl, scopes, err := e2.ResolveClientCredential(tok); err != nil || cl.ID != oc.ID || len(scopes) != 1 {
+		t.Fatalf("access token lost on restart: %v %v", cl, err)
+	}
+	if _, err := e2.CheckClientSecret(oc.ID, "vcs_wrong"); err == nil {
+		t.Fatal("wrong secret accepted")
+	}
+}

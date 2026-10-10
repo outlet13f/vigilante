@@ -9,6 +9,15 @@ import (
 )
 
 func (c *Config) applyDefaults() {
+	if c.API.RateLimit == nil {
+		c.API.RateLimit = &RateLimit{Rate: 20, Burst: 40}
+	}
+	if c.API.EmergencyRateLimit == nil {
+		c.API.EmergencyRateLimit = &RateLimit{Rate: 1, Burst: 10}
+	}
+	if c.API.TokenTTL == 0 {
+		c.API.TokenTTL = time.Hour
+	}
 	if c.Server.Listen == "" {
 		c.Server.Listen = ":8088"
 	}
@@ -282,6 +291,14 @@ func set(xs ...string) map[string]bool {
 func (c *Config) Validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	for name, rl := range map[string]*RateLimit{"api.rate_limit": c.API.RateLimit, "api.emergency_rate_limit": c.API.EmergencyRateLimit} {
+		if rl != nil && (rl.Rate < 0 || rl.Burst < 0 || rl.Daily < 0 || (rl.Rate > 0 && rl.Burst < 1)) {
+			bad("%s: rate, burst and daily must be >= 0, and burst >= 1 when rate > 0", name)
+		}
+	}
+	if c.API.TokenTTL < 0 || c.API.TokenTTL > 24*time.Hour {
+		bad("api.token_ttl must be between 1s and 24h")
+	}
 
 	targets := map[string]bool{}
 	for _, t := range c.Targets {

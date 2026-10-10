@@ -34,6 +34,7 @@ notify:      [...]   # 알림
 auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
 audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
+api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
 ```
 
 ## `server`
@@ -414,6 +415,17 @@ audit:
 - **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
 - **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
 - **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+
+## `api` — 오픈 API
+
+```yaml
+api:
+  rate_limit: {rate: 20, burst: 40}            # 호출자별 v2 호출 한도 (daily: 일일 상한, 선택)
+  emergency_rate_limit: {rate: 1, burst: 10}   # 롤백·승인·중단·서킷 전용 버킷
+  token_ttl: 1h                                # OAuth 액세스 토큰 수명 (최대 24h)
+```
+
+`rate: 0`이고 `daily`가 없으면 한도가 없습니다. API 클라이언트별 한도와 클라이언트 등록은 설정 파일이 아니라 API(`/v2/api-clients`)로 관리하며, 상태 저장소에 남습니다. 자세한 내용은 docs/06-api.md.
 
 ## `secrets` — 비밀값 출처
 

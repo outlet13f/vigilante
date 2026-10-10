@@ -10,7 +10,8 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | 항목 | 규칙 |
 |---|---|
 | 버전 | URL의 메이저 버전(`/v2`). 마이너 변경은 필드·리소스·선택 파라미터 추가만. 폐기 시 `Deprecation`·`Sunset` 헤더, 최소 6개월 유지 |
-| 인증 | `Authorization: Bearer <토큰>`. 서비스 계정 토큰(`vgl_…`, API 키) 또는 OIDC 액세스 토큰. 권한은 역할 × 팀·서비스 범위(docs/02 `auth`) |
+| 인증 | `Authorization: Bearer <토큰>`. 아래 "인증과 권한" 참고 |
+| 호출 한도 | 호출자별 토큰 버킷. 초과하면 `429` + `Retry-After`. 비상 조치는 별도 버킷 |
 | 오류 | RFC 9457 `application/problem+json`. `code`로 분기하고, 문의할 때는 `request_id`를 전달 |
 | 재시도 | 모든 POST·PUT에 `Idempotency-Key`. 같은 키·같은 본문이면 첫 응답을 그대로 돌려주고 `Idempotent-Replayed: true`를 붙임. 호출자별로 24시간 보관 |
 | 오래 걸리는 작업 | 관측·롤백·승인·기준선 측정은 `202 Accepted` + `Operation` + `Location: /v2/operations/{id}`. `status`가 `running`이 아닐 때까지 조회 |
@@ -18,6 +19,67 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | 목록 | `{items, next_cursor}`. `next_cursor`를 `cursor`로 넘겨 다음 페이지. `limit` 1~500(기본 50). 커서는 해석하지 말 것 |
 | 형식 | 시각은 RFC 3339 UTC, ID는 의미 없는 문자열, JSON 필드는 snake_case |
 | 추적 | 요청의 `X-Request-ID`(또는 W3C `traceparent`)를 응답과 서버 로그에 그대로 남김 |
+
+## 인증과 권한
+
+| 방식 | 토큰 | 쓰는 곳 |
+|---|---|---|
+| OAuth 2.0 client credentials | `POST /v2/oauth/token`으로 받은 `vat_…` (기본 1시간) | 서버 간 연동: 사내 배포 콘솔, 개발자 포털 |
+| API 키 | `vgk_…` 그대로 | 단순 연동: 스크립트, SIEM 수집 |
+| 서비스 계정 토큰 | `vgl_…` (설정 파일 `auth.service_accounts`) | CI, 에이전트 |
+| OIDC 액세스 토큰 | 사내 IdP가 발급한 JWT | 사용자, 콘솔 |
+
+권한은 두 단계로 판단합니다. **역할 grant**(`deployer@team=payments`처럼 역할@범위)가 어느 서비스에서 무엇을 할 수 있는지 정하고, API 클라이언트는 여기에 **스코프**가 더해져 할 수 있는 일의 종류를 좁힙니다. 둘 다 통과해야 허용됩니다.
+
+| 스코프 | 허용하는 일 |
+|---|---|
+| `deployments:read` | 배포·작업·서비스·대상·서킷·지표 조회 |
+| `deployments:write` | 배포 등록, 단계 관측, 중단, 기준선, 마지막 정상 버전 |
+| `rollbacks:execute` | 수동 롤백 |
+| `approvals:write` | 상위 전략 승인 |
+| `circuit:admin` | 서킷 닫기·열기 |
+| `audit:read` | 감사 기록 조회 (역할은 viewer@`*` 필요) |
+| `metrics:write` | 샘플 전송 (에이전트, 외부 모니터링) |
+| `config:write` | API 클라이언트·서버 설정 관리 (역할은 admin 필요) |
+
+### API 클라이언트 관리 (admin)
+
+```bash
+# OAuth 클라이언트 등록: 응답의 secret은 이때 한 번만 보입니다(서버에는 SHA-256만 저장)
+curl -X POST "$API/v2/api-clients" -H "$H" -d '{
+  "name": "deploy-console", "type": "oauth",
+  "scopes": ["deployments:read", "deployments:write"],
+  "grants": ["deployer@team=payments"],
+  "rate_limit": {"rate": 10, "burst": 20}
+}'
+
+# 토큰 받기 (RFC 6749 4.4). 표준 OAuth 라이브러리를 그대로 쓸 수 있습니다.
+curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials "$API/v2/oauth/token"
+```
+
+| 작업 | 요청 |
+|---|---|
+| 목록·조회 | `GET /v2/api-clients`, `GET /v2/api-clients/{id}` (비밀값은 앞 8자 `secret_hint`만) |
+| 스코프·grant·만료·한도 변경 | `PATCH /v2/api-clients/{id}`. 스코프를 줄이면 이미 발급한 토큰에도 즉시 적용 |
+| 비밀 회전 | `POST /v2/api-clients/{id}/secret`. 이전 비밀과 그 비밀로 받은 토큰은 즉시 무효 |
+| 폐기 | `DELETE /v2/api-clients/{id}`. 기록은 감사용으로 남음 |
+
+- 마지막 사용 시각(`last_used_at`)은 최대 1시간 간격으로 갱신합니다.
+- 클라이언트의 모든 조치는 감사 기록에 `client:<이름>`으로 남고, 토큰 발급(`oauth.token`)과 인증 실패(`denied`)도 남습니다.
+- 클라이언트 등록·비밀 회전 응답은 비밀값을 담고 있어 `Idempotency-Key` 재생을 하지 않습니다. 같은 이름의 활성 클라이언트가 있으면 409입니다.
+
+### 호출 한도
+
+| 버킷 | 기본값 | 대상 |
+|---|---|---|
+| default | 초당 20, 순간 40 | 모든 v2 호출 |
+| emergency | 초당 1, 순간 10 | 롤백, 승인, 중단, 서킷 닫기·열기 |
+
+- 호출자(사용자, 서비스 계정, API 클라이언트)마다 따로 셉니다. API 클라이언트는 `rate_limit`으로 자기 한도(일일 상한 `daily` 포함)를 가질 수 있습니다.
+- 응답에 `RateLimit-Limit`, `RateLimit-Remaining`이 붙고, 초과하면 `429` + `Retry-After`입니다.
+- 조회가 폭주해 default 버킷이 비어도 emergency 버킷의 롤백은 그대로 받습니다.
+- 비상용 legacy 토큰(`server.auth_token_env`)은 한도를 적용하지 않습니다.
+- 한도는 노드 메모리에서 셉니다. 모든 요청이 리더로 모이므로 클러스터 전체 기준과 같습니다.
 
 ## 리소스
 
@@ -39,7 +101,9 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | `GET /v2/presets` | 인증만 | 규칙 프리셋 |
 | `GET /v2/circuit` | viewer | 서킷 상태 |
 | `POST /v2/circuit/reset`, `POST /v2/circuit/trip` | admin | 서킷 닫기·열기. `reason` 필수 |
-| `GET /v2/audit-events` | viewer@`*` | 감사 기록, 오래된 순. `since`, `until`, `actor`, `action`, `service` |
+| `GET /v2/audit-events` | viewer@`*` + `audit:read` | 감사 기록, 오래된 순. `since`, `until`, `actor`, `action`, `service` |
+| `POST /v2/oauth/token` | 클라이언트 인증 | OAuth 토큰 발급 |
+| `/v2/api-clients…` | admin + `config:write` | API 클라이언트 관리 |
 
 `Operation.result`에는 작업이 끝났을 때의 배포 상태, 판정, CI 종료 코드(`exit_code`)가 들어 있습니다. `status`는 작업이 실행됐으면 `completed`(롤백이 실패했어도 결과는 `result`에), 실행 자체를 못 했으면 `failed`(`error`에 이유)입니다. 리더가 바뀌어도 작업은 이어지고, 새 리더는 배포 상태를 보고 작업 완료 여부를 판단합니다.
 
@@ -113,7 +177,7 @@ exit "$(jq -r '.result.exit_code // 1' <<<"$R")"   # 0 통과, 2 롤백됨, 3 �
 HA 팔로워가 리더를 아직 모르거나 리더에 닿지 못함. `Retry-After` 후 재시도.
 
 ### rate_limited
-호출 한도 초과. `Retry-After` 후 재시도 (M3-2에서 적용).
+호출 한도 초과. `Retry-After` 후 재시도하십시오. 롤백 같은 비상 조치는 별도 한도를 씁니다.
 
 ### internal
 서버 내부 오류. `request_id`와 함께 운영자에게 알리십시오.

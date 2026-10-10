@@ -18,6 +18,11 @@ agent:
   failsafe_after: 30s
   failsafe: hold                           # hold | rollback (agent may roll back its own host if the orchestrator is gone)
 
+api:
+  rate_limit: {rate: 20, burst: 40}           # per caller; API clients may carry their own
+  emergency_rate_limit: {rate: 1, burst: 10}  # rollbacks, approvals, abort, circuit
+  token_ttl: 1h                               # OAuth access tokens
+
 secrets:
   cache_ttl: 5m
   vault:

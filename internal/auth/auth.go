@@ -67,9 +67,34 @@ const (
 	ActApprove  Action = "approve"  // operator: approve a gated escalation
 	ActCircuit  Action = "circuit"  // admin: circuit reset/trip
 	ActAgent    Action = "agent"    // agent (or admin): push samples, heartbeat
+	ActManage   Action = "manage"   // admin: API clients and other server configuration
 )
 
-var needs = map[Action]Role{ActRead: Viewer, ActDeploy: Deployer, ActRollback: Operator, ActApprove: Operator, ActCircuit: Admin, ActAgent: Agent}
+var needs = map[Action]Role{ActRead: Viewer, ActDeploy: Deployer, ActRollback: Operator, ActApprove: Operator, ActCircuit: Admin, ActAgent: Agent, ActManage: Admin}
+
+// OAuth scopes narrow what an API client may do; its role grants still
+// decide where. Principals without scopes (users, service accounts) are
+// limited by their roles only.
+const (
+	ScopeDeploymentsRead  = "deployments:read"
+	ScopeDeploymentsWrite = "deployments:write"
+	ScopeRollbacksExecute = "rollbacks:execute"
+	ScopeApprovalsWrite   = "approvals:write"
+	ScopeConfigWrite      = "config:write"
+	ScopeCircuitAdmin     = "circuit:admin"
+	ScopeAuditRead        = "audit:read"
+	ScopeMetricsWrite     = "metrics:write"
+)
+
+// AllScopes lists every scope a client may be given.
+var AllScopes = []string{ScopeDeploymentsRead, ScopeDeploymentsWrite, ScopeRollbacksExecute, ScopeApprovalsWrite,
+	ScopeConfigWrite, ScopeCircuitAdmin, ScopeAuditRead, ScopeMetricsWrite}
+
+var scopeFor = map[Action]string{ActRead: ScopeDeploymentsRead, ActDeploy: ScopeDeploymentsWrite, ActRollback: ScopeRollbacksExecute,
+	ActApprove: ScopeApprovalsWrite, ActCircuit: ScopeCircuitAdmin, ActAgent: ScopeMetricsWrite, ActManage: ScopeConfigWrite}
+
+// ScopeFor is the OAuth scope an action needs.
+func ScopeFor(a Action) string { return scopeFor[a] }
 
 // Required is the minimum role for an action.
 func Required(a Action) Role { return needs[a] }
@@ -132,16 +157,38 @@ type Binding struct {
 
 func (b Binding) String() string { return b.Role.String() + "@" + b.Scope.String() }
 
+// ParseGrant reads "role@scope", e.g. "deployer@team=payments" or "viewer@*".
+func ParseGrant(s string) (Binding, error) {
+	role, scope, ok := strings.Cut(s, "@")
+	if !ok {
+		return Binding{}, fmt.Errorf("grant %q: use role@scope, e.g. deployer@team=payments", s)
+	}
+	return grant(role, scope)
+}
+
 // Principal is an authenticated caller.
 type Principal struct {
-	ID       string // user:alice | sa:ci-order | token:legacy | webhook:github | anonymous
-	Kind     string // user | service | legacy | webhook | anonymous
+	ID       string // user:alice | sa:ci-order | client:deploy-console | token:legacy | webhook:github | anonymous
+	Kind     string // user | service | client | legacy | webhook | anonymous
 	Groups   []string
 	Bindings []Binding
+	// Scopes limits an API client to these OAuth scopes; nil = no limit.
+	Scopes []string
+	// ClientID is the API client behind the request, if any.
+	ClientID string
+}
+
+// HasScope reports whether the principal's token carries scope (always
+// true for principals that are not scope-limited).
+func (p *Principal) HasScope(scope string) bool {
+	return p.Scopes == nil || slices.Contains(p.Scopes, scope)
 }
 
 // Can reports whether the principal may do a on svc.
 func (p *Principal) Can(a Action, svc Service) bool {
+	if !p.HasScope(ScopeFor(a)) {
+		return false
+	}
 	for _, b := range p.Bindings {
 		if b.Role.allows(a) && b.Scope.covers(svc) {
 			return true
@@ -153,6 +200,9 @@ func (p *Principal) Can(a Action, svc Service) bool {
 // CanSomewhere reports whether any grant allows a, in any scope (used for
 // endpoints that list or show cross-service information).
 func (p *Principal) CanSomewhere(a Action) bool {
+	if !p.HasScope(ScopeFor(a)) {
+		return false
+	}
 	for _, b := range p.Bindings {
 		if b.Role.allows(a) {
 			return true
@@ -187,7 +237,17 @@ type Authenticator struct {
 	grpClaim  string
 	oidcBinds []oidcBinding
 	Now       func() time.Time
+	// Clients resolves API client credentials (API keys and OAuth access
+	// tokens, prefixes vgk_ / vat_), which live in the state store.
+	Clients func(ctx context.Context, raw string) (*Principal, error)
 }
+
+// Client credential prefixes.
+const (
+	APIKeyPrefix       = "vgk_"
+	AccessTokenPrefix  = "vat_"
+	ClientSecretPrefix = "vcs_"
+)
 
 // Disabled reports that no authentication is configured (development only).
 func (a *Authenticator) Disabled() bool { return a.disabled }
@@ -269,6 +329,12 @@ func (a *Authenticator) Authenticate(r *http.Request) (*Principal, error) {
 
 // AuthenticateToken identifies the holder of a bearer token.
 func (a *Authenticator) AuthenticateToken(ctx context.Context, raw string) (*Principal, error) {
+	if strings.HasPrefix(raw, APIKeyPrefix) || strings.HasPrefix(raw, AccessTokenPrefix) {
+		if a.Clients == nil {
+			return nil, ErrInvalidToken
+		}
+		return a.Clients(ctx, raw)
+	}
 	if strings.HasPrefix(raw, TokenPrefix) {
 		sum := sha256.Sum256([]byte(raw))
 		acc, ok := a.accounts[hex.EncodeToString(sum[:])]
@@ -325,14 +391,22 @@ const TokenPrefix = "vgl_"
 
 // NewToken returns a fresh service-account token and the SHA-256 hex to put
 // in the config. The token itself is shown once and never stored.
-func NewToken() (token, sha string, err error) {
+func NewToken() (token, sha string, err error) { return NewSecret(TokenPrefix) }
+
+// NewSecret returns prefix + 256 random bits, and its SHA-256 hex.
+func NewSecret(prefix string) (secret, sha string, err error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", "", err
 	}
-	token = TokenPrefix + base64.RawURLEncoding.EncodeToString(b)
-	sum := sha256.Sum256([]byte(token))
-	return token, hex.EncodeToString(sum[:]), nil
+	secret = prefix + base64.RawURLEncoding.EncodeToString(b)
+	return secret, HashSecret(secret), nil
+}
+
+// HashSecret is the SHA-256 hex under which a secret is stored.
+func HashSecret(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 type ctxKey struct{}

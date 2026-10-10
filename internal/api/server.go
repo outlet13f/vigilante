@@ -64,6 +64,7 @@ type Server struct {
 	agents   map[string]time.Time
 	proxies  map[string]*httputil.ReverseProxy
 	inflight map[string]bool // idempotency keys being processed
+	limits   *limiter
 }
 
 // Leadership is what the API needs from the HA elector.
@@ -96,6 +97,12 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 }
 
 func (s *Server) Handler() http.Handler {
+	if s.limits == nil {
+		s.limits = newLimiter()
+	}
+	if s.Auth != nil && s.Auth.Clients == nil {
+		s.Auth.Clients = s.clientPrincipal
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		role, leader := "single", ""
@@ -245,7 +252,7 @@ func (s *Server) denied(r *http.Request, service string, err error) {
 // auditQuery returns audit records. Audit spans every service, so it needs a
 // viewer grant with scope *.
 func (s *Server) auditQuery(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.allow(w, r, auth.ActRead, auth.Service{}); !ok {
+	if !s.auditAllowed(w, r) {
 		return
 	}
 	q := r.URL.Query()
