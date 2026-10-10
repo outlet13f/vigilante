@@ -223,7 +223,11 @@ func (d *run) credentials(ctx context.Context, targets []string, services []*con
 	for _, s := range services {
 		for _, name := range executorsOf(s) {
 			ex := d.cfg.Executors[name]
-			for _, c := range []string{credOf(ex.VSphere), credOfN(ex.Nutanix), credOfW(ex.Webhook)} {
+			osCred := ""
+			if ex.OpenStack != nil {
+				osCred = ex.OpenStack.Credential
+			}
+			for _, c := range []string{credOf(ex.VSphere), credOfN(ex.Nutanix), credOfW(ex.Webhook), osCred} {
 				if c != "" {
 					used[c] = true
 				}
@@ -235,6 +239,9 @@ func (d *run) credentials(ctx context.Context, targets []string, services []*con
 			}
 			if tr.AWSALB != nil && tr.AWSALB.Credential != "" {
 				used[tr.AWSALB.Credential] = true
+			}
+			if tr.Octavia != nil && tr.Octavia.Credential != "" {
+				used[tr.Octavia.Credential] = true
 			}
 		}
 	}
@@ -252,7 +259,7 @@ func (d *run) credentials(ctx context.Context, targets []string, services []*con
 				problems = append(problems, "환경변수 "+env+" 비어 있음")
 			}
 		}
-		for _, ref := range []string{c.UsernameRef, c.PasswordRef, c.TokenRef, c.PassphraseRef, c.PrivateKeyRef} {
+		for _, ref := range []string{c.UsernameRef, c.PasswordRef, c.TokenRef, c.PassphraseRef, c.PrivateKeyRef, c.ApplicationCredentialSecretRef} {
 			if ref == "" {
 				continue
 			}

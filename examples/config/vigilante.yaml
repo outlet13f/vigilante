@@ -57,6 +57,13 @@ credentials:
   deploy-console:
     type: token
     token_env: DEPLOY_CONSOLE_TOKEN
+  openstack-prod:
+    type: openstack
+    auth_url: https://keystone.example.internal:5000/v3
+    region: RegionOne
+    interface: internal                      # closed network: use the internal catalog endpoints
+    application_credential_id: 4f6c2a9e8b7d4c1e9f0a3b5d7e9c1a2b
+    application_credential_secret_ref: "vault:secret/prod/openstack#app_cred_secret"
 
 targets:
   # --- legacy bare-metal / on-prem ------------------------------------------
@@ -120,6 +127,18 @@ targets:
     labels: {instance_id: i-0a1b2c3d4e5f60002, az: ap-northeast-2c}
     connection: {type: ssh, credential: ssh-deploy}
 
+  # --- OpenStack (company CMP) VMs behind Octavia -----------------------------
+  - name: billing-os-01
+    kind: vm
+    address: 10.30.0.11
+    labels: {openstack_server_id: 6a1b2c3d-1111-4e5f-8a9b-0c1d2e3f4a5b}
+    connection: {type: ssh, credential: ssh-deploy}
+  - name: billing-os-02
+    kind: vm
+    address: 10.30.0.12
+    labels: {openstack_server_id: 6a1b2c3d-2222-4e5f-8a9b-0c1d2e3f4a5b}
+    connection: {type: ssh, credential: ssh-deploy}
+
 traffic:
   nginx-edge:
     type: nginx
@@ -154,7 +173,23 @@ traffic:
       port: 8080
       wait_timeout: 3m
 
+  # Octavia: admin_state_up=false drains a member; waits for the LB to be ACTIVE
+  billing-lb:
+    type: octavia
+    octavia:
+      credential: openstack-prod
+      pool_id: 9c2e4b6a-3333-4d5e-8f9a-0b1c2d3e4f5a
+      member_port: 8080
+
 executors:
+  # Strategy D on OpenStack — Cinder root-volume snapshot (volume-booted) or
+  # Nova server snapshot + rebuild (image-booted), picked per server
+  billing-os-snap:
+    type: openstack
+    openstack:
+      credential: openstack-prod
+      revert_timeout: 15m
+      keep_snapshots: 3
   # Strategy A — symlink switch + systemd restart
   order-symlink:
     type: symlink
@@ -408,6 +443,21 @@ services:
       traffic: alb-web
       escalation:
         - executor: web-ansible
+
+  # ===========================================================================
+  # billing-api: Java on OpenStack VMs behind Octavia (preset-based)
+  # ===========================================================================
+  - name: billing-api
+    team: billing
+    targets: [billing-os-01, billing-os-02]
+    preset: java-web@1
+    overrides:
+      health_url: "http://{{.Address}}:8080/actuator/health"
+      access_log: /var/log/billing/access.log
+      app_log: /var/log/billing/application.log
+    rollback:
+      executor: billing-os-snap
+      traffic: billing-lb
 
 safety:
   observer_quorum: true                   # central and agent must agree before a rollback

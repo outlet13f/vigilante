@@ -1,6 +1,6 @@
 # 02. 설정 파일 명세 (`vigilante.yaml`)
 
-완전한 예시: [`examples/config/vigilante.yaml`](../examples/config/vigilante.yaml) — 베어메탈(Nginx+F5), vSphere VM 위 Docker(HAProxy), EC2(ALB) 3개 서비스를 모두 담고 있습니다.
+완전한 예시: [`examples/config/vigilante.yaml`](../examples/config/vigilante.yaml) — 베어메탈(Nginx+F5), vSphere VM 위 Docker(HAProxy), EC2(ALB), OpenStack VM(Octavia) 4개 서비스를 모두 담고 있습니다.
 
 검증: `vigilante validate -c vigilante.yaml` — 알 수 없는 키(오타)는 즉시 거부되고, 모든 교차 참조(target→credential, service→probe/executor/traffic, rule→metric)를 검사합니다. CI의 첫 단계로 넣으십시오.
 
@@ -304,7 +304,7 @@ rollback:
 | `vsphere` | D. VM 스냅샷 | `url`, `credential`, `vm`, `snapshot`, `power_on`, `tls_skip_verify` | 스냅샷 생성 (`vsphere.snapshot`) |
 | `nutanix` | D. VM 스냅샷 | `url`, `credential`, `vm_uuid`, `snapshot` | 스냅샷 생성 (`nutanix.snapshot_uuid`) |
 | `kvm` | D. VM 스냅샷 | `hypervisor`(target), `domain`, `snapshot` | `virsh snapshot-create-as --atomic` |
-| `openstack` **(M7 예정, 미구현)** | D. 인스턴스 스냅샷 | `credential`(type `openstack`), `server_id`(기본 `{{.Labels.openstack_server_id}}`), `mode`(auto\|volume\|image), `snapshot`, `revert_timeout`, `power_on` | 볼륨 부팅: Cinder 볼륨 스냅샷(`openstack.volume_snapshot_id`) / 이미지 부팅: Nova 서버 스냅샷(`openstack.image_id`) |
+| `openstack` **(실험적: M8 실장비 검증 전)** | D. 인스턴스 스냅샷 | `credential`(type `openstack`), `server_id`(기본 `{{.Labels.openstack_server_id}}`), `mode`(auto\|volume\|image), `snapshot`(이름), `revert_timeout`(기본 15m), `power_on`(기본 true), `keep_snapshots`(기본 3) | 볼륨 부팅: Cinder 볼륨 스냅샷(`openstack.volume_snapshot_id`) / 이미지 부팅: Nova 서버 스냅샷(`openstack.image_id`) |
 | `exec` | 범용 | `prepare`, `rollback`, `verify`, `on`(target\|local\|다른 target) | stdout |
 | `webhook` | 범용(사내 배포 콘솔) | `url`, `method`, `headers`, `body`, `verify_url`, `credential` | — |
 
@@ -317,11 +317,43 @@ rollback:
 | `envoy` | 파일 기반 EDS의 `health_status: DRAINING` + 원자적 `mv` | `hosts[]`, `eds_file`, `member_format` |
 | `f5` | iControl REST `PATCH .../pool/~P~pool/members/~P~ip:port` (`session: user-disabled`[, `state: user-down`]) | `url`, `credential`, `pool`, `member_format`, `force_offline`, `token_auth` |
 | `aws_alb` | `DeregisterTargets` → draining 완료 대기 / `RegisterTargets` → healthy 대기 | `credential`, `target_group_arn`, `target_id`(기본 `{{.Labels.instance_id}}`), `port`, `wait_timeout` |
-| `octavia` **(M7 예정, 미구현)** | Octavia v2 풀 멤버 `admin_state_up=false`(드레인) → LB `provisioning_status` ACTIVE 대기 / `admin_state_up=true` → 멤버 `operating_status` ONLINE 대기. `PENDING_*`·409는 재시도 | `credential`(type `openstack`), `pool_id`, `member_address`(기본 `{{.Address}}`), `member_port`, `wait_timeout` |
+| `octavia` **(실험적: M8 실장비 검증 전)** | Octavia v2 풀 멤버 `admin_state_up=false`(드레인) → LB `provisioning_status` ACTIVE 대기 / `admin_state_up=true` → 멤버 `operating_status` ONLINE 대기. `PENDING_*`·409는 재시도 | `credential`(type `openstack`), `pool_id`, `member_address`(기본 `{{.Address}}`), `member_port`, `wait_timeout` |
 
 공통: `drain_wait`(드레인 후 대기).
 
-OpenStack 자격증명(M7 예정): `credentials.<name>: {type: openstack, auth_url, region, application_credential_id, application_credential_secret_ref, cacert}`. Keystone v3 application credential을 권장하며, 사용자·비밀번호·프로젝트 방식은 대안으로 둡니다. `doctor`는 로그인, 스냅샷·rebuild·revert 권한, Octavia 풀 멤버 수정 권한, 스냅샷·이미지 쿼터를 점검합니다.
+### OpenStack
+
+```yaml
+credentials:
+  openstack-prod:
+    type: openstack
+    auth_url: https://keystone.example.internal:5000/v3
+    region: RegionOne
+    interface: internal                 # 카탈로그에서 쓸 엔드포인트: public(기본) | internal | admin
+    application_credential_id: 4f6c...  # 권장: 프로젝트 범위 고정, 사용자 비밀번호 불필요
+    application_credential_secret_ref: "vault:secret/prod/openstack#app_cred_secret"
+    cacert: /etc/vigilante/openstack-ca.pem
+    # 대안: user + password_ref + project_name(또는 project_id) [+ user_domain_name, project_domain_name, 기본 Default]
+targets:
+  - {name: order-os-01, address: 10.20.0.11, labels: {openstack_server_id: 6a1b...}, connection: {type: ssh, credential: ssh-deploy}}
+executors:
+  os-snap: {type: openstack, openstack: {credential: openstack-prod}}
+traffic:
+  order-lb: {type: octavia, octavia: {credential: openstack-prod, pool_id: 9c2e..., member_port: 8080}}
+```
+
+| 부팅 방식 | prepare | rollback | verify |
+|---|---|---|---|
+| 볼륨 부팅 (`image`가 비어 있음) | 루트 볼륨의 Cinder 스냅샷(`force`, 실행 중에도) | 서버 정지 → `revert_to_snapshot`(볼륨 API 3.40) → 볼륨에 `vigilante.reverted_to` 기록 → 서버 기동 | 서버 ACTIVE·실행 중, 볼륨 표시가 체크포인트 스냅샷 |
+| 이미지 부팅 | Nova `createImage`(Glance 이미지, `active`까지 대기) | 체크포인트 이미지로 `rebuild`. IP·포트·메타데이터 유지 | 서버 ACTIVE, 서버 이미지가 체크포인트 이미지 |
+
+- `mode: auto`(기본)는 서버의 부팅 방식을 보고 고릅니다. 다른 방식을 강제하면 prepare에서 거부합니다.
+- **재실행 안전:** 이미 체크포인트로 복원된 서버·볼륨은 다시 손대지 않습니다(크래시 후 재개, 리더 교체).
+- **정리:** prepare가 끝나면 같은 서버(볼륨)의 vigilante 스냅샷·이미지 중 최신 `keep_snapshots`개만 남기고 지웁니다(`vigilante.managed` 메타데이터가 있는 것만). Cinder revert는 가장 최근 스냅샷으로만 되돌릴 수 있으므로, 배포 사이에 다른 도구가 같은 볼륨의 스냅샷을 만들면 revert가 거부됩니다.
+- **revert가 거부되면** 서버는 정지 상태로 남고, 원인(백엔드 미지원, 최신 스냅샷 아님, 사용 중 볼륨 거부)과 함께 실패를 보고합니다. 롤백 실패이므로 에스컬레이션·서킷 규칙이 그대로 적용됩니다. 백엔드·릴리스별 동작은 M8 실장비 랩에서 확정합니다.
+- **한계:** 스냅샷은 디스크 상태만 되돌립니다. 메모리와 외부 DB는 되돌리지 않고, 분리된 데이터 볼륨은 대상이 아닙니다.
+- **`octavia`:** 같은 로드밸런서의 변경은 한 번에 하나만 받으므로, 변경마다 `provisioning_status: ACTIVE`를 기다리고 409는 재시도하며 대상을 하나씩 바꿉니다. 이미 원하는 상태인 멤버는 건너뜁니다. 다시 켠 멤버는 `operating_status`가 ONLINE(또는 NO_MONITOR)이 될 때까지 기다립니다. neutron-lbaas(레거시)는 지원하지 않습니다.
+- **`doctor`:** Keystone 로그인, 서버 조회와 부팅 방식, 루트 볼륨, Cinder 최대 마이크로버전(3.40 이상), 스냅샷 쿼터 여유, Octavia 풀·로드밸런서 상태를 점검합니다. 멤버 수정 권한처럼 변경 없이는 확인할 수 없는 항목은 경고로 남깁니다.
 
 ## `safety`
 

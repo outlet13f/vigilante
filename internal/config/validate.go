@@ -83,6 +83,14 @@ func (c *Config) applyDefaults() {
 				tr.AWSALB.WaitTimeout = 5 * time.Minute
 			}
 		}
+		if o := tr.Octavia; o != nil {
+			if o.MemberAddress == "" {
+				o.MemberAddress = "{{.Address}}"
+			}
+			if o.WaitTimeout == 0 {
+				o.WaitTimeout = 5 * time.Minute
+			}
+		}
 		c.Traffic[name] = tr
 	}
 	for name, ex := range c.Executors {
@@ -116,6 +124,28 @@ func (c *Config) applyDefaults() {
 		}
 		if ex.Webhook != nil && ex.Webhook.Method == "" {
 			ex.Webhook.Method = "POST"
+		}
+		if o := ex.OpenStack; o != nil {
+			if o.ServerID == "" {
+				o.ServerID = "{{.Labels.openstack_server_id}}"
+			}
+			if o.Mode == "" {
+				o.Mode = "auto"
+			}
+			if o.Snapshot == "" {
+				o.Snapshot = "vigilante-{{.Service}}-{{.Version}}"
+			}
+			if o.RevertTimeout == 0 {
+				o.RevertTimeout = 15 * time.Minute
+			}
+			if o.PowerOn == nil {
+				on := true
+				o.PowerOn = &on
+			}
+			if o.KeepSnapshots == nil {
+				k := 3
+				o.KeepSnapshots = &k
+			}
 		}
 		c.Executors[name] = ex
 	}
@@ -267,8 +297,8 @@ func defaultNode(n *Node) {
 
 var (
 	validProbeTypes   = set("http", "grpc", "tcp", "host", "docker", "log", "access_log", "db")
-	validExecTypes    = set("symlink", "container", "vsphere", "nutanix", "kvm", "exec", "webhook")
-	validTrafficTypes = set("nginx", "haproxy", "envoy", "f5", "aws_alb")
+	validExecTypes    = set("symlink", "container", "vsphere", "nutanix", "kvm", "openstack", "exec", "webhook")
+	validTrafficTypes = set("nginx", "haproxy", "envoy", "f5", "aws_alb", "octavia")
 	validAggs         = set("last", "avg", "min", "max", "sum", "count", "rate", "p50", "p90", "p95", "p99")
 	validOps          = set(">", ">=", "<", "<=", "==", "!=")
 	validStepActions  = set("traffic.drain", "traffic.enable", "app.rollback", "app.verify", "probe.verify", "wait")
@@ -348,6 +378,43 @@ func (c *Config) Validate() error {
 			bad("%s %q: unknown credential %q", kind, name, cred)
 		}
 	}
+	checkOpenStackCred := func(kind, name, cred string) {
+		cr, ok := c.Credentials[cred]
+		switch {
+		case cred == "":
+			bad("%s %q: credential required (type openstack)", kind, name)
+		case !ok:
+			bad("%s %q: unknown credential %q", kind, name, cred)
+		case cr.Type != "openstack":
+			bad("%s %q: credential %q must be of type openstack", kind, name, cred)
+		}
+	}
+	for name, cr := range c.Credentials {
+		if cr.Type != "openstack" {
+			continue
+		}
+		if cr.AuthURL == "" {
+			bad("credentials.%s: openstack needs auth_url (Keystone v3)", name)
+		}
+		switch {
+		case cr.ApplicationCredentialID != "":
+			if cr.ApplicationCredentialSecretRef == "" {
+				bad("credentials.%s: application_credential_id needs application_credential_secret_ref", name)
+			}
+		case cr.User != "":
+			if cr.PasswordRef == "" && cr.PasswordEnv == "" {
+				bad("credentials.%s: openstack password auth needs password_ref or password_env", name)
+			}
+			if cr.ProjectName == "" && cr.ProjectID == "" {
+				bad("credentials.%s: openstack password auth needs project_name or project_id", name)
+			}
+		default:
+			bad("credentials.%s: openstack needs application_credential_id (recommended) or user + password_ref + project", name)
+		}
+		if i := cr.Interface; i != "" && i != "public" && i != "internal" && i != "admin" {
+			bad("credentials.%s: interface must be public, internal or admin", name)
+		}
+	}
 
 	for name, tr := range c.Traffic {
 		if !validTrafficTypes[tr.Type] {
@@ -385,6 +452,12 @@ func (c *Config) Validate() error {
 			} else {
 				checkCred("traffic", name, tr.AWSALB.Credential)
 			}
+		case "octavia":
+			if tr.Octavia == nil || tr.Octavia.PoolID == "" || tr.Octavia.MemberPort <= 0 {
+				bad("traffic %q: octavia.pool_id and octavia.member_port required", name)
+			} else {
+				checkOpenStackCred("traffic", name, tr.Octavia.Credential)
+			}
 		}
 	}
 
@@ -415,6 +488,18 @@ func (c *Config) Validate() error {
 				bad("executor %q: nutanix.url and nutanix.vm_uuid required", name)
 			} else {
 				checkCred("executor", name, ex.Nutanix.Credential)
+			}
+		case "openstack":
+			if ex.OpenStack == nil {
+				bad("executor %q: openstack block required", name)
+				break
+			}
+			checkOpenStackCred("executor", name, ex.OpenStack.Credential)
+			if m := ex.OpenStack.Mode; m != "" && m != "auto" && m != "volume" && m != "image" {
+				bad("executor %q: openstack.mode must be auto, volume or image", name)
+			}
+			if k := ex.OpenStack.KeepSnapshots; k != nil && *k < 0 {
+				bad("executor %q: openstack.keep_snapshots must be >= 0", name)
 			}
 		case "kvm":
 			if ex.KVM == nil || ex.KVM.Domain == "" || ex.KVM.Hypervisor == "" {
@@ -789,6 +874,7 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 		check(w+".token_ref", cr.TokenRef)
 		check(w+".passphrase_ref", cr.PassphraseRef)
 		check(w+".private_key_ref", cr.PrivateKeyRef)
+		check(w+".application_credential_secret_ref", cr.ApplicationCredentialSecretRef)
 		if cr.SSHCA != nil {
 			usesVault = true
 			if cr.Type != "ssh" {
