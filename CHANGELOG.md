@@ -22,6 +22,16 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   rate limits, idempotency keys, events over SSE and signed webhooks.
 - Approval mode, change freezes, ServiceNow change gate and incidents,
   Teams / email / PagerDuty alerts, web operations console.
+- Decision quality: verdict feedback (`PUT /v2/deployments/{id}/feedback`,
+  `vigilante feedback`, console) and `vigilante pilot report` against the
+  release gate.
+- `vigilante lab run|summary`: the real-equipment scenario (checkpoint, bad
+  deployment, detection, drain, restore, back in traffic) with results for
+  the compatibility matrix.
+
+### Fixed
+- Windows: local commands with quoted arguments reached the program with
+  literal backslashes (cmd.exe does not parse Go's argument escaping).
 - Release: minimal build, rpm/deb, container image, Helm chart, SBOMs,
   signed air-gapped bundles; `vigilante store status|migrate` with a
   downgrade guard.

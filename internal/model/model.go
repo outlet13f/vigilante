@@ -110,12 +110,44 @@ type Deployment struct {
 	FreezeOverride string `json:"freeze_override,omitempty"`
 	// ChangeTicket is the ITSM change this deployment runs under.
 	ChangeTicket *ChangeTicket `json:"change_ticket,omitempty"`
-	Events       []Event       `json:"events,omitempty"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	// DryRun: the deployment ran with dry_run, so rollbacks were only logged.
+	DryRun bool `json:"dry_run,omitempty"`
+	// Feedback is a person's assessment of the verdict (pilot quality data).
+	Feedback  *Feedback `json:"feedback,omitempty"`
+	Events    []Event   `json:"events,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.
+// Feedback outcomes. A false positive is a FAIL verdict on a deployment that
+// was in fact healthy; a false negative is a deployment that was harmful but
+// not failed (it passed or was held), typically found through an incident.
+const (
+	FeedbackCorrect       = "correct"
+	FeedbackFalsePositive = "false_positive"
+	FeedbackFalseNegative = "false_negative"
+	FeedbackUnclear       = "unclear"
+)
+
+type Feedback struct {
+	Outcome  string    `json:"outcome"`
+	Incident string    `json:"incident,omitempty"` // incident or problem ticket backing the assessment
+	Note     string    `json:"note,omitempty"`
+	By       string    `json:"by"`
+	At       time.Time `json:"at"`
+}
+
+// Failed reports whether any phase of d ended in a FAIL verdict.
+func (d *Deployment) Failed() bool {
+	for _, ev := range d.Events {
+		if ev.Kind == "verdict" && len(ev.Message) >= 5 && ev.Message[:5] == "FAIL:" {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Deployment) AddEvent(kind, msg string) {
 	now := time.Now()
 	d.Events = append(d.Events, Event{Time: now, Kind: kind, Message: msg})

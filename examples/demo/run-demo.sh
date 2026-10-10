@@ -83,6 +83,17 @@ export VIGILANTE_DEPLOYMENT_ID=demo-good VIGILANTE_VERSION=v1.1
   --baseline "$RUN/baseline.json" >"$RUN/watch4.json" 2>"$RUN/watch4.log"
 expect 0 "$?" "healthy release promoted"
 
+say "7. lab scenario (M8): checkpoint -> inject bad v2 -> detect -> roll back to v1.1, recorded for the compatibility matrix"
+"$VIG" lab run -c "$CFG" --service demo --label "demo fakeapp" --previous v1.1 --repeat 1 --baseline 10s \
+  --inject "curl -fs -X POST \"$APP_URL/admin/deploy?version=v2\"" --out "$RUN/lab-results.jsonl" 2>"$RUN/lab.log" \
+  | grep -E '^run |^\| ' | sed 's/^/   /'
+expect 0 "${PIPESTATUS[0]}" "lab scenario passes against a real process"
+
+say "8. decision quality report (pilot): far below the 30-deployment gate, so exit 4"
+"$VIG" pilot report -c "$CFG" > "$RUN/pilot.md" 2>/dev/null
+expect 4 "$?" "release gate not met yet"
+grep -E '^Release gate|^\| (observed|false|real)' "$RUN/pilot.md" | sed 's/^/   /'
+
 say "journal (audit trail) — $RUN/journal.jsonl"
 "$VIG" status -c "$CFG" 2>/dev/null | sed 's/^/   /'
 exit $FAILED

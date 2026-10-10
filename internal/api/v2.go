@@ -50,6 +50,7 @@ func (s *Server) v2Routes() []route {
 		{pattern: "POST /v2/deployments/{id}/rollbacks", handler: s.v2StartRollback, write: true, class: classEmergency},
 		{pattern: "POST /v2/deployments/{id}/approvals", handler: s.v2Approve, write: true, class: classEmergency},
 		{pattern: "POST /v2/deployments/{id}/abort", handler: s.v2Abort, write: true, class: classEmergency},
+		{pattern: "PUT /v2/deployments/{id}/feedback", handler: s.v2SetFeedback, write: true},
 		{pattern: "GET /v2/operations", handler: s.v2ListOperations},
 		{pattern: "GET /v2/operations/{id}", handler: s.v2GetOperation},
 		{pattern: "GET /v2/services", handler: s.v2ListServices},
@@ -731,6 +732,27 @@ func (s *Server) v2Abort(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.E.Abort(d.ID) {
 		s.audit(r, "deployment.abort", d.Service, d.ID, req.Reason)
+	}
+	dv, _ := s.deploymentV2(d.ID)
+	writeTagged(w, r, 200, dv)
+}
+
+func (s *Server) v2SetFeedback(w http.ResponseWriter, r *http.Request) {
+	d, p, ok := s.v2Lookup(w, r, auth.ActDeploy)
+	if !ok {
+		return
+	}
+	var req struct {
+		Outcome  string `json:"outcome"`
+		Incident string `json:"incident"`
+		Note     string `json:"note"`
+	}
+	if !s.decodeStrict(w, r, &req, false) {
+		return
+	}
+	if _, err := s.E.SetFeedback(d.ID, model.Feedback{Outcome: req.Outcome, Incident: req.Incident, Note: req.Note, By: p.ID}, source(r)); err != nil {
+		s.problem(w, r, 422, "validation_failed", err.Error(), fieldError{"outcome", err.Error()})
+		return
 	}
 	dv, _ := s.deploymentV2(d.ID)
 	writeTagged(w, r, 200, dv)

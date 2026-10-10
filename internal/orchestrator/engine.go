@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -348,6 +349,47 @@ func (e *Engine) SetCreatedBy(d *model.Deployment, actor string) {
 	}
 }
 
+// ErrFeedback: the outcome contradicts what the deployment's verdicts were.
+var ErrFeedback = errors.New("invalid feedback")
+
+// SetFeedback records a person's assessment of a deployment's verdict (it
+// replaces an earlier one) and audits it.
+func (e *Engine) SetFeedback(id string, fb model.Feedback, source string) (*model.Deployment, error) {
+	e.mu.Lock()
+	d, ok := e.deployments[id]
+	if !ok {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("deployment %s not found", id)
+	}
+	failed := d.Failed()
+	e.mu.Unlock()
+	switch fb.Outcome {
+	case model.FeedbackCorrect, model.FeedbackUnclear:
+	case model.FeedbackFalsePositive:
+		if !failed {
+			return nil, fmt.Errorf("%w: false_positive means a FAIL verdict on a healthy deployment, and %s had no FAIL verdict", ErrFeedback, id)
+		}
+	case model.FeedbackFalseNegative:
+		if failed {
+			return nil, fmt.Errorf("%w: false_negative means a harmful deployment was not failed, and %s was failed", ErrFeedback, id)
+		}
+	default:
+		return nil, fmt.Errorf("%w: outcome must be correct, false_positive, false_negative or unclear", ErrFeedback)
+	}
+	if fb.At.IsZero() {
+		fb.At = time.Now()
+	}
+	e.mu.Lock()
+	d.Feedback = &fb
+	e.mu.Unlock()
+	e.event(d, "feedback", fmt.Sprintf("verdict assessed as %s by %s", fb.Outcome, fb.By))
+	e.persist(d)
+	e.Audit(journal.Entry{Actor: fb.By, Source: source, Action: "deployment.feedback", Service: d.Service, DeployID: d.ID,
+		Reason: strings.TrimSpace(fb.Outcome + " " + fb.Note), Ticket: fb.Incident})
+	cp, _ := e.Deployment(id)
+	return cp, nil
+}
+
 // MarkBlocked records that a phase could not start (e.g. circuit open).
 func (e *Engine) MarkBlocked(d *model.Deployment, err error) {
 	e.setState(d, model.StateHeld, err.Error())
@@ -406,7 +448,7 @@ func (e *Engine) Create(id, service, version, previous string) (*model.Deploymen
 	now := time.Now()
 	d := &model.Deployment{ID: id, Service: service, Version: version, PreviousVersion: previous,
 		State: model.StatePending, Verdict: model.VerdictPending, CreatedAt: now, UpdatedAt: now,
-		Checkpoints: map[string]map[string]string{}}
+		Checkpoints: map[string]map[string]string{}, DryRun: e.DryRun}
 	e.deployments[id] = d
 	e.mu.Unlock()
 	e.event(d, "created", fmt.Sprintf("deployment created: %s %s -> %s", service, previous, version))

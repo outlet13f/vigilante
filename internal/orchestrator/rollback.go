@@ -74,6 +74,16 @@ func (e *Engine) traffic(svc *config.Service) (executor.TrafficController, error
 	})
 }
 
+// Traffic returns the traffic controller of a service's rollback plan (nil
+// when the plan has none).
+func (e *Engine) Traffic(service string) (executor.TrafficController, error) {
+	svc, ok := e.Cfg.Service(service)
+	if !ok {
+		return nil, fmt.Errorf("unknown service %q", service)
+	}
+	return e.traffic(svc)
+}
+
 // Rollback executes the service's rollback plan for a deployment. The final
 // deployment state tells the outcome: ROLLED_BACK, ROLLBACK_FAILED or
 // AWAITING_APPROVAL.

@@ -283,6 +283,37 @@ paths:
         '412': {$ref: '#/components/responses/PreconditionFailed'}
         '422': {$ref: '#/components/responses/Unprocessable'}
 
+  /v2/deployments/{id}/feedback:
+    parameters:
+      - {$ref: '#/components/parameters/DeploymentID'}
+    put:
+      tags: [deployments]
+      operationId: setDeploymentFeedback
+      security: [{bearerAuth: []}, {oauth2: [deployments:write]}]
+      summary: Assess the verdict
+      description: |
+        Records whether the verdict was right, for measuring decision quality
+        (false positives and false negatives). Replaces an earlier assessment.
+        `false_positive` needs a FAIL verdict; `false_negative` needs none.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FeedbackRequest'}
+      responses:
+        '200':
+          description: The deployment with its feedback.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Deployment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /v2/deployments/{id}/abort:
     parameters:
       - {$ref: '#/components/parameters/DeploymentID'}
@@ -1562,6 +1593,8 @@ components:
             approval: {type: string}
             checked_at: {type: string, format: date-time}
             unverified: {type: boolean, description: 'ITSM was unreachable and the gate fails open.'}
+        dry_run: {type: boolean, description: 'Ran with dry_run: rollbacks were only logged.'}
+        feedback: {$ref: '#/components/schemas/Feedback'}
         pending_rollback:
           type: object
           description: The rollback prepared for a failed phase, waiting for a decision (approve mode).
@@ -1623,6 +1656,26 @@ components:
         reason: {type: string, maxLength: 1000}
         executor: {type: string, description: 'Override the primary executor.'}
         targets: {type: array, items: {type: string}, description: 'Override the target set.'}
+    FeedbackRequest:
+      type: object
+      additionalProperties: false
+      required: [outcome]
+      properties:
+        outcome: {type: string, enum: [correct, false_positive, false_negative, unclear]}
+        incident: {type: string, maxLength: 200, description: 'Incident or problem ticket backing the assessment.'}
+        note: {type: string, maxLength: 2000}
+    Feedback:
+      type: object
+      description: A person's assessment of the verdict (decision quality).
+      required: [outcome, by, at]
+      properties:
+        outcome:
+          type: string
+          x-extensible-enum: [correct, false_positive, false_negative, unclear]
+        incident: {type: string}
+        note: {type: string}
+        by: {type: string}
+        at: {type: string, format: date-time}
     AbortRequest:
       type: object
       additionalProperties: false
