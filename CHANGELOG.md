@@ -109,7 +109,9 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   and rolled back healthy releases. `safety.observer_guard` (on by default)
   watches scheduling lag, a loopback round trip and timeouts spread across
   services, and holds breaches built on probe failures while the observer
-  is degraded and for `grace` (1m) after.
+  is degraded and for `grace` (1m) after. Only probes the orchestrator
+  measures itself (http, tcp, grpc, db, host) count, plus `probe_error`;
+  the same metric names from log and access-log probes are still judged.
 
 ### Changed
 - DB probe: every interval runs the query on one kept connection; the
