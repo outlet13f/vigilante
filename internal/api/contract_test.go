@@ -612,3 +612,37 @@ itsm:
 		t.Fatalf("incident: %v", inc)
 	}
 }
+
+func TestV2Feedback(t *testing.T) {
+	_, base := newV2Server(t, "")
+	c := &v2Client{t: t, base: base, token: "tok"}
+	c.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+
+	// A failed canary that was in fact healthy: a false positive.
+	c.do("POST", "/v2/deployments", `{"id":"fb1","service":"svc","version":"v2"}`, nil)
+	r := c.do("POST", "/v2/deployments/fb1/observations", `{"phase":"canary"}`, nil)
+	waitOp(t, c, r.JSON["id"].(string))
+	wantProblem(t, c.do("PUT", "/v2/deployments/fb1/feedback", `{"outcome":"false_negative"}`, nil), 422, "validation_failed")
+	r = c.do("PUT", "/v2/deployments/fb1/feedback", `{"outcome":"false_positive","note":"probe port was firewalled"}`, nil)
+	fb, _ := r.JSON["feedback"].(map[string]any)
+	if r.StatusCode != 200 || fb["outcome"] != "false_positive" || fb["by"] != "token:legacy" {
+		t.Fatalf("feedback: %d %s", r.StatusCode, r.Body)
+	}
+
+	// A deployment that was never failed but caused an incident: a false negative.
+	c.do("POST", "/v2/deployments", `{"id":"fb2","service":"svc","version":"v3"}`, nil)
+	wantProblem(t, c.do("PUT", "/v2/deployments/fb2/feedback", `{"outcome":"false_positive"}`, nil), 422, "validation_failed")
+	if r := c.do("PUT", "/v2/deployments/fb2/feedback", `{"outcome":"false_negative","incident":"INC0012345"}`, nil); r.StatusCode != 200 {
+		t.Fatalf("false negative: %d %s", r.StatusCode, r.Body)
+	}
+	if r := c.do("PUT", "/v2/deployments/fb2/feedback", `{"outcome":"maybe"}`, nil); r.StatusCode < 400 {
+		t.Fatalf("unknown outcome accepted: %s", r.Body)
+	}
+	wantProblem(t, c.do("PUT", "/v2/deployments/nope/feedback", `{"outcome":"correct"}`, nil), 404, "not_found")
+
+	r = c.do("GET", "/v2/audit-events?action=deployment.feedback", "", nil)
+	items := r.JSON["items"].([]any)
+	if len(items) != 2 || items[1].(map[string]any)["ticket"] != "INC0012345" {
+		t.Fatalf("audit: %s", r.Body)
+	}
+}

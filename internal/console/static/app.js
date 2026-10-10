@@ -427,6 +427,29 @@ async function deploymentView(id) {
         : h('p', { class: 'sub' }, 'operator 권한이 있어야 결정할 수 있습니다.'));
   }
 
+  // Verdict assessment (pilot decision quality): was the verdict right?
+  let assess = null;
+  if (['SUCCEEDED', 'PROMOTED', 'HELD', 'ROLLED_BACK', 'ROLLBACK_FAILED', 'ABORTED'].includes(d.state)) {
+    const failed = (d.events || []).some((e) => e.kind === 'verdict' && e.message.startsWith('FAIL:'));
+    const fb = d.feedback;
+    const LABEL = { correct: '판정이 맞음', false_positive: '오탐 (정상인데 FAIL)', false_negative: '미탐 (문제가 있었는데 통과)', unclear: '판단 불가' };
+    const outcome = h('select', { id: 'fb-outcome' }, ['correct', failed ? 'false_positive' : 'false_negative', 'unclear']
+      .map((o) => h('option', { value: o, selected: fb && fb.outcome === o }, LABEL[o])));
+    const incident = h('input', { id: 'fb-incident', placeholder: 'INC0012345', value: (fb && fb.incident) || '' });
+    const note = h('input', { id: 'fb-note', placeholder: '확인한 내용', value: (fb && fb.note) || '', style: 'min-width:280px' });
+    assess = h('div', { class: 'panel' + (fb ? '' : ' alert') },
+      h('h2', { style: 'margin-top:0' }, '판정 평가'),
+      h('p', { class: 'sub' }, fb
+        ? `${LABEL[fb.outcome] || fb.outcome} · ${fb.by} · ${fmtTime(fb.at)}${fb.incident ? ' · ' + fb.incident : ''}${fb.note ? ' · ' + fb.note : ''}`
+        : '아직 평가하지 않았습니다. 판정 품질(오탐·미탐) 측정에 쓰입니다.'),
+      can('deployer', svc) ? h('div', { class: 'filters' },
+        h('div', {}, h('label', { for: 'fb-outcome' }, '평가'), outcome),
+        h('div', {}, h('label', { for: 'fb-incident' }, '인시던트'), incident),
+        h('div', {}, h('label', { for: 'fb-note' }, '메모'), note),
+        h('button', { onclick: () => act('판정 평가', () => api('PUT', `/v2/deployments/${encodeURIComponent(id)}/feedback`,
+          { outcome: outcome.value, incident: incident.value.trim(), note: note.value.trim() })) }, fb ? '고치기' : '저장')) : null);
+  }
+
   const ev = d.last_evaluation;
   show(
     h('p', {}, h('a', { href: '#/deployments' }, '← 배포 목록')),
@@ -443,8 +466,10 @@ async function deploymentView(id) {
       d.approved_by ? [h('dt', {}, '승인'), h('dd', {}, d.approved_by)] : null,
       d.change_ticket ? [h('dt', {}, '변경 티켓'), h('dd', {}, d.change_ticket.number + (d.change_ticket.unverified ? ' (미검증)' : ''))] : null,
       d.freeze_override ? [h('dt', {}, '동결 예외'), h('dd', {}, d.freeze_override)] : null,
+      d.dry_run ? [h('dt', {}, '드라이런'), h('dd', {}, '조치는 기록만 했습니다 (dry_run)')] : null,
       ev ? [h('dt', {}, '최근 평가'), h('dd', {}, `${fmtTime(ev.time)} · 위반 ${ev.failing}, 보류 ${ev.holding}, 경고 ${ev.warning} (판정 ${ev.known}/${ev.known + ev.unknown})`)] : null),
     actions.childElementCount ? h('div', { style: 'margin-top:12px' }, actions) : null),
+    assess,
     h('h2', {}, '규칙 위반'),
     (d.breaches && d.breaches.length) ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, '규칙'), h('th', {}, '대상'), h('th', {}, '조치'), h('th', {}, '내용'))),
       h('tbody', {}, d.breaches.map((b) => h('tr', {}, h('td', {}, b.rule), h('td', {}, b.target), h('td', {}, b.action + (b.environmental ? ' (환경 요인)' : '')), h('td', { class: 'mono' }, b.detail || '')))))

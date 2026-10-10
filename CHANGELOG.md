@@ -22,6 +22,9 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   rate limits, idempotency keys, events over SSE and signed webhooks.
 - Approval mode, change freezes, ServiceNow change gate and incidents,
   Teams / email / PagerDuty alerts, web operations console.
+- Decision quality: verdict feedback (`PUT /v2/deployments/{id}/feedback`,
+  `vigilante feedback`, console) and `vigilante pilot report` against the
+  release gate.
 - Release: minimal build, rpm/deb, container image, Helm chart, SBOMs,
   signed air-gapped bundles; `vigilante store status|migrate` with a
   downgrade guard.

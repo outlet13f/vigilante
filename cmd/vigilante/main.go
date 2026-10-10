@@ -61,6 +61,8 @@ Usage:
   vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
                      | query [--actor A] [--action X] [--service S] [--since DATE]
   vigilante store    status | migrate [--down-to N --yes]   (PostgreSQL state store schema)
+  vigilante feedback --id ID --outcome correct|false_positive|false_negative|unclear [--incident INC] [--note T] [--server URL]
+  vigilante pilot    report [--since DATE] [--until DATE] [--service A,B] [--json] [--out F]   (decision quality; exit 4 = gate not met)
   vigilante support-bundle -c FILE [--server URL] [--log FILE]... [--out F.zip]   (diagnostics, secrets removed)
   vigilante plugins
   vigilante version
@@ -214,6 +216,10 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdStore(ctx, args)
 	case "support-bundle":
 		return cmdSupportBundle(ctx, args)
+	case "feedback":
+		return cmdFeedback(ctx, args)
+	case "pilot":
+		return cmdPilot(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":

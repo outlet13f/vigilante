@@ -23,6 +23,7 @@
 | [docs/08-upgrade.md](docs/08-upgrade.md) · [CHANGELOG.md](CHANGELOG.md) | 버전 정책(SemVer)과 호환성 약속, 순차 업그레이드, 되돌리기 |
 | [docs/09-compatibility.md](docs/09-compatibility.md) | 호환성 매트릭스: 플러그인별 검증 수준(검증됨·실험적) |
 | [docs/10-security.md](docs/10-security.md) | 보안 가이드: 통신 경로, 최소 권한(sudoers·외부 시스템 역할), 비밀값, 공급망 |
+| [docs/11-pilot.md](docs/11-pilot.md) | 파일럿 운영: 판정 평가(오탐·미탐) 기록, 판정 품질 보고서와 출시 게이트 |
 | [examples/config/vigilante.yaml](examples/config/vigilante.yaml) | 4개 서비스 × 전 인프라 유형(OpenStack 포함) 참조 설정 |
 | [examples/ci/](examples/ci/) | Jenkins / GitLab CI / GitHub Actions 연동 |
 
@@ -72,6 +73,8 @@ vigilante audit query  -c vigilante.yaml --action denied --since 2026-10-01
 vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--approve]
 vigilante store status -c vigilante.yaml                               # PostgreSQL 스키마 상태 (store migrate [--down-to N])
 vigilante support-bundle -c vigilante.yaml --server https://vigilante:8088   # 진단 zip (비밀값 제거)
+vigilante feedback --id $BUILD --outcome false_positive --note "..."       # 판정 평가 (오탐·미탐 측정)
+vigilante pilot report -c vigilante.yaml --since 2026-11-01            # 판정 품질 보고서와 출시 게이트 (미달 시 종료 코드 4)
 ```
 
 설치 패키지(rpm·deb), 컨테이너 이미지, Helm 차트, 폐쇄망 번들은 릴리스마다 나옵니다. [docs/07-install.md](docs/07-install.md)를 보십시오.

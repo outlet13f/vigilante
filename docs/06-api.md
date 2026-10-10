@@ -93,6 +93,7 @@ curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials "$API/v2/oa
 | `GET /v2/deployments/{id}` | viewer | 배포, 타임라인, 위반, 최근 평가, `exit_code` |
 | `POST /v2/deployments/{id}/observations` | deployer | 단계 관측 시작 → Operation |
 | `POST /v2/deployments/{id}/rollbacks` | operator | 수동 롤백 → Operation |
+| `PUT /v2/deployments/{id}/feedback` | deployer | 판정 평가(`correct`·`false_positive`·`false_negative`·`unclear`, 인시던트·메모). 판정 품질 측정용 (docs/11-pilot.md) |
 | `POST /v2/deployments/{id}/approvals` | operator | 승인 대기 중인 롤백 결정 → Operation. `{"decision": "approve"\|"reject", "comment"}`. approve 모드의 준비된 롤백은 승인·거절, 상위 전략은 승인만. 4-eyes 적용 |
 | `POST /v2/deployments/{id}/abort` | deployer | 관측 중단 |
 | `GET /v2/operations`, `GET /v2/operations/{id}` | viewer | 작업 진행·결과 |
