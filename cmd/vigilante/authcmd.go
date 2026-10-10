@@ -12,7 +12,43 @@ import (
 	"time"
 
 	"vigilante/internal/auth"
+	"vigilante/internal/model"
+	"vigilante/internal/notify"
+	"vigilante/internal/orchestrator"
 )
+
+// localPrivileged guards a privileged command that acts on the state store
+// directly instead of through the API, where roles and scopes would apply.
+// With auth.local_cli restricted it needs --break-glass REASON; every
+// break-glass use is audited and sent as a critical alert.
+func localPrivileged(ctx context.Context, e *orchestrator.Engine, c *common, action string, d *model.Deployment) error {
+	if c.breakGlass == "" {
+		if !e.Cfg.LocalCLIRestricted() {
+			return nil
+		}
+		return fmt.Errorf("%s refused: the API has authentication, so privileged local commands are restricted (auth.local_cli). "+
+			"Run it through the server with --server and an operator or admin token, or pass --break-glass REASON (audited and alerted)", action)
+	}
+	var service, id string
+	if d != nil {
+		service, id = d.Service, d.ID
+	}
+	cliAudit(e, c, "breakglass."+action, service, id, c.breakGlass)
+	e.Notify.Send(ctx, notify.Message{Level: notify.Critical, Title: fmt.Sprintf("Break-glass: %s ran %s locally", cliActor(), action),
+		Text: c.breakGlass, Deployment: d})
+	return nil
+}
+
+// localFourEyes applies auth.four_eyes to local approval decisions: the
+// person who created the deployment or requested its rollback may not
+// decide it, unless they break glass.
+func localFourEyes(e *orchestrator.Engine, c *common, d *model.Deployment) error {
+	me := cliActor()
+	if !e.Cfg.Auth.FourEyes || c.breakGlass != "" || (me != d.CreatedBy && me != d.RollbackRequestedBy) {
+		return nil
+	}
+	return fmt.Errorf("four-eyes: %s created this deployment or requested its rollback, so another operator must decide (or --break-glass REASON)", me)
+}
 
 // cliActor names the person running a local CLI command in deployment records.
 func cliActor() string {

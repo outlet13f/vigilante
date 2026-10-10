@@ -152,6 +152,25 @@ type Auth struct {
 	// FourEyes: whoever created a deployment or requested its rollback may
 	// not also approve its gated escalation.
 	FourEyes bool `yaml:"four_eyes"`
+	// LocalCLI governs privileged commands run against the state store
+	// directly instead of through the API (no --server): deciding a rollback
+	// approval, approving an escalation, circuit reset/trip and change-freeze
+	// overrides. restricted refuses them unless --break-glass REASON is given
+	// (audited and alerted); full allows them. auto (default) is restricted
+	// when the API has authentication configured, full otherwise.
+	LocalCLI string `yaml:"local_cli"`
+}
+
+// LocalCLIRestricted reports whether privileged local commands need
+// --break-glass (see Auth.LocalCLI).
+func (c *Config) LocalCLIRestricted() bool {
+	switch c.Auth.LocalCLI {
+	case "full":
+		return false
+	case "restricted":
+		return true
+	}
+	return c.Server.AuthTokenEnv != "" || len(c.Auth.ServiceAccounts) > 0 || c.Auth.OIDC != nil
 }
 
 // OIDC validates bearer JWTs from the company identity provider.

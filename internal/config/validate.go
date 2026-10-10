@@ -750,6 +750,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	switch c.Auth.LocalCLI {
+	case "", "auto", "full", "restricted":
+	default:
+		bad("auth.local_cli must be auto|full|restricted, got %q", c.Auth.LocalCLI)
+	}
 	if ou := c.Safety.RollbackLease.OnUnavailable; ou != "proceed" && ou != "fail" {
 		bad("safety.rollback_lease.on_unavailable must be proceed|fail, got %q", ou)
 	}

@@ -29,7 +29,7 @@
 
 - 상태는 저널에 영속화되어 **프로세스 재시작·CI 잡 간에 유지**됩니다 (테스트: `TestRollbackFailureIsolatesAndOpensCircuit`).
 - 킬 스위치: `vigilante circuit trip --reason "변경 동결"` 또는 `POST /v1/circuit/trip` — 변경 동결 기간이나 대형 장애 대응 중 자동화를 즉시 멈춥니다.
-- 리셋: `vigilante circuit reset` / `POST /v1/circuit/reset` (API 토큰 필요). 원인 조사 후에만.
+- 리셋: `vigilante circuit reset --server URL` / `POST /v1/circuit/reset` (admin 토큰 필요). 원인 조사 후에만. 인증을 켠 환경에서 서버 없이 로컬로 리셋·차단하려면 `--break-glass "이유"`가 필요하고 감사·알림이 남습니다(`auth.local_cli`).
 
 ## 2. 롤백 실패 시나리오별 대응
 

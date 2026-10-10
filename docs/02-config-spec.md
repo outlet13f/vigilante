@@ -464,11 +464,13 @@ auth:
       token_sha256: 0f1e...   # (64자 hex)
       roles: [{role: agent}]
   four_eyes: true             # 배포 생성자·롤백 요청자는 그 승인 요청을 직접 승인할 수 없음
+  local_cli: auto             # auto | full | restricted — 아래 "로컬 CLI" 참고
 ```
 
 - 토큰 폐기: 서비스 계정 항목을 지우고 설정을 다시 읽히면 즉시 무효가 됩니다. 만료일을 두는 것을 권장합니다.
 - 확인: `vigilante whoami --server URL` (환경변수 `VIGILANTE_TOKEN`의 신원과 권한 출력).
 - 모든 생성·롤백·승인 기록에 작업자(`created_by`, `rollback_requested_by`, `approved_by`)가 남습니다. 로컬 CLI 실행은 `cli:<OS 사용자>@<호스트>`로 기록됩니다.
+- **로컬 CLI(`auth.local_cli`):** `--server` 없이 실행한 CLI는 API를 거치지 않고 상태 저장소를 직접 다루므로 역할 검사를 받지 않습니다. 그래서 인증이 설정된 환경(기본 `auto`)에서는 권한이 큰 로컬 명령, 즉 롤백 승인·거절(`rollback --approve|--reject`), 에스컬레이션 승인(`rollback --approve`), `circuit reset|trip`, 동결 중 `--freeze-override`를 거부합니다. `--server`와 operator·admin 토큰으로 실행하거나, 서버 장애 같은 비상시에는 `--break-glass "이유"`를 붙입니다. break-glass는 감사 기록(`breakglass.<작업>`)과 critical 알림을 남깁니다. `full`은 제한을 끄고, `restricted`는 인증이 없어도 제한합니다. 로컬 승인·거절에도 `four_eyes`를 적용합니다(break-glass 제외). 상태 저장소 접근 권한(DB 계정, 저널 파일) 자체가 이 명령들의 권한과 같으므로, 그 계정은 운영자에게만 줍니다.
 - OIDC를 설정하면 서버 시작 시 발급자(issuer)의 discovery 문서를 가져오므로 서버에서 SSO에 접근할 수 있어야 합니다.
 
 ## `audit` — 감사 기록

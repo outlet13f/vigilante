@@ -46,6 +46,14 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   if another process holds the lease when the store returns).
   `on_unavailable: fail` keeps the old behaviour.
 
+### Fixed (security)
+- The local CLI (no `--server`) acts on the state store directly, so it
+  skipped role checks and four-eyes. With authentication configured
+  (`auth.local_cli: auto`, the default), deciding approvals, approving
+  escalations, `circuit reset|trip` and `--freeze-override` now need
+  `--break-glass REASON`, which is audited (`breakglass.<action>`) and sent
+  as a critical alert; local approval decisions also apply `four_eyes`.
+
 ### Fixed (decisions)
 - An overloaded orchestrator read its own probe timeouts as target failures
   and rolled back healthy releases. `safety.observer_guard` (on by default)
