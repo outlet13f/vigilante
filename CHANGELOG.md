@@ -39,6 +39,77 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
 ### Fixed (store)
 - State writes that failed while the store was unreachable were dropped;
   they are now queued in order and written when it returns.
+- A rollback that started while the store was unreachable ended
+  ROLLBACK_FAILED because the service lease could not be taken. It now
+  retries for `safety.rollback_lease.wait` (10s) and then rolls back under
+  the in-process lock, recording `lease.unavailable` (and `lease.conflict`
+  if another process holds the lease when the store returns).
+  `on_unavailable: fail` keeps the old behaviour.
+
+### Fixed (security)
+- The local CLI (no `--server`) acts on the state store directly, so it
+  skipped role checks and four-eyes. With authentication configured
+  (`auth.local_cli: auto`, the default), deciding approvals, approving
+  escalations, `circuit reset|trip` and `--freeze-override` now need
+  `--break-glass REASON`, which is audited (`breakglass.<action>`) and sent
+  as a critical alert; local approval decisions also apply `four_eyes`.
+- Helm chart: refuses to render when the config has no authentication
+  (service accounts, OIDC, or `server.auth_token_env` supplied via
+  env/envFrom); set `auth.allowAnonymous=true` for development installs.
+  Previously every in-cluster caller was an anonymous admin.
+
+- SIEM export over TLS: `audit.syslog.address: tls://host[:port]` (RFC 5425
+  octet-counted frames, default port 6514) with `audit.syslog.tls`
+  (`ca_file`, `cert_file`/`key_file`, `server_name`, `min_version`).
+  Previously only plaintext tcp/udp.
+- Keyed audit chain: `audit.chain_key_ref` adds an HMAC of each entry's
+  chain hash, so someone with write access to the store but without the key
+  can no longer rewrite entries and recompute the chain. `vigilante audit
+  verify` checks the MACs (`--key REF` to override), reports entries written
+  before the key as unkeyed and where the key starts protecting the chain
+  (`keyed_from`). No schema migration. With a key configured, every command
+  that opens the store needs it (like `dsn_ref`).
+
+- The web console sends `Strict-Transport-Security: max-age=31536000` when
+  served over HTTPS, and applies its security headers to the sign-in
+  endpoints too.
+
+### Fixed (integration)
+- `vigilante watch --server` now forwards `--ticket` and `--freeze-override`,
+  and exits 3 (not 1) when the server refuses at a closed gate (circuit
+  open, change freeze, change ticket, ITSM unavailable).
+- `POST /v1/deployments` accepts `change_ticket` and `freeze_override`
+  (admins only) in the body, and gate refusals include a `code` field
+  (`circuit_open`, `change_frozen`, `change_ticket_invalid`,
+  `itsm_unavailable`).
+- OpenAPI: the `approval.decided` payload is documented as `deployment_id,
+  service, kind, decision, decided_by, comment` (it never carried
+  `approved_by`); a contract test keeps the two in step.
+- ServiceNow: retry decisions use the HTTP status instead of matching error
+  text; transient failures (connection errors, 429, 5xx) retry after 1s, 2s
+  and 4s; incidents are created in the background so a slow ServiceNow no
+  longer delays later work notes. `vigilante_itsm_calls_total` gains
+  `result="retry"`.
+
+### Fixed (deployment)
+- Helm chart with server TLS: the HA advertise URL, probes, port names,
+  Ingress backend port and ServiceMonitor scheme use https (the advertise
+  URL was always `http://`, which broke forwarding); new `tls.enabled`,
+  `tls.secretName` and `serviceMonitor.tlsConfig` values.
+  `server.tls.client_auth: require` is refused (probes carry no certificate).
+- `server.ha.tls` (`ca_file`, `server_name`, client cert): followers verify
+  the leader by a name in its certificate rather than the pod IP they
+  forward to.
+- Helm chart memory defaults raised to 512Mi request / 2Gi limit (512Mi was
+  below the 1.1 GiB peak heap measured at 20,000 probes), with `GOMEMLIMIT`
+  at 90% of the limit (`goMemLimit` to override or turn off).
+
+### Fixed (decisions)
+- An overloaded orchestrator read its own probe timeouts as target failures
+  and rolled back healthy releases. `safety.observer_guard` (on by default)
+  watches scheduling lag, a loopback round trip and timeouts spread across
+  services, and holds breaches built on probe failures while the observer
+  is degraded and for `grace` (1m) after.
 
 ### Changed
 - DB probe: every interval runs the query on one kept connection; the

@@ -130,12 +130,30 @@ type Audit struct {
 	// Retention is the default for `vigilante audit prune` (e.g. 8760h).
 	// Nothing is deleted automatically.
 	Retention time.Duration `yaml:"retention"`
+	// ChainKeyRef (vault:/env:/file:, at least 32 bytes) keys the hash
+	// chain: every new journal entry also carries an HMAC of its chain hash,
+	// so someone who can write to the store but has not got the key cannot
+	// rewrite entries and recompute the chain. `vigilante audit verify` checks
+	// the MACs with the same key. Shared by every node writing to the store.
+	ChainKeyRef string `yaml:"chain_key_ref"`
 }
 
 // SyslogExport ships audit records to a SIEM.
 type SyslogExport struct {
-	Address string `yaml:"address"` // tcp://host:port or udp://host:port
-	Format  string `yaml:"format"`  // rfc5424 (default, JSON message) | cef
+	// Address: tcp://host:port, udp://host:port, or tls://host[:port]
+	// (RFC 5425: octet-counted frames over TLS, default port 6514).
+	Address string     `yaml:"address"`
+	Format  string     `yaml:"format"` // rfc5424 (default, JSON message) | cef
+	TLS     *SyslogTLS `yaml:"tls"`    // tls:// only; without it the system roots verify the collector
+}
+
+// SyslogTLS: how the exporter verifies the collector and authenticates to it.
+type SyslogTLS struct {
+	CAFile     string `yaml:"ca_file"` // private CA of the collector certificate
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	ServerName string `yaml:"server_name"` // default: the address host
+	MinVersion string `yaml:"min_version"` // 1.2 (default) | 1.3
 }
 
 // Auth configures who may call the API and what they may do.
@@ -152,6 +170,25 @@ type Auth struct {
 	// FourEyes: whoever created a deployment or requested its rollback may
 	// not also approve its gated escalation.
 	FourEyes bool `yaml:"four_eyes"`
+	// LocalCLI governs privileged commands run against the state store
+	// directly instead of through the API (no --server): deciding a rollback
+	// approval, approving an escalation, circuit reset/trip and change-freeze
+	// overrides. restricted refuses them unless --break-glass REASON is given
+	// (audited and alerted); full allows them. auto (default) is restricted
+	// when the API has authentication configured, full otherwise.
+	LocalCLI string `yaml:"local_cli"`
+}
+
+// LocalCLIRestricted reports whether privileged local commands need
+// --break-glass (see Auth.LocalCLI).
+func (c *Config) LocalCLIRestricted() bool {
+	switch c.Auth.LocalCLI {
+	case "full":
+		return false
+	case "restricted":
+		return true
+	}
+	return c.Server.AuthTokenEnv != "" || len(c.Auth.ServiceAccounts) > 0 || c.Auth.OIDC != nil
 }
 
 // OIDC validates bearer JWTs from the company identity provider.
@@ -239,6 +276,22 @@ type HA struct {
 	AdvertiseURL string        `yaml:"advertise_url"` // how other nodes reach this node's API
 	NodeID       string        `yaml:"node_id"`       // default: hostname
 	LeaseTTL     time.Duration `yaml:"lease_ttl"`
+	// TLS is how followers verify the leader when they forward API calls to
+	// an https advertise URL (default: system trust store, host from the URL).
+	TLS *HATLS `yaml:"tls"`
+}
+
+// HATLS configures follower-to-leader forwarding over HTTPS.
+type HATLS struct {
+	CAFile string `yaml:"ca_file"` // private CA of the nodes' certificates
+	// ServerName is checked against the leader's certificate instead of the
+	// host in its advertise URL. Pod IPs are rarely in a certificate; the
+	// Service DNS name usually is.
+	ServerName string `yaml:"server_name"`
+	// CertFile/KeyFile: a client certificate, when server.tls.client_auth
+	// is require.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 // Agent configures the optional push agent (`vigilante agent`).
@@ -709,6 +762,39 @@ type Safety struct {
 	BlastRadius    BlastRadius    `yaml:"blast_radius"`
 	Flapping       Flapping       `yaml:"flapping"`
 	ObserverQuorum bool           `yaml:"observer_quorum"`
+	RollbackLease  RollbackLease  `yaml:"rollback_lease"`
+	ObserverGuard  ObserverGuard  `yaml:"observer_guard"`
+}
+
+// ObserverGuard holds rule breaches built on probe failures (up, latency,
+// failures, timeouts) instead of rolling back while this orchestrator's own
+// measurements are unreliable. See internal/observer.
+type ObserverGuard struct {
+	Disabled bool `yaml:"disabled"`
+	// MaxLag: a 250ms internal tick waking later than this marks the
+	// observer degraded (default 1s).
+	MaxLag time.Duration `yaml:"max_lag"`
+	// LoopbackTimeout bounds a round trip to an in-process TCP echo (default 1s).
+	LoopbackTimeout time.Duration `yaml:"loopback_timeout"`
+	// TimeoutShare and MinServices: probes timing out on at least this share
+	// of the observed targets (default 0.5), spread over at least this many
+	// services (default 3), are the observer's problem, not one release's.
+	TimeoutShare float64 `yaml:"timeout_share"`
+	MinServices  int     `yaml:"min_services"`
+	// Grace keeps holding for this long after the observer recovers, so
+	// failure counts and windows filled during the episode age out (default 1m).
+	Grace time.Duration `yaml:"grace"`
+}
+
+// RollbackLease governs the cross-process rollback lock (a state-store
+// lease) when the store cannot be reached at the moment a rollback starts.
+type RollbackLease struct {
+	// Wait is how long to keep retrying the store (default 10s).
+	Wait time.Duration `yaml:"wait"`
+	// OnUnavailable: proceed (default) rolls back under the in-process lock
+	// alone and says so in the deployment's events, the audit log and a
+	// warning notification; fail refuses the rollback (ROLLBACK_FAILED).
+	OnUnavailable string `yaml:"on_unavailable"`
 }
 
 type CircuitBreaker struct {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	"vigilante/internal/events"
@@ -105,48 +104,51 @@ func (s *Server) handleITSM(ev *model.CloudEvent) {
 	s.itsmCall("work_note", func(ctx context.Context) error { return s.E.ITSM.WorkNote(ctx, d.ChangeTicket.SysID, note) })
 }
 
+// openIncident raises the incident in the background, so a slow or failing
+// ServiceNow delays neither the event stream nor anything else. Retries are
+// safe: EnsureIncident first looks for an active incident with the same
+// correlation_id, so a create that timed out after ServiceNow stored it is
+// found instead of duplicated.
 func (s *Server) openIncident(correlation, short, desc, deploymentID, service string) {
-	var number string
-	var created bool
-	ok := s.itsmCall("incident", func(ctx context.Context) error {
-		var err error
-		number, created, err = s.E.ITSM.EnsureIncident(ctx, correlation, short, desc)
-		return err
+	s.background(func() {
+		var number string
+		var created bool
+		ok := s.itsmCall("incident", func(ctx context.Context) error {
+			var err error
+			number, created, err = s.E.ITSM.EnsureIncident(ctx, correlation, short, desc)
+			return err
+		})
+		if !ok || !created {
+			return
+		}
+		s.E.Audit(journal.Entry{Actor: "system", Source: "system", Action: "itsm.incident", Service: service, DeployID: deploymentID,
+			Reason: number + " opened: " + short})
+		if d := s.E.Live(deploymentID); d != nil {
+			s.E.Annotate(d, "itsm", "incident "+number+" opened")
+		}
 	})
-	if !ok || !created {
-		return
-	}
-	s.E.Audit(journal.Entry{Actor: "system", Source: "system", Action: "itsm.incident", Service: service, DeployID: deploymentID,
-		Reason: number + " opened: " + short})
-	if d := s.E.Live(deploymentID); d != nil {
-		s.E.Annotate(d, "itsm", "incident "+number+" opened")
-	}
 }
 
-// itsmCall retries a ServiceNow call a few times; failures are logged and
-// counted, never raised.
+// itsmCallTimeout bounds one attempt (an incident is a search and a create).
+const itsmCallTimeout = 30 * time.Second
+
+// itsmCall runs a ServiceNow call with the client's bounded retries (1s, 2s,
+// 4s by default). Failures are logged and counted, never raised: result
+// "ok" or "error" once per call, "retry" for each repeated attempt.
 func (s *Server) itsmCall(kind string, fn func(context.Context) error) bool {
-	var err error
-	for attempt, wait := range []time.Duration{0, 2 * time.Second, 10 * time.Second} {
-		if attempt > 0 {
-			select {
-			case <-s.ctx.Done():
-				return false
-			case <-time.After(wait):
-			}
-		}
-		ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
-		err = fn(ctx)
-		cancel()
-		if err == nil {
-			telemetry.ITSMCalls.Inc(kind, "ok")
-			return true
-		}
-		if strings.Contains(err.Error(), ": 4") && !strings.Contains(err.Error(), ": 429") { // a 4xx will not get better
-			break
-		}
+	attempts, err := s.E.ITSM.Retry(s.ctx, func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, itsmCallTimeout)
+		defer cancel()
+		return fn(ctx)
+	})
+	if attempts > 1 {
+		telemetry.ITSMCalls.Add(float64(attempts-1), kind, "retry")
+	}
+	if err == nil {
+		telemetry.ITSMCalls.Inc(kind, "ok")
+		return true
 	}
 	telemetry.ITSMCalls.Inc(kind, "error")
-	s.E.Log.Error("servicenow call failed", "kind", kind, "err", err)
+	s.E.Log.Error("servicenow call failed", "kind", kind, "attempts", attempts, "err", err)
 	return false
 }

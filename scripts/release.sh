@@ -76,7 +76,8 @@ build() {
 
     # Helm chart with the release version.
     if command -v helm >/dev/null; then
-        helm lint deploy/helm/vigilante
+        # The default config has no auth, which the chart refuses to render.
+        helm lint deploy/helm/vigilante --set auth.allowAnonymous=true
         helm package deploy/helm/vigilante --version "$VERSION" --app-version "$VERSION" --destination "$OUT"
     else
         echo "helm not found: skipping the chart package" >&2

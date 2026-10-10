@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,7 @@ func (c *ca) issue(t *testing.T, dir, name string, serial int64, server bool) (s
 	if server {
 		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 		tpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+		tpl.DNSNames = []string{name + ".vigilante.svc"}
 	} else {
 		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
 	}
@@ -170,5 +172,45 @@ func TestServerConfigErrors(t *testing.T) {
 	}
 	if tc, err := Server(nil); tc != nil || err != nil {
 		t.Fatal("nil config must mean plain HTTP")
+	}
+}
+
+// Followers forwarding to the leader by pod IP verify the certificate
+// against server.ha.tls.server_name (the Service DNS name) instead.
+func TestHAClientServerName(t *testing.T) {
+	dir := t.TempDir()
+	root := newCA(t, "corp-ca")
+	caFile := filepath.Join(dir, "ca.pem")
+	_ = os.WriteFile(caFile, root.pem, 0o600)
+	srvCert, srvKey := root.issue(t, dir, "leader", 20, true)
+	s := serve(t, &config.ServerTLS{CertFile: srvCert, KeyFile: srvKey})
+	get := func(c *config.HATLS, url string) error {
+		tc, err := HAClient(c)
+		if err != nil {
+			return err
+		}
+		r, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: tc}, Timeout: 5 * time.Second}).Get(url)
+		if err == nil {
+			r.Body.Close()
+		}
+		return err
+	}
+	if tc, err := HAClient(nil); tc != nil || err != nil {
+		t.Fatalf("nil config: %v %v", tc, err)
+	}
+	// "localhost" is not in the certificate: plain verification fails...
+	byName := strings.Replace(s.URL, "127.0.0.1", "localhost", 1)
+	if err := get(&config.HATLS{CAFile: caFile}, byName); err == nil {
+		t.Fatal("host name outside the certificate accepted")
+	}
+	// ...and server_name makes it verify against the Service name.
+	if err := get(&config.HATLS{CAFile: caFile, ServerName: "leader.vigilante.svc"}, byName); err != nil {
+		t.Fatalf("server_name: %v", err)
+	}
+	if err := get(&config.HATLS{CAFile: caFile, ServerName: "other.vigilante.svc"}, byName); err == nil {
+		t.Fatal("wrong server_name accepted")
+	}
+	if _, err := HAClient(&config.HATLS{CAFile: filepath.Join(dir, "missing.pem")}); err == nil || !strings.Contains(err.Error(), "server.ha.tls") {
+		t.Fatalf("missing CA: %v", err)
 	}
 }

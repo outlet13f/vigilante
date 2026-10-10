@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -36,11 +37,30 @@ func cmdAudit(ctx context.Context, args []string) (int, error) {
 	action2 := c.fs.String("action", "", "query: filter by action (e.g. denied, rollback.manual)")
 	since := c.fs.String("since", "", "query: from date/time (YYYY-MM-DD or RFC 3339)")
 	limit := c.fs.Int("limit", 200, "query: max records")
+	keyRef := c.fs.String("key", "", "verify: chain key reference (env:NAME, file:/path, vault:...) instead of audit.chain_key_ref")
 	if err := c.fs.Parse(args[1:]); err != nil {
 		return 1, err
 	}
 	if action == "verify" && *file != "" {
-		r, err := audit.VerifyFile(*file)
+		// An archive needs no config; -c only supplies audit.chain_key_ref
+		// (and secrets.vault for a vault: key).
+		ref := *keyRef
+		explicit := false
+		c.fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "c" })
+		if explicit {
+			cfg, err := loadConfig(c.config)
+			if err != nil {
+				return 1, err
+			}
+			if ref == "" {
+				ref = cfg.Audit.ChainKeyRef
+			}
+		}
+		key, err := store.ResolveChainKey(ctx, ref)
+		if err != nil {
+			return 1, err
+		}
+		r, err := audit.VerifyFile(*file, key)
 		return reportVerify(r, err, *file)
 	}
 	cfg, err := loadConfig(c.config)
@@ -55,7 +75,15 @@ func cmdAudit(ctx context.Context, args []string) (int, error) {
 
 	switch action {
 	case "verify":
-		r, err := audit.Verify(ctx, st)
+		ref := cfg.Audit.ChainKeyRef
+		if *keyRef != "" {
+			ref = *keyRef
+		}
+		key, err := store.ResolveChainKey(ctx, ref)
+		if err != nil {
+			return 1, err
+		}
+		r, err := audit.Verify(ctx, st, key)
 		return reportVerify(r, err, st.Describe())
 	case "export":
 		if *out == "" {
@@ -146,6 +174,18 @@ func reportVerify(r audit.Report, err error, what string) (int, error) {
 		fmt.Fprintf(os.Stderr, " (%d older entries predate the chain)", r.Legacy)
 	}
 	fmt.Fprintln(os.Stderr)
+	switch {
+	case !r.KeyChecked:
+		fmt.Fprintln(os.Stderr, "no chain key: MACs not checked (anyone who can write to the store could have recomputed the chain; set audit.chain_key_ref)")
+	case r.Keyed == 0 && r.Checked > 0:
+		fmt.Fprintln(os.Stderr, "WARNING: no entry carries a MAC: the key has not signed anything yet, or the MACs were stripped")
+	default:
+		fmt.Fprintf(os.Stderr, "chain key protects the chain from entry %d on: %d MACs verified", r.KeyedFrom, r.Keyed)
+		if r.Unkeyed > 0 {
+			fmt.Fprintf(os.Stderr, " (%d earlier entries were written before the key was configured)", r.Unkeyed)
+		}
+		fmt.Fprintln(os.Stderr)
+	}
 	return 0, nil
 }
 

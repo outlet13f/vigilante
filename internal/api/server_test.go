@@ -18,6 +18,7 @@ import (
 
 	"vigilante/internal/auth"
 	"vigilante/internal/config"
+	"vigilante/internal/itsm/snowtest"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
 	"vigilante/internal/store"
@@ -428,6 +429,65 @@ func TestReadyzAndRequestID(t *testing.T) {
 	defer func() { s.E.Journal = healthy }()
 	if r, out = call(t, "GET", hs.URL+"/readyz", "", "", nil); r.StatusCode != 503 || out["checks"].(map[string]any)["store"] != "unreachable" {
 		t.Fatalf("missing journal makes the node unready: %d %v", r.StatusCode, out)
+	}
+}
+
+// v1 create takes change_ticket and freeze_override in the body (what
+// `vigilante watch --server` sends) and labels a closed gate with its code.
+func TestV1CreateGateFields(t *testing.T) {
+	snow := snowtest.New(t)
+	now := time.Now().UTC()
+	snow.AddChange("CHG100", "sys100", "-1", "approved", now.Add(-time.Hour).Format("2006-01-02 15:04:05"), now.Add(time.Hour).Format("2006-01-02 15:04:05"))
+	t.Setenv("VGL_SNOW_PW", "snow-pass")
+	ciTok, ci := sa(t, "ci", "deployer", "*")
+	s, hs := newTestServerWith(t, `credentials: {snow: {type: basic, user: vigilante, password_ref: "env:VGL_SNOW_PW"}}
+itsm:
+  servicenow:
+    url: `+snow.Srv.URL+`
+    credential: snow
+    change_gate: {enabled: true, services: [svc]}
+auth:
+  service_accounts:
+`+ci)
+	create := func(token, body string, hdr map[string]string) (*http.Response, map[string]any) {
+		t.Helper()
+		return call(t, "POST", hs.URL+"/v1/deployments", token, body, hdr)
+	}
+
+	r, out := create(ciTok, `{"service":"svc","version":"v2","previous_version":"v1"}`, nil)
+	if r.StatusCode != 409 || out["code"] != "change_ticket_invalid" {
+		t.Fatalf("no ticket: %d %v", r.StatusCode, out)
+	}
+	r, out = create(ciTok, `{"id":"t1","service":"svc","version":"v2","previous_version":"v1","change_ticket":"CHG100"}`, nil)
+	if r.StatusCode != 201 || out["change_ticket"].(map[string]any)["sys_id"] != "sys100" {
+		t.Fatalf("ticket in the body: %d %v", r.StatusCode, out)
+	}
+	r, out = create(ciTok, `{"id":"t2","service":"svc","version":"v2","previous_version":"v1"}`, map[string]string{"X-Change-Ticket": "CHG100"})
+	if r.StatusCode != 201 {
+		t.Fatalf("ticket in the header still works: %d %v", r.StatusCode, out)
+	}
+
+	s.E.CreateFreeze(&model.Freeze{Name: "q4", Reason: "quarter end", StartsAt: now.Add(-time.Minute), EndsAt: now.Add(time.Hour),
+		Services: []string{}, Teams: []string{}, AllowRollback: true, CreatedBy: "test"})
+	r, out = create(ciTok, `{"service":"svc","version":"v3","previous_version":"v2","change_ticket":"CHG100"}`, nil)
+	if r.StatusCode != 409 || out["code"] != "change_frozen" {
+		t.Fatalf("frozen: %d %v", r.StatusCode, out)
+	}
+	if r, out = create(ciTok, `{"service":"svc","version":"v3","previous_version":"v2","change_ticket":"CHG100","freeze_override":"hotfix"}`, nil); r.StatusCode != 403 {
+		t.Fatalf("only admins may override: %d %v", r.StatusCode, out)
+	}
+	r, out = create("tok", `{"id":"hf","service":"svc","version":"v3","previous_version":"v2","change_ticket":"CHG100","freeze_override":"hotfix for INC42"}`, nil)
+	if r.StatusCode != 201 || !strings.Contains(out["freeze_override"].(string), "hotfix for INC42") {
+		t.Fatalf("admin override: %d %v", r.StatusCode, out)
+	}
+
+	snow.SetDown(true)
+	r, out = create("tok", `{"service":"svc","version":"v4","previous_version":"v3","change_ticket":"CHG100","freeze_override":"x"}`, nil)
+	if r.StatusCode != 503 || out["code"] != "itsm_unavailable" || r.Header.Get("Retry-After") == "" {
+		t.Fatalf("ITSM down: %d %v", r.StatusCode, out)
+	}
+	if r, out = create("tok", `{"version":"v4"}`, nil); r.StatusCode != 400 || out["code"] != nil {
+		t.Fatalf("plain error: %d %v", r.StatusCode, out)
 	}
 }
 

@@ -22,6 +22,10 @@ var (
 	StoreErrors  = NewCounter("vigilante_store_errors_total", "Failed state store writes (fenced = leadership lost, error = queued for retry, dropped = queue full).", "reason")
 	StorePending = NewGauge("vigilante_store_pending_writes", "Writes queued while the state store is unreachable.")
 
+	ObserverDegraded     = NewGauge("vigilante_observer_degraded", "1 while this orchestrator's own measurements are unreliable (scheduling lag, loopback, timeouts across services).")
+	ObserverDegradations = NewCounter("vigilante_observer_degradations_total", "Times the observer became degraded, by first signal: scheduling lag, loopback, spread.", "signal")
+	ObserverHolds        = NewCounter("vigilante_observer_holds_total", "Rule breaches held instead of failing because the observer was degraded.")
+
 	SSHConnections = NewGauge("vigilante_ssh_connections", "Pooled SSH connections.")
 	SSHSessions    = NewGauge("vigilante_ssh_sessions", "Open SSH sessions (commands and streams).")
 	SSHDials       = NewCounter("vigilante_ssh_dials_total", "SSH connection attempts.", "result")
@@ -31,7 +35,7 @@ var (
 	APILatency  = NewHistogram("vigilante_api_request_seconds", "API request latency (excluding long-poll waits is up to the client).",
 		[]float64{.001, .005, .01, .05, .1, .5, 1, 5, 30, 120, 600}, "route")
 
-	ITSMCalls = NewCounter("vigilante_itsm_calls_total", "ServiceNow calls (incidents, work notes) by result.", "kind", "result")
+	ITSMCalls = NewCounter("vigilante_itsm_calls_total", "ServiceNow calls (incidents, work notes) by result: ok, error (after retries), retry (each repeated attempt).", "kind", "result")
 
 	AuditExported = NewCounter("vigilante_audit_exported_total", "Audit records sent to the SIEM.")
 	AuditDropped  = NewCounter("vigilante_audit_export_dropped_total", "Audit records not sent to the SIEM (queue full or send failure).")

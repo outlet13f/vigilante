@@ -4,7 +4,8 @@
 // Exit codes (watch / rollback):
 //
 //	0 PASS (phase promoted)   1 error   2 FAIL -> rolled back
-//	3 rollback failed / circuit open / approval needed   4 HOLD / inconclusive
+//	3 rollback failed / circuit open / approval needed / gate closed (freeze, change ticket)
+//	4 HOLD / inconclusive
 package main
 
 import (
@@ -49,9 +50,9 @@ Usage:
                      [--version V] [--previous P] [--id ID] [--baseline FILE] [--dry-run] [--server URL]
   vigilante mark-good -c FILE --service S --version V [--reason TEXT]
   vigilante rollback -c FILE (--id ID | --service S --version V --previous P [--targets a,b])
-                     [--executor NAME] [--approve] [--reason TEXT] [--dry-run]
+                     [--executor NAME] [--approve|--reject] [--reason TEXT] [--dry-run] [--break-glass REASON]
   vigilante status   -c FILE [--id ID]
-  vigilante circuit  -c FILE status|reset|trip [--reason TEXT] [--server URL]
+  vigilante circuit  -c FILE status|reset|trip [--reason TEXT] [--server URL] [--break-glass REASON]
   vigilante server   -c FILE [--dry-run]
   vigilante agent    -c FILE --target NAME --server URL
   vigilante doctor   -c FILE [--service S] [--previous P] [--json] [--junit FILE]
@@ -72,6 +73,9 @@ Usage:
 --id and --version default to the CI run (Jenkins, GitLab CI, GitHub Actions,
 VIGILANTE_DEPLOYMENT_ID / VIGILANTE_VERSION, or git describe); --previous defaults
 to the service's last successful deployment (see mark-good).
+
+With authentication configured (auth.local_cli), local approval decisions,
+circuit reset|trip and --freeze-override need --server or --break-glass REASON.
 
 Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=debug|info|warn
 `
@@ -130,7 +134,7 @@ func loadConfig(path string) (*config.Config, error) {
 type common struct {
 	fs                                  *flag.FlagSet
 	config, service, ver, prev, id, srv string
-	ticket                              string
+	ticket, breakGlass                  string
 	dryRun                              bool
 }
 
@@ -144,6 +148,7 @@ func newFlags(name string) *common {
 	c.fs.StringVar(&c.srv, "server", "", "delegate to a running orchestrator at URL")
 	c.fs.BoolVar(&c.dryRun, "dry-run", false, "log actions instead of executing them")
 	c.fs.StringVar(&c.ticket, "ticket", "", "change or incident ticket recorded in the audit trail")
+	c.fs.StringVar(&c.breakGlass, "break-glass", "", "reason for running a privileged command locally when auth.local_cli is restricted (audited and alerted)")
 	return c
 }
 
@@ -296,7 +301,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	if c.srv != "" {
-		return watchRemote(ctx, c, *phase)
+		return watchRemote(ctx, c, *phase, *override)
 	}
 	e, err := c.engine()
 	if err != nil {
@@ -357,21 +362,32 @@ func apiCall(ctx context.Context, server, method, path string, body any, out any
 	return nil
 }
 
-func watchRemote(ctx context.Context, c *common, phase string) (int, error) {
+// watchRemote registers the deployment on the server and polls it to a
+// verdict. --ticket and --freeze-override go with the request; a refusal by
+// a closed gate (circuit, freeze, change ticket) exits 3, as in local mode.
+func watchRemote(ctx context.Context, c *common, phase, override string) (int, error) {
 	autoFill(c, nil)
-	var d model.Deployment
-	err := apiCall(ctx, c.srv, http.MethodPost, "/v1/deployments", map[string]any{
+	body := map[string]any{
 		"id": c.id, "service": c.service, "version": c.ver, "previous_version": c.prev, "phase": phase,
-	}, &d)
-	if err != nil {
-		return 1, err
+	}
+	if override != "" {
+		body["freeze_override"] = override
+	}
+	var hdr http.Header
+	if c.ticket != "" {
+		body["change_ticket"] = c.ticket
+		hdr = http.Header{"X-Change-Ticket": {c.ticket}} // servers before change_ticket in v1 read the header
+	}
+	var d model.Deployment
+	if err := apiRequest(ctx, c.srv, http.MethodPost, "/v1/deployments", hdr, body, &d); err != nil {
+		return remoteExitCode(err), err
 	}
 	fmt.Fprintf(os.Stderr, "deployment %s: observing %s via %s\n", d.ID, phase, c.srv)
 	for {
 		select {
 		case <-ctx.Done():
 			return 1, ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(remotePoll):
 		}
 		var st struct {
 			Deployment model.Deployment `json:"deployment"`
@@ -427,6 +443,12 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 			return 1, errors.New("--approve and --reject are exclusive")
 		}
 		action := map[bool]string{true: "rollback.approve", false: "rollback.reject"}[*approve]
+		if err := localFourEyes(e, c, d); err != nil {
+			return 1, err
+		}
+		if err := localPrivileged(ctx, e, c, action, d); err != nil {
+			return 1, err
+		}
 		cliAudit(e, c, action, d.Service, d.ID, *reason)
 		_ = e.DecideRollback(ctx, d, cliActor(), *approve, *reason)
 		cp, _ := e.Deployment(d.ID)
@@ -438,6 +460,14 @@ func cmdRollback(ctx context.Context, args []string) (int, error) {
 	}
 	if err := requireRollbackTarget(d); err != nil {
 		return 1, err
+	}
+	if *approve {
+		if err := localFourEyes(e, c, d); err != nil {
+			return 1, err
+		}
+		if err := localPrivileged(ctx, e, c, "escalation.approve", d); err != nil {
+			return 1, err
+		}
 	}
 	opt := orchestrator.RollbackOptions{Reason: *reason, Manual: true, Approved: *approve, Executor: *exec, Actor: cliActor()}
 	if *targets != "" {
@@ -560,6 +590,11 @@ func cmdCircuit(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	defer e.Close()
+	if action == "reset" || action == "trip" {
+		if err := localPrivileged(ctx, e, c, "circuit."+action, nil); err != nil {
+			return 1, err
+		}
+	}
 	switch action {
 	case "status":
 	case "reset":
@@ -610,7 +645,9 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	}
 	role := "single node"
 	if e.Cfg.Server.HA.Enabled {
-		startHA(ctx, e, srv)
+		if _, err := startHA(ctx, e, srv); err != nil {
+			return 1, err
+		}
 		role = "HA node " + e.Cfg.Server.HA.AdvertiseURL
 	} else {
 		go func() {
@@ -668,6 +705,11 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 func createGated(e *orchestrator.Engine, c *common, override string) (*model.Deployment, int, error) {
 	var ticket *model.ChangeTicket
 	if c.id == "" || e.Live(c.id) == nil {
+		if override != "" && e.ActiveFreeze(c.service, time.Now()) != nil {
+			if err := localPrivileged(context.Background(), e, c, "freeze.override", nil); err != nil {
+				return nil, 3, err
+			}
+		}
 		if err := e.FreezeGate(c.service, override); err != nil {
 			return nil, 3, err
 		}

@@ -226,6 +226,65 @@ func TestStaticFilesAndTokenMode(t *testing.T) {
 	}
 }
 
+// HSTS goes on every console response when the console is reached over
+// HTTPS: server.tls, an https redirect_url (TLS proxy), or a TLS request.
+func TestHSTSOverHTTPS(t *testing.T) {
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	serve := func(t *testing.T, cfg *config.Config, tlsServer bool) (*http.Client, string) {
+		t.Helper()
+		c, err := New(context.Background(), cfg, func(context.Context, string) error { return nil }, quiet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mux := http.NewServeMux()
+		c.Register(mux)
+		var hs *httptest.Server
+		if tlsServer {
+			hs = httptest.NewTLSServer(mux)
+		} else {
+			hs = httptest.NewServer(mux)
+		}
+		t.Cleanup(hs.Close)
+		client := *hs.Client()
+		client.CheckRedirect = noRedirect.CheckRedirect
+		return &client, hs.URL
+	}
+	paths := []struct{ method, path string }{
+		{"GET", "/console/"}, {"GET", "/console/app.js"}, {"GET", "/console"}, {"GET", "/console/auth/mode"},
+		{"GET", "/console/auth/login"}, {"GET", "/console/auth/callback"}, {"POST", "/console/auth/logout"},
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		tls  bool
+		want string
+	}{
+		{"plain http", &config.Config{}, false, ""},
+		{"http redirect_url", &config.Config{Console: config.Console{RedirectURL: "http://vigilante.internal/console/auth/callback"}}, false, ""},
+		{"server.tls", &config.Config{Server: config.Server{TLS: &config.ServerTLS{CertFile: "c.pem", KeyFile: "k.pem"}}}, false, "max-age=31536000"},
+		{"https redirect_url", &config.Config{Console: config.Console{RedirectURL: "https://vigilante.example.internal/console/auth/callback"}}, false, "max-age=31536000"},
+		{"tls request", &config.Config{}, true, "max-age=31536000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, base := serve(t, tc.cfg, tc.tls)
+			for _, p := range paths {
+				req, _ := http.NewRequest(p.method, base+p.path, nil)
+				r, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.Body.Close()
+				if got := r.Header.Get("Strict-Transport-Security"); got != tc.want {
+					t.Errorf("%s %s: Strict-Transport-Security %q, want %q", p.method, p.path, got, tc.want)
+				}
+				if r.Header.Get("X-Content-Type-Options") != "nosniff" || r.Header.Get("Content-Security-Policy") == "" {
+					t.Errorf("%s %s: security headers missing: %v", p.method, p.path, r.Header)
+				}
+			}
+		})
+	}
+}
+
 func TestSessionKeyMustBeLongEnough(t *testing.T) {
 	t.Setenv("VGL_SHORT", "short")
 	_, err := New(context.Background(), &config.Config{Console: config.Console{SessionKeyRef: "env:VGL_SHORT"}}, nil, quiet)

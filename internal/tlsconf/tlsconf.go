@@ -1,5 +1,5 @@
-// Package tlsconf builds the TLS settings of the API server (server.tls) and
-// of the push agent (agent.tls). Certificates are re-read when their files
+// Package tlsconf builds the TLS settings of the API server (server.tls), of
+// the push agent (agent.tls) and of the SIEM exporter (audit.syslog.tls). Certificates are re-read when their files
 // change, so a renewed certificate (cert-manager, an internal CA's renewal
 // job) takes effect without a restart.
 package tlsconf
@@ -117,23 +117,63 @@ func Server(c *config.ServerTLS) (*tls.Config, error) {
 	return tc, nil
 }
 
+// HAClient returns the TLS config followers use to forward to the leader,
+// or nil to use the system defaults.
+func HAClient(c *config.HATLS) (*tls.Config, error) {
+	if c == nil {
+		return nil, nil
+	}
+	tc, err := Client(&config.AgentTLS{CAFile: c.CAFile, CertFile: c.CertFile, KeyFile: c.KeyFile})
+	if err != nil {
+		return nil, fmt.Errorf("server.ha.tls: %w", err)
+	}
+	tc.ServerName = c.ServerName
+	return tc, nil
+}
+
 // Client returns the agent's TLS config, or nil to use the system defaults.
 func Client(c *config.AgentTLS) (*tls.Config, error) {
 	if c == nil {
 		return nil, nil
 	}
+	return clientConfig("agent.tls", c.CAFile, c.CertFile, c.KeyFile)
+}
+
+// Syslog returns the TLS config of the SIEM exporter (audit.syslog with a
+// tls:// address). host is the address host, the default server name.
+func Syslog(c *config.SyslogTLS, host string) (*tls.Config, error) {
+	if c == nil {
+		c = &config.SyslogTLS{}
+	}
+	tc, err := clientConfig("audit.syslog.tls", c.CAFile, c.CertFile, c.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+	tc.ServerName = host
+	if c.ServerName != "" {
+		tc.ServerName = c.ServerName
+	}
+	if c.MinVersion == "1.3" {
+		tc.MinVersion = tls.VersionTLS13
+	}
+	return tc, nil
+}
+
+// clientConfig: a private CA (empty = system roots) and an optional client
+// certificate, re-read when renewed.
+func clientConfig(where, caFile, certFile, keyFile string) (*tls.Config, error) {
 	tc := &tls.Config{MinVersion: tls.VersionTLS12}
-	if c.CAFile != "" {
-		p, err := pool(c.CAFile)
+	if caFile != "" {
+		p, err := pool(caFile)
 		if err != nil {
-			return nil, fmt.Errorf("agent.tls.ca_file: %w", err)
+			return nil, fmt.Errorf("%s.ca_file: %w", where, err)
 		}
 		tc.RootCAs = p
 	}
-	if c.CertFile != "" {
-		kp, err := newKeyPair(c.CertFile, c.KeyFile)
+	if certFile != "" {
+		kp, err := newKeyPair(certFile, keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("agent.tls: %w", err)
+			return nil, fmt.Errorf("%s: %w", where, err)
 		}
 		tc.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return kp.get() }
 	}

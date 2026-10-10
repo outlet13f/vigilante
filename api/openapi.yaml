@@ -1258,7 +1258,18 @@ paths:
     get: {tags: [v1], operationId: v1Audit, summary: Query the audit trail (JSON or CSV), responses: {'200': {description: OK}}}
   /v1/deployments:
     get: {tags: [v1], operationId: v1ListDeployments, summary: List deployments, responses: {'200': {description: OK}}}
-    post: {tags: [v1], operationId: v1CreateDeployment, summary: Create a deployment (optionally start a phase), responses: {'201': {description: Created}}}
+    post:
+      tags: [v1]
+      operationId: v1CreateDeployment
+      summary: Create a deployment (optionally start a phase)
+      description: |
+        JSON body: id, service, version, previous_version, prepare, phase, and
+        (as in v2) change_ticket and freeze_override (admins only). The
+        X-Change-Ticket header still works. A closed gate answers 409 (503 for
+        itsm_unavailable) with `{"error": "...", "code": "change_frozen"}`,
+        the code being one of circuit_open, change_frozen,
+        change_ticket_invalid, itsm_unavailable.
+      responses: {'201': {description: Created}}
   /v1/deployments/{id}:
     parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     get: {tags: [v1], operationId: v1GetDeployment, summary: Get a deployment with its exit code, responses: {'200': {description: OK}}}
@@ -2001,7 +2012,9 @@ components:
             Deployment events: deployment_id, service, version, previous_version,
             phase, state, verdict, reason, exit_code, targets, breaches.
             Circuit events: state, reason. approval.decided: deployment_id,
-            approved_by, comment. agent.lost: target, last_seen, services.
+            service, kind (rollback | escalation), decision (approved |
+            rejected), decided_by, comment. agent.lost: target, last_seen,
+            services.
     Webhook:
       type: object
       required: [id, url, types, services, teams, active, cursor, consecutive_failures, dead_letters, created_at, updated_at]

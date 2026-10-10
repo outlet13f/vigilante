@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -32,6 +33,31 @@ func TestMain(m *testing.M) {
 type backend struct {
 	st     store.Store
 	tamper func(t *testing.T, pos int64, how string) // how: "edit" | "delete"
+	put    func(t *testing.T, pos int64, e journal.Entry)
+}
+
+// recompute is an attacker with write access to the store but not the chain
+// key: it changes entries and then recomputes every hash so the unkeyed
+// chain verifies again. MACs stay as fn leaves them.
+func (b backend) recompute(t *testing.T, fn func(i int, e *journal.Entry)) {
+	t.Helper()
+	var pos []int64
+	var all []journal.Entry
+	b.st.Scan(context.Background(), func(p int64, e journal.Entry) error {
+		pos, all = append(pos, p), append(all, e)
+		return nil
+	})
+	prev := ""
+	for i := range all {
+		fn(i, &all[i])
+		if all[i].Kind == journal.KindAnchor {
+			prev = all[i].Hash
+		} else if all[i].Hash != "" {
+			all[i].Chain(prev)
+			prev = all[i].Hash
+		}
+		b.put(t, pos[i], all[i])
+	}
 }
 
 func backends(t *testing.T) map[string]func(t *testing.T) backend {
@@ -54,6 +80,12 @@ func backends(t *testing.T) map[string]func(t *testing.T) backend {
 					lines = append(lines[:i], lines[i+1:]...)
 				}
 				os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+			}, put: func(t *testing.T, pos int64, e journal.Entry) {
+				b, _ := os.ReadFile(path)
+				lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+				line, _ := json.Marshal(e)
+				lines[pos-1] = string(line)
+				os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 			}}
 		},
 		"postgres": func(t *testing.T) backend {
@@ -74,6 +106,16 @@ func backends(t *testing.T) map[string]func(t *testing.T) backend {
 					q = `DELETE FROM vigilante_events WHERE seq = $1`
 				}
 				if _, err := c.Exec(context.Background(), q, pos); err != nil {
+					t.Fatal(err)
+				}
+			}, put: func(t *testing.T, pos int64, e journal.Entry) {
+				c, err := pgx.Connect(context.Background(), dsn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close(context.Background())
+				body, _ := json.Marshal(e)
+				if _, err := c.Exec(context.Background(), `UPDATE vigilante_events SET body = $2 WHERE seq = $1`, pos, body); err != nil {
 					t.Fatal(err)
 				}
 			}}
@@ -104,13 +146,13 @@ func TestChainDetectsTampering(t *testing.T) {
 			t.Run(name+"/"+how, func(t *testing.T) {
 				b := open(t)
 				seed(t, b.st, 5, time.Now())
-				r, err := Verify(context.Background(), b.st)
+				r, err := Verify(context.Background(), b.st, nil)
 				if err != nil || !r.OK || r.Checked != 5 {
 					t.Fatalf("intact chain: %+v %v", r, err)
 				}
 				pos := positions(t, b.st)
 				b.tamper(t, pos[2], how)
-				r, err = Verify(context.Background(), b.st)
+				r, err = Verify(context.Background(), b.st, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -148,10 +190,10 @@ func TestPruneArchivesAndKeepsState(t *testing.T) {
 			if err != nil || n != 5 {
 				t.Fatalf("pruned %d: %v", n, err)
 			}
-			if r, err := VerifyReader(&archive); err != nil || !r.OK || r.Checked != 5 {
+			if r, err := VerifyReader(&archive, nil); err != nil || !r.OK || r.Checked != 5 {
 				t.Fatalf("archive must verify on its own: %+v %v", r, err)
 			}
-			if r, err := Verify(ctx, b.st); err != nil || !r.OK || r.Checked != 3 {
+			if r, err := Verify(ctx, b.st, nil); err != nil || !r.OK || r.Checked != 3 {
 				t.Fatalf("chain after prune: %+v %v", r, err)
 			}
 			st, err := b.st.Load(ctx)
@@ -168,7 +210,7 @@ func TestPruneArchivesAndKeepsState(t *testing.T) {
 				t.Error("circuit state lost by pruning")
 			}
 			seed(t, b.st, 1, time.Now()) // appends keep chaining after the anchor
-			if r, _ := Verify(ctx, b.st); !r.OK || r.Checked != 4 {
+			if r, _ := Verify(ctx, b.st, nil); !r.OK || r.Checked != 4 {
 				t.Fatalf("append after prune: %+v", r)
 			}
 		})
@@ -184,7 +226,7 @@ func TestLegacyEntriesBeforeChain(t *testing.T) {
 	}
 	defer st.Close()
 	seed(t, st, 2, time.Now())
-	r, err := Verify(context.Background(), st)
+	r, err := Verify(context.Background(), st, nil)
 	if err != nil || !r.OK || r.Legacy != 1 || r.Checked != 2 {
 		t.Fatalf("%+v %v", r, err)
 	}

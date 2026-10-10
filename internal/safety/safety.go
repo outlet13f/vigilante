@@ -177,7 +177,19 @@ type Guard struct {
 	// TTL bounds how long a crashed holder blocks the service; the lease is
 	// renewed every TTL/3 while held, so long rollbacks keep it.
 	TTL time.Duration
-	Now func() time.Time
+	// LeaseWait is how long Acquire keeps retrying a state store it cannot
+	// reach before giving up on the lease.
+	LeaseWait time.Duration
+	// ProceedUnleased lets the rollback go ahead under the in-process lock
+	// alone once LeaseWait has passed: a bad release keeps hurting users while
+	// the store is down, and rollback steps are idempotent. Unleased (when set)
+	// is told, so the decision is visible. False refuses the rollback instead.
+	ProceedUnleased bool
+	Unleased        func(service string, err error)
+	// Conflict is called when the store comes back during an unleased
+	// rollback and another process already holds the service lease.
+	Conflict func(service, holder string)
+	Now      func() time.Time
 }
 
 func NewGuard(cfg config.Flapping, history map[string][]time.Time) *Guard {
@@ -189,54 +201,99 @@ func NewGuard(cfg config.Flapping, history map[string][]time.Time) *Guard {
 		Owner: fmt.Sprintf("%s/%d", host, os.Getpid()), TTL: 2 * time.Minute, Now: time.Now}
 }
 
+// Acquire takes the service's rollback lock. ErrLocked means another rollback
+// holds it here or in another process; a store that stays unreachable for
+// LeaseWait either fails the call or, with ProceedUnleased, hands back a lock
+// that keeps trying to take the lease in the background.
 func (g *Guard) Acquire(service string) (release func(), err error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if g.locks[service] {
+		g.mu.Unlock()
 		return nil, ErrLocked
 	}
-	var stopRenew func()
-	if g.Leases != nil {
-		key := "service:" + service
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		ok, err := g.Leases.TryLease(ctx, key, g.Owner, g.TTL)
-		if err == nil && !ok {
-			holder, _ := g.Leases.LeaseHolder(ctx, key)
-			err = fmt.Errorf("%w (held by %s)", ErrLocked, holder)
-		}
-		cancel()
-		if err != nil {
-			return nil, err
-		}
-		stopRenew = g.renew(key)
-	}
 	g.locks[service] = true
-	return func() {
+	g.mu.Unlock()
+	unlock := func() {
 		g.mu.Lock()
 		delete(g.locks, service)
 		g.mu.Unlock()
-		if stopRenew != nil {
-			stopRenew()
-		}
+	}
+	if g.Leases == nil {
+		return unlock, nil
+	}
+	key := "service:" + service
+	held, err := g.tryLease(key)
+	switch {
+	case err == nil && !held:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		holder, _ := g.Leases.LeaseHolder(ctx, key)
+		cancel()
+		unlock()
+		return nil, fmt.Errorf("%w (held by %s)", ErrLocked, holder)
+	case err != nil && !g.ProceedUnleased:
+		unlock()
+		return nil, fmt.Errorf("%w: %v", ErrLeaseUnavailable, err)
+	case err != nil && g.Unleased != nil:
+		g.Unleased(service, err)
+	}
+	stopRenew := g.renew(service, key, held)
+	return func() {
+		unlock()
+		stopRenew()
 	}, nil
 }
 
+// ErrLeaseUnavailable means the state store could not be reached to take the
+// cross-process rollback lock.
+var ErrLeaseUnavailable = errors.New("state store unreachable: cannot take the service rollback lease")
+
+// tryLease retries store errors with backoff for up to LeaseWait. A definite
+// answer (taken or held elsewhere) returns at once.
+func (g *Guard) tryLease(key string) (bool, error) {
+	deadline := time.Now().Add(g.LeaseWait)
+	backoff := 250 * time.Millisecond
+	for {
+		attempt := min(5*time.Second, max(time.Until(deadline), time.Second))
+		ctx, cancel := context.WithTimeout(context.Background(), attempt)
+		ok, err := g.Leases.TryLease(ctx, key, g.Owner, g.TTL)
+		cancel()
+		if err == nil || time.Until(deadline) <= 0 {
+			return ok, err
+		}
+		time.Sleep(min(backoff, max(time.Until(deadline), 0)))
+		backoff = min(backoff*2, 2*time.Second)
+	}
+}
+
 // renew keeps a held lease alive until the returned stop function runs, then
-// releases it.
-func (g *Guard) renew(key string) func() {
+// releases it. Without the lease (store down at Acquire) it keeps trying to
+// take it, and reports a conflict if another process got there first.
+func (g *Guard) renew(service, key string, held bool) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	interval := g.TTL / 3
+	if !held {
+		interval = min(interval, 5*time.Second)
+	}
 	go func() {
 		defer close(done)
-		t := time.NewTicker(g.TTL / 3)
+		t := time.NewTicker(interval)
 		defer t.Stop()
+		conflict := false
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, _ = g.Leases.TryLease(rctx, key, g.Owner, g.TTL)
+				rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+				ok, err := g.Leases.TryLease(rctx, key, g.Owner, g.TTL)
+				if err == nil && !ok && !conflict {
+					conflict = true
+					if g.Conflict != nil {
+						holder, _ := g.Leases.LeaseHolder(rctx, key)
+						g.Conflict(service, holder)
+					}
+				}
 				rcancel()
 			}
 		}

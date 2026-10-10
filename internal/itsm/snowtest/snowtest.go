@@ -21,6 +21,34 @@ type Fake struct {
 	Incidents []map[string]any
 	WorkNotes map[string][]string // sys_id -> notes
 	Down      bool                // answer 503 to everything
+	// failIncident answers 503 to that many incident requests;
+	// lostCreates stores that many incidents but answers 504, like a
+	// create whose response never arrived.
+	failIncident, lostCreates int
+	incidentReqs              int
+}
+
+// IncidentRequests counts incident requests (searches and creates).
+func (f *Fake) IncidentRequests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.incidentReqs
+}
+
+// FailIncidents makes the next n incident requests (search or create) fail
+// with 503.
+func (f *Fake) FailIncidents(n int) {
+	f.mu.Lock()
+	f.failIncident = n
+	f.mu.Unlock()
+}
+
+// LoseCreates makes the next n incident creates succeed in ServiceNow but
+// answer 504 to the caller.
+func (f *Fake) LoseCreates(n int) {
+	f.mu.Lock()
+	f.lostCreates = n
+	f.mu.Unlock()
 }
 
 func New(t testing.TB) *Fake {
@@ -66,6 +94,10 @@ func reply(w http.ResponseWriter, code int, v any) {
 func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	incident := r.URL.Path == "/api/now/table/incident"
+	if incident {
+		f.incidentReqs++
+	}
 	if f.Down {
 		reply(w, 503, map[string]any{"error": map[string]string{"message": "maintenance"}})
 		return
@@ -73,6 +105,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 	if u, p, ok := r.BasicAuth(); !ok || u != "vigilante" || p != "snow-pass" {
 		reply(w, 401, map[string]any{"error": map[string]string{"message": "User Not Authenticated"}})
 		return
+	}
+	if incident {
+		if f.failIncident > 0 {
+			f.failIncident--
+			reply(w, 503, map[string]any{"error": map[string]string{"message": "instance busy"}})
+			return
+		}
 	}
 	q := r.URL.Query().Get("sysparm_query")
 	switch {
@@ -103,6 +142,11 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		body["number"] = fmt.Sprintf("INC%07d", len(f.Incidents)+1)
 		f.Incidents = append(f.Incidents, body)
+		if f.lostCreates > 0 {
+			f.lostCreates--
+			reply(w, 504, map[string]any{"error": map[string]string{"message": "gateway timeout"}})
+			return
+		}
 		reply(w, 201, map[string]any{"result": map[string]any{"number": body["number"]}})
 	default:
 		reply(w, 404, map[string]any{"error": map[string]string{"message": "no route " + r.URL.Path}})

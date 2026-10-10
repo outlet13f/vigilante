@@ -2,11 +2,14 @@ package audit
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,14 +19,19 @@ import (
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/telemetry"
+	"vigilante/internal/tlsconf"
 )
 
 // Exporter ships audit-relevant journal entries to a SIEM over syslog
 // (RFC 5424 with a JSON message, or CEF). Sending never blocks the engine: a
 // full queue drops entries and counts them; the journal stays the record of
 // truth and `vigilante audit export` can backfill.
+//
+// udp and tcp send one message per line; tls (RFC 5425) sends octet-counted
+// frames, "LEN SP MSG", over a verified TLS connection.
 type Exporter struct {
 	network, addr string
+	tls           *tls.Config // network "tls"
 	format        string
 	host          string
 	log           *slog.Logger
@@ -35,19 +43,52 @@ type Exporter struct {
 	lastState map[string]model.State // deployment -> last exported state
 }
 
-// NewExporter parses address "tcp://host:port" or "udp://host:port".
+// NewExporter parses address "tcp://host:port", "udp://host:port" or
+// "tls://host[:port]" (default port 6514).
 func NewExporter(cfg config.SyslogExport, log *slog.Logger) (*Exporter, error) {
 	network, addr, ok := strings.Cut(cfg.Address, "://")
-	if !ok || (network != "tcp" && network != "udp") || addr == "" {
-		return nil, fmt.Errorf("audit.syslog.address must be tcp://host:port or udp://host:port, got %q", cfg.Address)
+	if !ok || (network != "tcp" && network != "udp" && network != "tls") || addr == "" {
+		return nil, fmt.Errorf("audit.syslog.address must be tcp://host:port, udp://host:port or tls://host[:port], got %q", cfg.Address)
 	}
 	format := cfg.Format
 	if format == "" {
 		format = "rfc5424"
 	}
-	host, _ := os.Hostname()
-	return &Exporter{network: network, addr: addr, format: format, host: host, log: log,
-		ch: make(chan journal.Entry, 10000), lastState: map[string]model.State{}}, nil
+	x := &Exporter{network: network, addr: addr, format: format, log: log,
+		ch: make(chan journal.Entry, 10000), lastState: map[string]model.State{}}
+	if network == "tls" {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			x.addr = net.JoinHostPort(strings.Trim(addr, "[]"), "6514")
+		}
+		host, _, _ := net.SplitHostPort(x.addr)
+		tc, err := tlsconf.Syslog(cfg.TLS, host)
+		if err != nil {
+			return nil, err
+		}
+		x.tls = tc
+	} else if cfg.TLS != nil {
+		return nil, errors.New("audit.syslog.tls needs a tls:// address")
+	}
+	x.host, _ = os.Hostname()
+	return x, nil
+}
+
+// dial connects to the collector; tls includes the handshake in the timeout.
+func (x *Exporter) dial(ctx context.Context) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	if x.tls != nil {
+		td := tls.Dialer{NetDialer: &d, Config: x.tls}
+		return td.DialContext(ctx, "tcp", x.addr)
+	}
+	return d.DialContext(ctx, x.network, x.addr)
+}
+
+// frame wraps one message for the transport.
+func (x *Exporter) frame(msg string) []byte {
+	if x.tls != nil {
+		return []byte(strconv.Itoa(len(msg)) + " " + msg) // RFC 5425 octet counting
+	}
+	return []byte(msg + "\n")
 }
 
 // Send queues an entry if it is audit-relevant.
@@ -96,8 +137,7 @@ func (x *Exporter) Run(ctx context.Context) {
 		for attempt := 0; ; attempt++ {
 			if conn == nil {
 				var err error
-				d := net.Dialer{Timeout: 5 * time.Second}
-				if conn, err = d.DialContext(ctx, x.network, x.addr); err != nil {
+				if conn, err = x.dial(ctx); err != nil {
 					conn = nil
 					x.log.Warn("SIEM unreachable; audit entries queue up", "addr", x.addr, "err", err, "queued", len(x.ch))
 					select {
@@ -111,7 +151,7 @@ func (x *Exporter) Run(ctx context.Context) {
 				backoff = time.Second
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if _, err := conn.Write([]byte(line + "\n")); err != nil {
+			if _, err := conn.Write(x.frame(line)); err != nil {
 				conn.Close()
 				conn = nil
 				if attempt < 1 {

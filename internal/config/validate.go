@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -43,6 +44,17 @@ func (c *Config) applyDefaults() {
 		}
 		if sn.Incidents.Impact == 0 {
 			sn.Incidents.Impact = 2
+		}
+	}
+	if sl := c.Audit.Syslog; sl != nil {
+		if sl.Format == "" {
+			sl.Format = "rfc5424"
+		}
+		// RFC 5425 assigns 6514 to syslog over TLS.
+		if hp, ok := strings.CutPrefix(sl.Address, "tls://"); ok && hp != "" {
+			if _, _, err := net.SplitHostPort(hp); err != nil {
+				sl.Address = "tls://" + net.JoinHostPort(strings.Trim(hp, "[]"), "6514")
+			}
 		}
 	}
 	if c.Server.Listen == "" {
@@ -285,6 +297,28 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Safety.Flapping.MaxRollbacksPerHour == 0 {
 		c.Safety.Flapping.MaxRollbacksPerHour = 3
+	}
+	if c.Safety.RollbackLease.Wait == 0 {
+		c.Safety.RollbackLease.Wait = 10 * time.Second
+	}
+	if c.Safety.RollbackLease.OnUnavailable == "" {
+		c.Safety.RollbackLease.OnUnavailable = "proceed"
+	}
+	og := &c.Safety.ObserverGuard
+	if og.MaxLag == 0 {
+		og.MaxLag = time.Second
+	}
+	if og.LoopbackTimeout == 0 {
+		og.LoopbackTimeout = time.Second
+	}
+	if og.TimeoutShare == 0 {
+		og.TimeoutShare = 0.5
+	}
+	if og.MinServices == 0 {
+		og.MinServices = 3
+	}
+	if og.Grace == 0 {
+		og.Grace = time.Minute
 	}
 }
 
@@ -728,6 +762,18 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	switch c.Auth.LocalCLI {
+	case "", "auto", "full", "restricted":
+	default:
+		bad("auth.local_cli must be auto|full|restricted, got %q", c.Auth.LocalCLI)
+	}
+	if ou := c.Safety.RollbackLease.OnUnavailable; ou != "proceed" && ou != "fail" {
+		bad("safety.rollback_lease.on_unavailable must be proceed|fail, got %q", ou)
+	}
+	if og := c.Safety.ObserverGuard; og.TimeoutShare <= 0 || og.TimeoutShare > 1 || og.MinServices < 1 || og.Grace < 0 {
+		bad("safety.observer_guard: timeout_share must be in (0,1], min_services >= 1, grace >= 0")
+	}
+
 	switch st := c.Server.State; st.Backend {
 	case "file":
 	case "postgres":
@@ -806,11 +852,25 @@ func (c *Config) Validate() error {
 		}
 	}
 	if sl := c.Audit.Syslog; sl != nil {
-		if n, a, ok := strings.Cut(sl.Address, "://"); !ok || (n != "tcp" && n != "udp") || a == "" {
-			bad("audit.syslog.address must be tcp://host:port or udp://host:port")
+		n, a, ok := strings.Cut(sl.Address, "://")
+		if !ok || (n != "tcp" && n != "udp" && n != "tls") || a == "" {
+			bad("audit.syslog.address must be tcp://host:port, udp://host:port or tls://host[:port]")
+		} else if host, _, err := net.SplitHostPort(a); n == "tls" && (err != nil || host == "") {
+			bad("audit.syslog.address: tls needs a collector host name (tls://siem.example.internal:6514)")
 		}
 		if sl.Format != "" && sl.Format != "rfc5424" && sl.Format != "cef" {
 			bad("audit.syslog.format must be rfc5424 or cef")
+		}
+		if t := sl.TLS; t != nil {
+			if n != "tls" {
+				bad("audit.syslog.tls is only used with a tls:// address")
+			}
+			if (t.CertFile == "") != (t.KeyFile == "") {
+				bad("audit.syslog.tls: cert_file and key_file go together")
+			}
+			if t.MinVersion != "" && t.MinVersion != "1.2" && t.MinVersion != "1.3" {
+				bad("audit.syslog.tls.min_version must be 1.2 or 1.3")
+			}
 		}
 	}
 	if c.Agent.Failsafe != "hold" && c.Agent.Failsafe != "rollback" {
@@ -1024,6 +1084,7 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 		}
 	}
 	check("server.state.dsn_ref", c.Server.State.DSNRef)
+	check("audit.chain_key_ref", c.Audit.ChainKeyRef)
 	check("api.webhook_signing_key_ref", c.API.WebhookSigningKeyRef)
 	check("console.session_key_ref", c.Console.SessionKeyRef)
 	check("console.client_secret_ref", c.Console.ClientSecretRef)

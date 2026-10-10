@@ -29,7 +29,7 @@
 
 - 상태는 저널에 영속화되어 **프로세스 재시작·CI 잡 간에 유지**됩니다 (테스트: `TestRollbackFailureIsolatesAndOpensCircuit`).
 - 킬 스위치: `vigilante circuit trip --reason "변경 동결"` 또는 `POST /v1/circuit/trip` — 변경 동결 기간이나 대형 장애 대응 중 자동화를 즉시 멈춥니다.
-- 리셋: `vigilante circuit reset` / `POST /v1/circuit/reset` (API 토큰 필요). 원인 조사 후에만.
+- 리셋: `vigilante circuit reset --server URL` / `POST /v1/circuit/reset` (admin 토큰 필요). 원인 조사 후에만. 인증을 켠 환경에서 서버 없이 로컬로 리셋·차단하려면 `--break-glass "이유"`가 필요하고 감사·알림이 남습니다(`auth.local_cli`).
 
 ## 2. 롤백 실패 시나리오별 대응
 
@@ -47,8 +47,10 @@
 | S10 | 롤백 → 재배포 → 롤백 반복 (이전 버전도 불량, 또는 오탐) | 서비스별 롤백 이력 | `max_rollbacks_per_hour` 초과 또는 `cooldown` 이내면 자동 롤백 **차단** → 실패 대상만 격리 → 사람에게 | ROLLBACK_FAILED("flapping guard") |
 | S11 | 같은 서비스에 동시 롤백 (CI 잡 2개, 서버+CLI) | 프로세스 내 락 + 저널 디렉토리의 **락 파일**(O_EXCL, 30분 stale 회수) | 두 번째 요청은 즉시 거부 | — |
 | S12 | 오케스트레이터가 롤백 도중 사망 또는 DB에서 끊김 | 단일 노드: 재시작 시 저널 재생. HA: 리더 리스 만료 | 완료된 단계(`rollback.step`)는 건너뛰고 나머지 수행. 모든 단계 멱등. HA에서는 다른 노드가 리더가 되어 이어받고, 물러난 노드의 기록은 DB가 거부(펜싱) | 테스트: `TestResumeSkipsCompletedSteps`, `TestHAFailoverFinishesInterruptedRollback` |
+| S12a | 롤백 시작 시점에 상태 저장소(PostgreSQL) 장애 | 서비스 lease 획득 오류 | `rollback_lease.wait`(10s) 동안 재시도 후, 기본(`proceed`)은 프로세스 안 잠금만으로 롤백 진행 + 이벤트·감사·경고 알림. 기록은 대기열에 쌓였다가 복구 시 순서대로 기록. 복구 후 다른 프로세스가 lease를 잡고 있으면 `lease.conflict` 알림. `fail`이면 롤백하지 않음 | 테스트: `TestChaosStoreOutageDuringRollback`, `TestChaosStoreOutageLeaseFailMode` |
 | S13 | 오케스트레이터가 카나리 관측 중 사망 / 네트워크 분단 | 에이전트 하트비트 실패 `failsafe_after` | 에이전트가 **로컬 규칙 평가**. `failsafe: rollback`이면 자기 호스트만 롤백(트래픽 단계 제외), `hold`면 기록·알림만 | 테스트: `TestAgentPushesAndFailsafeRollsBack` |
 | S14 | 관측자 실명 (오케스트레이터→대상 SSH만 불가, 서비스는 정상) | 중앙=위반, 에이전트=정상 | **HOLD** — 롤백하지 않음 (`observer_quorum`) | 네트워크 점검 |
+| S14a | 관측 장치 과부하 (오케스트레이터 CPU 부족, 소켓 고갈, 관측 쪽 네트워크 장애) — 대상은 정상 | 내부 타이머 지연 > `max_lag`, 루프백 왕복 > `loopback_timeout`, 또는 3개 이상 서비스에 걸친 대상 절반 이상의 프로브 시간 초과 | 프로브 실패 지표 기반 위반을 **HOLD** — 회복 후 `grace`(1m)까지 유지. 로그·액세스 로그 위반은 그대로 판정 (`observer_guard`) | 서버 자원·네트워크 점검. `vigilante_observer_degraded` 지표. 테스트: `TestChaosObserverDegradedHolds` |
 | S15 | 공유 의존성 장애 (DB 다운) — 신·구 버전 모두 에러 | 대조군도 같은 규칙 위반 | **HOLD** (Environmental) — 롤백해도 복구되지 않으므로 하지 않음 | 의존성 복구 |
 | S16 | 프로브 전체 침묵 (수집 불가) | 샘플 수 < `min_samples`, 전부 Unknown | PASS 금지 → INCONCLUSIVE → `on_inconclusive` 정책 | 기본 hold (exit 4) |
 | S17 | 설정 오류(오타, 없는 실행기, 롤백 규칙 없는 서비스) 또는 환경 문제(sudo 비밀번호 요구, 이전 릴리스 삭제, LB 풀에 없는 대상, 로그 형식 불일치) | `validate`(엄격 디코딩·교차 참조) + `doctor`(읽기 전용 사전 점검, JUnit 리포트) | 파이프라인 첫 단계에서 실패하고 조치 방법 출력 | 롤백 순간에 발견되지 않도록 CI에서 강제 |

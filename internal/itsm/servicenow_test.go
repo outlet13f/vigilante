@@ -72,3 +72,112 @@ func TestIncidentsAreDeduplicatedAndNotesWritten(t *testing.T) {
 		t.Fatalf("work notes: %v", wn)
 	}
 }
+
+func fastRetries(s *ServiceNow) {
+	s.Backoff = []time.Duration{time.Millisecond, 2 * time.Millisecond, 4 * time.Millisecond}
+}
+
+func TestIncidentRetriedUntilServiceNowRecovers(t *testing.T) {
+	if len(DefaultBackoff) != 3 || DefaultBackoff[0] != time.Second || DefaultBackoff[2] != 4*time.Second {
+		t.Fatalf("default backoff: %v", DefaultBackoff)
+	}
+	f := snowtest.New(t)
+	s := client(t, f)
+	fastRetries(s)
+	f.FailIncidents(2) // the search fails twice, then all is well
+	var number string
+	var created bool
+	attempts, err := s.Retry(context.Background(), func(ctx context.Context) (err error) {
+		number, created, err = s.EnsureIncident(ctx, "vigilante:d1:rollback_failed", "rollback failed", "details")
+		return err
+	})
+	if err != nil || attempts != 3 || !created || number != "INC0000001" {
+		t.Fatalf("attempts %d, %s %v %v", attempts, number, created, err)
+	}
+	if inc, _ := f.Snapshot(); len(inc) != 1 || inc[0]["correlation_id"] != "vigilante:d1:rollback_failed" {
+		t.Fatalf("incidents: %v", inc)
+	}
+}
+
+// A create that reached ServiceNow but whose answer was lost is found by its
+// correlation_id on the retry, not created twice.
+func TestRetryAfterLostCreateDoesNotDuplicate(t *testing.T) {
+	f := snowtest.New(t)
+	s := client(t, f)
+	fastRetries(s)
+	f.LoseCreates(1)
+	var number string
+	var created bool
+	attempts, err := s.Retry(context.Background(), func(ctx context.Context) (err error) {
+		number, created, err = s.EnsureIncident(ctx, "vigilante:circuit:7", "circuit open", "details")
+		return err
+	})
+	if err != nil || attempts != 2 || created || number != "INC0000001" {
+		t.Fatalf("attempts %d, %s %v %v", attempts, number, created, err)
+	}
+	if inc, _ := f.Snapshot(); len(inc) != 1 {
+		t.Fatalf("duplicate incidents: %v", inc)
+	}
+}
+
+func TestRetryIsBounded(t *testing.T) {
+	f := snowtest.New(t)
+	s := client(t, f)
+	fastRetries(s)
+	f.SetDown(true)
+	attempts, err := s.Retry(context.Background(), func(ctx context.Context) error {
+		_, _, err := s.EnsureIncident(ctx, "c", "s", "d")
+		return err
+	})
+	var se *StatusError
+	if attempts != 4 || !errors.As(err, &se) || se.Code != 503 {
+		t.Fatalf("down: %d attempts, %v", attempts, err)
+	}
+
+	// A 4xx will not get better: no retry.
+	f.SetDown(false)
+	t.Setenv("VGL_SNOW_BAD", "wrong")
+	bad := NewServiceNow(s.Config(), map[string]config.Credential{"snow": {Type: "basic", User: "vigilante", PasswordRef: "env:VGL_SNOW_BAD"}})
+	fastRetries(bad)
+	before := f.IncidentRequests()
+	if attempts, err := bad.Retry(context.Background(), func(ctx context.Context) error {
+		_, _, err := bad.EnsureIncident(ctx, "c", "s", "d")
+		return err
+	}); attempts != 1 || !errors.As(err, &se) || se.Code != 401 || f.IncidentRequests() != before+1 {
+		t.Fatalf("401: %d attempts, %v", attempts, err)
+	}
+
+	// The context ends the wait between attempts.
+	f.SetDown(true)
+	s.Backoff = []time.Duration{time.Hour}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	attempts, err = s.Retry(ctx, func(ctx context.Context) error {
+		_, _, err := s.EnsureIncident(ctx, "c", "s", "d")
+		return err
+	})
+	if attempts != 1 || !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Fatalf("cancelled: %d attempts, %v after %s", attempts, err, time.Since(start))
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&StatusError{Code: 503}, true},
+		{&StatusError{Code: 500}, true},
+		{&StatusError{Code: 429}, true},
+		{&StatusError{Code: 400}, false},
+		{&StatusError{Code: 403}, false},
+		{errors.New("servicenow: dial tcp 10.0.0.1:443: connect: connection refused"), true},
+		{&ErrInvalidChange{Reason: "change CHG1 does not exist"}, false},
+		{nil, false},
+	} {
+		if got := Retryable(tc.err); got != tc.want {
+			t.Errorf("Retryable(%v) = %v", tc.err, got)
+		}
+	}
+}

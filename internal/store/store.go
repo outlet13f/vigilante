@@ -50,17 +50,21 @@ type Store interface {
 	// Fence makes Append fail with ErrFenced unless owner holds key.
 	// An empty key turns fencing off.
 	Fence(key, owner string)
+	// SetChainKey makes Append add each entry's MAC (journal.Entry.MAC,
+	// audit.chain_key_ref). nil turns it off.
+	SetChainKey(key []byte)
 	// Ping checks the backend is reachable (readiness).
 	Ping(ctx context.Context) error
 	Describe() string
 	Close() error
 }
 
-// anchorFor builds the anchor that replaces a pruned prefix.
+// anchorFor builds the anchor that replaces a pruned prefix. It carries the
+// last pruned entry's hash and MAC (the MAC is of that hash, so it holds).
 func anchorFor(pruned []journal.Entry, before time.Time) journal.Entry {
 	last := pruned[len(pruned)-1]
 	return journal.Entry{
-		Kind: journal.KindAnchor, Time: time.Now(), Hash: last.Hash, Actor: "system", Source: "cli", Action: "audit.prune",
+		Kind: journal.KindAnchor, Time: time.Now(), Hash: last.Hash, MAC: last.MAC, Actor: "system", Source: "cli", Action: "audit.prune",
 		Message:   fmt.Sprintf("pruned %d entries older than %s; chain continues from %s", len(pruned), before.Format(time.RFC3339), last.Hash),
 		Compacted: journal.Compact(pruned, before),
 	}
@@ -76,20 +80,54 @@ func writeArchive(w io.Writer, entries []journal.Entry) error {
 	return nil
 }
 
-// Open returns the backend configured in server.state.
+// Open returns the backend configured in server.state, keyed with
+// audit.chain_key_ref when it is set.
 func Open(ctx context.Context, cfg *config.Config) (Store, error) {
+	key, err := ChainKey(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	var s Store
 	switch st := cfg.Server.State; st.Backend {
 	case "", "file":
-		return OpenFile(cfg.Server.JournalPath)
+		s, err = OpenFile(cfg.Server.JournalPath)
 	case "postgres":
-		dsn, err := PostgresDSN(ctx, cfg)
-		if err != nil {
-			return nil, err
+		dsn, derr := PostgresDSN(ctx, cfg)
+		if derr != nil {
+			return nil, derr
 		}
-		return OpenPostgresWith(ctx, dsn, st.AutoMigrate == nil || *st.AutoMigrate)
+		s, err = OpenPostgresWith(ctx, dsn, st.AutoMigrate == nil || *st.AutoMigrate)
 	default:
 		return nil, fmt.Errorf("unknown state backend %q", st.Backend)
 	}
+	if err != nil {
+		return nil, err
+	}
+	s.SetChainKey(key)
+	return s, nil
+}
+
+// MinChainKey is the shortest accepted audit.chain_key_ref value, in bytes.
+const MinChainKey = 32
+
+// ChainKey resolves audit.chain_key_ref (nil when it is not set).
+func ChainKey(ctx context.Context, cfg *config.Config) ([]byte, error) {
+	return ResolveChainKey(ctx, cfg.Audit.ChainKeyRef)
+}
+
+// ResolveChainKey resolves a chain key reference (nil for "").
+func ResolveChainKey(ctx context.Context, ref string) ([]byte, error) {
+	if ref == "" {
+		return nil, nil
+	}
+	v, err := secrets.Resolve(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("audit.chain_key_ref: %w", err)
+	}
+	if len(v) < MinChainKey {
+		return nil, fmt.Errorf("audit.chain_key_ref: the key must be at least %d bytes (got %d)", MinChainKey, len(v))
+	}
+	return []byte(v), nil
 }
 
 // PostgresDSN resolves server.state's connection string.

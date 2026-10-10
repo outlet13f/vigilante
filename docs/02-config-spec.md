@@ -32,7 +32,7 @@ services:    [...]   # 서비스 = 대상 + 프로브 + 규칙 + 단계 + 롤백
 safety:      {...}   # 서킷브레이커·blast radius·플래핑·관측 쿼럼
 notify:      [...]   # 알림
 auth:        {...}   # API 인증(OIDC·서비스 계정)과 역할·범위
-audit:       {...}   # SIEM 전송(syslog)과 보존 기간
+audit:       {...}   # SIEM 전송(syslog·TLS), 체인 키, 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
 change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
@@ -56,6 +56,7 @@ console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 | `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달. 환경변수 `VIGILANTE_HA_ADVERTISE_URL`이 있으면 그 값을 씀(여러 노드가 설정 파일 하나를 공유할 때, 예: Helm 차트) |
 | `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름. 환경변수 `VIGILANTE_HA_NODE_ID`가 우선 |
 | `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
+| `ha.tls` | — | 팔로워가 https 주소의 리더로 전달할 때의 검증: `ca_file`(노드 인증서의 사설 CA), `server_name`(주소의 호스트 대신 인증서에서 확인할 이름. 파드 IP로 전달하는 Helm에서는 Service DNS 이름), `cert_file`·`key_file`(`server.tls.client_auth: require`일 때 클라이언트 인증서). 없으면 시스템 신뢰 저장소와 주소의 호스트로 검증 |
 | `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
 | `tls.cert_file` / `tls.key_file` | — | 있으면 HTTPS로 직접 서비스(TLS 1.2 이상). 파일이 바뀌면 재시작 없이 새 인증서를 씀(cert-manager·갱신 작업). 없으면 HTTP이므로 앞에 TLS 프록시·인그레스를 둠 |
 | `tls.client_ca_file` / `tls.client_auth` | —, `none` | 클라이언트 인증서 검증. `optional`: 제시된 인증서만 검증(에이전트는 인증서, 브라우저·CI는 토큰), `require`: 모든 클라이언트에 인증서 요구. 어느 경우든 API 토큰 인증은 그대로 |
@@ -397,7 +398,21 @@ safety:
   circuit_breaker: {failure_threshold: 2, window: 1h, open_duration: 0s}
   blast_radius:    {min_healthy: 1, min_healthy_percent: 50}
   flapping:        {max_rollbacks_per_hour: 3, cooldown: 5m}
+  rollback_lease:  {wait: 10s, on_unavailable: proceed}
+  observer_guard:  {max_lag: 1s, loopback_timeout: 1s, timeout_share: 0.5, min_services: 3, grace: 1m}
 ```
+
+| 키 | 기본값 | 설명 |
+|---|---|---|
+| `rollback_lease.wait` | `10s` | 롤백 시작 시 서비스 잠금(상태 저장소 lease)을 얻으려고 저장소를 다시 시도하는 시간 |
+| `rollback_lease.on_unavailable` | `proceed` | 그래도 저장소에 닿지 않을 때. `proceed`는 이 프로세스 안의 잠금만으로 롤백하고 배포 이벤트(`safety`), 감사(`lease.unavailable`), 경고 알림을 남깁니다. 롤백 도중 저장소가 돌아오면 lease를 다시 잡고, 다른 프로세스가 이미 잡고 있으면 `lease.conflict`로 알립니다. `fail`은 롤백을 시작하지 않습니다(ROLLBACK_FAILED) |
+| `observer_guard.disabled` | `false` | 관측 장치 자체가 불안정할 때 프로브 실패 기반 위반을 롤백 대신 HOLD하는 기능을 끕니다 |
+| `observer_guard.max_lag` | `1s` | 내부 250ms 타이머가 이보다 늦게 깨면 관측 장치 과부하(CPU 부족, GC, VM 정지) |
+| `observer_guard.loopback_timeout` | `1s` | 프로세스 안 TCP 에코 왕복이 이보다 길면 과부하(소켓·네트워크 스택 고갈) |
+| `observer_guard.timeout_share` / `min_services` | `0.5` / `3` | 관측 중인 대상의 이 비율 이상에서, 이 개수 이상의 서비스에 걸쳐 프로브가 시간 초과면 관측 쪽 문제로 봅니다. 서비스 하나의 불량 릴리스로는 걸리지 않습니다 |
+| `observer_guard.grace` | `1m` | 회복 후에도 이 시간 동안은 HOLD를 유지합니다. 과부하 중 쌓인 연속 실패 수와 윈도우 값이 빠질 시간입니다 |
+
+관측 장치 판별은 프로브 실패에서 나온 지표(`up`, `latency_ms`, `consecutive_failures`, `consecutive_timeouts`, `timeout`, `probe_error`)를 쓰는 규칙에만 적용합니다. 로그·액세스 로그·호스트·컨테이너 지표는 대상이 직접 보고한 값이라 그대로 판정합니다. 지표: `vigilante_observer_degraded`, `vigilante_observer_degradations_total{signal}`, `vigilante_observer_holds_total`.
 
 상세 동작은 [04-safety-circuit-breaker.md](04-safety-circuit-breaker.md).
 
@@ -450,11 +465,13 @@ auth:
       token_sha256: 0f1e...   # (64자 hex)
       roles: [{role: agent}]
   four_eyes: true             # 배포 생성자·롤백 요청자는 그 승인 요청을 직접 승인할 수 없음
+  local_cli: auto             # auto | full | restricted — 아래 "로컬 CLI" 참고
 ```
 
 - 토큰 폐기: 서비스 계정 항목을 지우고 설정을 다시 읽히면 즉시 무효가 됩니다. 만료일을 두는 것을 권장합니다.
 - 확인: `vigilante whoami --server URL` (환경변수 `VIGILANTE_TOKEN`의 신원과 권한 출력).
 - 모든 생성·롤백·승인 기록에 작업자(`created_by`, `rollback_requested_by`, `approved_by`)가 남습니다. 로컬 CLI 실행은 `cli:<OS 사용자>@<호스트>`로 기록됩니다.
+- **로컬 CLI(`auth.local_cli`):** `--server` 없이 실행한 CLI는 API를 거치지 않고 상태 저장소를 직접 다루므로 역할 검사를 받지 않습니다. 그래서 인증이 설정된 환경(기본 `auto`)에서는 권한이 큰 로컬 명령, 즉 롤백 승인·거절(`rollback --approve|--reject`), 에스컬레이션 승인(`rollback --approve`), `circuit reset|trip`, 동결 중 `--freeze-override`를 거부합니다. `--server`와 operator·admin 토큰으로 실행하거나, 서버 장애 같은 비상시에는 `--break-glass "이유"`를 붙입니다. break-glass는 감사 기록(`breakglass.<작업>`)과 critical 알림을 남깁니다. `full`은 제한을 끄고, `restricted`는 인증이 없어도 제한합니다. 로컬 승인·거절에도 `four_eyes`를 적용합니다(break-glass 제외). 상태 저장소 접근 권한(DB 계정, 저널 파일) 자체가 이 명령들의 권한과 같으므로, 그 계정은 운영자에게만 줍니다.
 - OIDC를 설정하면 서버 시작 시 발급자(issuer)의 discovery 문서를 가져오므로 서버에서 SSO에 접근할 수 있어야 합니다.
 
 ## `audit` — 감사 기록
@@ -464,27 +481,35 @@ auth:
 - **작업자:** 기록마다 `actor`(예: `user:alice`, `sa:ci-order`, `cli:bob@host`, 자동 조치는 `system`), `source`(api·cli·webhook·system), `action`, 대상 서비스·배포, `reason`이 남습니다.
 - **변경 티켓:** API는 `X-Change-Ticket` 헤더, CLI는 `--ticket`으로 받은 값을 `ticket`에 남깁니다.
 - **권한 거부:** 거부(403)된 요청도 `action: denied`로 남습니다. 반복되는 거부는 권한 탐색 시도의 신호입니다.
-- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. DB 관리자가 SQL로 직접 바꿔도 검출됩니다.
+- **해시 체인(변조 검출):** 기록마다 직전 기록의 해시(`prev`)와 자신의 해시(`hash`)를 포함합니다. 한 건이라도 고치거나 지우면 그 지점부터 체인이 끊어지고, `vigilante audit verify`가 위치와 원인(수정·삭제)을 보고합니다. 단, 체인만으로는 저장소에 쓸 수 있는 사람이 기록을 고친 뒤 해시를 처음부터 다시 계산하는 것을 막지 못합니다.
+- **체인 키(`chain_key_ref`):** 설정하면 새 기록마다 체인 해시의 HMAC-SHA256(`mac`)이 붙습니다. 키가 없으면 MAC을 만들 수 없으므로, 기록을 고치고 체인을 다시 계산해도 `audit verify`가 MAC 불일치·누락으로 검출합니다. 키는 32바이트 이상, 모든 노드가 같은 키를 씁니다. 키를 설정하기 전 기록은 `unkeyed`로 세고 변조로 보지 않으며, 결과의 `keyed_from`이 키가 보호하기 시작한 위치입니다(그 앞 기록을 고치면 첫 키 기록의 MAC이 맞지 않아 역시 검출됩니다). PostgreSQL은 기록 본문(JSON)에 담기므로 마이그레이션이 필요 없습니다.
 
 ```yaml
 audit:
   syslog:
-    address: tcp://siem.example.internal:6514   # 또는 udp://...
+    address: tls://siem.example.internal:6514   # tls://(RFC 5425, 포트 생략 시 6514) | tcp:// | udp://
     format: rfc5424                              # rfc5424(JSON 본문, 기본) | cef
+    tls:                                         # tls:// 전용. 없으면 시스템 루트 CA로 검증
+      ca_file: /etc/vigilante/siem-ca.pem        # 수집기 인증서의 사설 CA
+      cert_file: /etc/vigilante/siem-client.crt  # 수집기가 클라이언트 인증서를 요구할 때(key_file과 함께)
+      key_file: /etc/vigilante/siem-client.key
+      server_name: siem.example.internal         # 기본은 address의 호스트
+      min_version: "1.2"                         # 1.2(기본) | 1.3
+  chain_key_ref: vault:secret/prod/vigilante#audit_chain_key   # 또는 env:NAME, file:/path
   retention: 8760h                               # audit prune의 기본 보존 기간. 자동 삭제는 하지 않음
 ```
 
 | 명령 | 하는 일 |
 |---|---|
-| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증. 끊어지면 exit 1 |
-| `vigilante audit verify --file ARCHIVE.jsonl` | 아카이브 파일만 따로 검증 |
+| `vigilante audit verify -c FILE` | 저장소 전체 체인 검증(`chain_key_ref`가 있으면 MAC도). 끊어지면 exit 1 |
+| `vigilante audit verify --file ARCHIVE.jsonl [-c FILE \| --key REF]` | 아카이브 파일만 따로 검증. `-c`나 `--key`를 주면 MAC도 검증 |
 | `vigilante audit query -c FILE [--actor A] [--action denied] [--service S] [--since 2026-10-01]` | 감사 기록 조회 |
 | `vigilante audit export -c FILE --out F.jsonl` | 전체 기록을 체인 그대로 내보내기 |
 | `vigilante audit prune -c FILE --out ARCHIVE.jsonl [--before 2025-10-01 \| --older-than 8760h]` | 보존 기간이 지난 기록을 아카이브로 옮기고 삭제 |
 
 - **조회 API:** `GET /v1/audit?since=&until=&actor=&service=&action=&kind=&limit=&format=csv`. 모든 서비스에 걸친 정보라 `viewer@*`(전체 범위) 권한이 필요합니다.
-- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다.
-- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다. 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
+- **SIEM 전송:** 저장된 뒤 비동기로 보냅니다. SIEM이 느리거나 끊겨도 롤백을 막지 않으며, 큐가 가득 차면 버리고 개수를 셉니다. 빠진 구간은 `audit export`로 채울 수 있습니다. 배포 상태는 상태가 바뀔 때만 보냅니다. `tls://`는 RFC 5425 형식(`길이 공백 메시지`)으로 보내고 수집기 인증서와 이름을 검증합니다. 검증에 실패하면 보내지 않고 재시도합니다. `tcp://`·`udp://`는 평문(줄 단위)이므로 신뢰 망 안에서만 쓰십시오.
+- **보존 정리(prune):** 지울 구간을 먼저 아카이브에 쓰고(아카이브는 따로 검증 가능), 그 구간이 만든 상태 중 아직 필요한 것을 하나의 앵커 기록에 담아 대체합니다. 필요한 상태는 진행 중인 배포와 롤백 단계, 서비스별 마지막 성공 버전, 서킷 상태, 플래핑 계산용 최근 롤백입니다. 남은 체인은 앵커에서 이어집니다(앵커는 마지막으로 지운 기록의 MAC도 이어받습니다). 파일 백엔드는 서버가 그 파일을 쓰지 않을 때 실행하십시오.
 
 ## `change_freeze` — 변경 동결
 
@@ -500,9 +525,9 @@ change_freeze:
     allow_rollback: true                  # 기본 true
 ```
 
-- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다. 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
+- **막는 것:** 동결 중인 서비스의 새 배포 등록과 단계 관측 시작. API는 `409`(코드 `change_frozen`), CLI(`watch`, `prepare`)는 종료 코드 3입니다(`watch --server`에서 서버가 거부해도 3). 동결 전에 등록한 배포도 새 단계를 시작할 수 없습니다.
 - **막지 않는 것:** 자동 롤백은 기본으로 허용합니다. 장애 복구는 변경이 아니기 때문입니다. `allow_rollback: false`인 기간에는 자동 롤백 대신 실패한 대상을 격리하고 사람에게 넘깁니다. 수동 롤백은 항상 가능합니다.
-- **예외(긴급 배포):** API는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다. 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
+- **예외(긴급 배포):** API(v1·v2)는 admin이 `freeze_override`에 이유를 넣어 배포를 등록하고, CLI는 `--freeze-override "이유"`를 씁니다(`watch --server`는 서버로 전달하므로 토큰이 admin이어야 함). 배포의 `freeze_override`와 감사 기록(`freeze.override`)에 누가 왜 했는지 남습니다.
 - **실행 중 선언:** 장애 대응처럼 설정 파일 없이 동결해야 하면 admin이 `POST /v2/freezes`로 선언하고 `DELETE /v2/freezes/{id}`로 일찍 끝냅니다. 상태 저장소에 남아 리더가 바뀌어도 유지됩니다. `GET /v2/freezes`는 설정 창과 선언된 동결을 함께 보여 줍니다.
 - 주간 창의 시각은 `timezone`(생략 시 서버 지역 시간) 기준이며, 바이너리에 시간대 데이터가 들어 있어 호스트 설정과 무관하게 동작합니다.
 
@@ -540,7 +565,7 @@ console:
 - **CSRF:** 쿠키로 인증한 변경 요청은 `X-CSRF-Token` 헤더에 CSRF 쿠키 값을 담아야 합니다(double-submit). 없으면 `403 forbidden`입니다. `Authorization` 헤더가 있는 요청은 쿠키를 보지 않으므로 API 클라이언트에는 영향이 없습니다.
 - **토큰 로그인:** SSO가 없으면 콘솔이 서비스 계정 토큰이나 API 키를 묻습니다. 토큰은 그 브라우저 탭(sessionStorage)에만 남습니다.
 - **화면:** 현황(서킷·조치 필요·진행 중·최근 배포·실시간 이벤트), 배포 목록·상세(승인·거절, 롤백, 관측 중단, 규칙 위반, 작업, 타임라인), 서비스, 변경 동결(선언·종료), 감사 기록. 모든 조작은 사유를 받아 감사 기록에 남기며(출처 `ui`), 버튼은 역할에 맞는 것만 보입니다. 실시간 갱신은 `GET /v2/events`(SSE)를 씁니다.
-- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. API 데이터는 모두 텍스트로만 화면에 넣습니다.
+- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. HTTPS로 서비스하면(`server.tls`, `https://` `redirect_url`(TLS 프록시 뒤), 또는 TLS 요청) `Strict-Transport-Security: max-age=31536000`도 보냅니다(`includeSubDomains` 없음). 콘솔의 모든 응답(로그인·콜백·로그아웃 포함)에 붙습니다. API 데이터는 모두 텍스트로만 화면에 넣습니다.
 
 ## `secrets` — 비밀값 출처
 
@@ -616,9 +641,9 @@ itsm:
     work_notes: true                        # 변경 티켓에 진행 결과 기록 (기본 true)
 ```
 
-- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 v2 `change_ticket`, CLI는 `--ticket`입니다. 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
+- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 본문 `change_ticket`(v1·v2), CLI는 `--ticket`입니다(`watch --server`도 서버로 전달). 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
 - **ServiceNow 장애:** `on_error: closed`면 `503 itsm_unavailable`(Retry-After)로 새 배포를 받지 않고, `open`이면 진행하되 배포의 `change_ticket.unverified: true`와 이벤트에 남깁니다. **롤백은 어느 경우에도 ServiceNow를 기다리지 않습니다.**
-- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다.
+- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다. 생성은 백그라운드에서 하며, 실패하면(접속 오류, 시간 초과, 429, 5xx) 1초·2초·4초 뒤 최대 세 번 다시 시도합니다. 응답을 못 받은 생성이 실제로는 저장됐어도 재시도가 `correlation_id`로 찾아내므로 중복되지 않습니다. 그 밖의 4xx(인증 실패 등)는 재시도하지 않습니다. 작업 노트도 같은 재시도를 씁니다.
 - **작업 노트:** 검증된 티켓이 있는 배포는 관측 시작·판정·롤백 시작·완료·실패·승인 요청·결정을 변경 티켓의 work notes에 남깁니다.
 - 인시던트와 작업 노트는 서버(리더)가 이벤트를 따라가며 처리합니다. CI 단발 실행(`vigilante watch`)만 쓰는 구성에서는 게이트만 동작합니다.
-- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`.
+- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`(`result`: 호출마다 `ok` 또는 재시도 후 `error`, 다시 시도할 때마다 `retry`).

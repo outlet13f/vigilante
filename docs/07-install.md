@@ -113,10 +113,24 @@ config: |
   server:
     state: {backend: postgres, dsn_env: VIGILANTE_PG_DSN}
     ha: {enabled: true}
+  auth: {...}
   ...
 ```
 
-- 파드마다 `VIGILANTE_HA_ADVERTISE_URL`(파드 IP)과 노드 ID(파드 이름)를 차트가 넣습니다.
+파드에서 직접 HTTPS(`server.tls`, 인증서는 `kubernetes.io/tls` 시크릿):
+
+```yaml
+tls: {secretName: vigilante-tls}     # /etc/vigilante-tls에 마운트
+config: |
+  version: v1
+  server:
+    tls: {cert_file: /etc/vigilante-tls/tls.crt, key_file: /etc/vigilante-tls/tls.key}
+  ...
+```
+
+- `config`에 인증(`auth.service_accounts`, `auth.oidc`, 또는 시크릿을 `env`로 넣은 `server.auth_token_env`)이 없으면 차트가 렌더링을 거부합니다. 인증 없이 모든 호출을 익명 admin으로 받는 개발용 설치만 `auth.allowAnonymous: true`로 허용합니다. `existingConfigMap`은 차트가 읽지 못하므로 확인하지 않습니다.
+- 파드마다 `VIGILANTE_HA_ADVERTISE_URL`(파드 IP)과 노드 ID(파드 이름)를 차트가 넣습니다. `config`에 `server.tls.cert_file`이 있으면(`existingConfigMap`이면 `tls.enabled: true`) 이 주소와 프로브, 포트 이름, ServiceMonitor가 `https`로 바뀝니다. 팔로워는 리더의 파드 IP로 HTTPS 전달을 하는데, 파드 IP는 보통 인증서에 없습니다. `server.ha.tls`에 CA(`ca_file: /etc/vigilante-tls/ca.crt`)와 인증서에 들어 있는 이름(`server_name: vigilante.<네임스페이스>.svc`)을 지정하면 그 이름으로 검증합니다. `tls.client_auth: require`는 프로브와 리더 전달이 클라이언트 인증서를 내지 못해 거부하므로 `optional`을 씁니다.
+- 메모리: 기본 요청 512Mi, 한도 2Gi이며 `GOMEMLIMIT`을 한도의 90%로 넣습니다(`goMemLimit`으로 변경). 부하 시험의 최대 힙은 대상 2,000 × 프로브 3(6천 개)에서 352 MiB, × 10(2만 개)에서 1.1 GiB였습니다. 프로브 1천 개당 약 60 MiB에 여유를 더해 잡습니다.
 - 파일 저장소로 리플리카를 2 이상 주면 차트가 렌더링을 거부합니다.
 - 폐쇄망: `image.repository: registry.internal/vigilante`.
 - 설정 확인: `kubectl exec deploy/vigilante -- vigilante validate -c /etc/vigilante/vigilante.yaml`.

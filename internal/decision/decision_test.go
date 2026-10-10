@@ -145,3 +145,43 @@ func TestNotifyRuleDoesNotFail(t *testing.T) {
 		t.Fatalf("got %s warnings=%d", out.Verdict, len(out.Warnings))
 	}
 }
+
+type fakeObserver struct{ degraded bool }
+
+func (o fakeObserver) Degraded(from, to time.Time) (bool, string) {
+	return o.degraded, "scheduling lag: woke 4s late"
+}
+
+// While the observer is degraded, breaches built on probe failures are held;
+// breaches the target itself reported (log, access log) still fail.
+func TestObserverDegradedHoldsProbeFailures(t *testing.T) {
+	down := config.Rule{Name: "down", Action: "rollback", When: config.Node{Condition: config.Condition{
+		Metric: "http.consecutive_failures", Agg: "last", Window: 10 * time.Second, Op: ">=", Value: f(3), For: 1, ResetAfter: 1, Scope: "target", Absent: "unknown",
+	}}}
+	s := metrics.NewStore(time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	feed(ctx, s, "canary-1", "http.consecutive_failures", 5, "")
+	time.Sleep(20 * time.Millisecond)
+
+	eng := New(phase([]config.Rule{down}, []string{"canary-1"}, nil), s, nil)
+	eng.Observer = fakeObserver{degraded: true}
+	out := eng.Run(ctx)
+	if out.Verdict != model.VerdictHold || len(out.Breaches) == 0 || out.Breaches[0].Action != "hold" {
+		t.Fatalf("degraded observer: %s %s", out.Verdict, out.Reason)
+	}
+
+	eng = New(phase([]config.Rule{down}, []string{"canary-1"}, nil), s, nil)
+	eng.Observer = fakeObserver{degraded: false}
+	if out := eng.Run(ctx); out.Verdict != model.VerdictFail {
+		t.Fatalf("healthy observer: %s %s", out.Verdict, out.Reason)
+	}
+
+	feed(ctx, s, "canary-1", "access.error_rate_5xx", 12, "")
+	time.Sleep(20 * time.Millisecond)
+	eng = New(phase([]config.Rule{errRule("rollback")}, []string{"canary-1"}, nil), s, nil)
+	eng.Observer = fakeObserver{degraded: true}
+	if out := eng.Run(ctx); out.Verdict != model.VerdictFail {
+		t.Fatalf("access-log breach must not be held for the observer: %s %s", out.Verdict, out.Reason)
+	}
+}
