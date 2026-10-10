@@ -23,13 +23,36 @@ import (
 )
 
 const (
-	KindDeployment    = "deployment"     // full deployment snapshot
-	KindCircuit       = "circuit"        // circuit breaker state
-	KindRollbackStart = "rollback.start" // service rollback begins (flapping history)
-	KindStepDone      = "rollback.step"  // target finished plan step N
-	KindAudit         = "audit"          // who did what (API/CLI actions, denials)
-	KindAnchor        = "anchor"         // chain start after pruning: Hash = last pruned entry's hash
+	KindDeployment    = "deployment"      // full deployment snapshot
+	KindCircuit       = "circuit"         // circuit breaker state
+	KindRollbackStart = "rollback.start"  // service rollback begins (flapping history)
+	KindStepDone      = "rollback.step"   // target finished plan step N
+	KindAudit         = "audit"           // who did what (API/CLI actions, denials)
+	KindAnchor        = "anchor"          // chain start after pruning: Hash = last pruned entry's hash
+	KindOperation     = "operation"       // API long-running operation snapshot
+	KindIdempotency   = "idempotency"     // response remembered for an Idempotency-Key
+	KindAPIClient     = "api-client"      // API client snapshot (secret stored as SHA-256)
+	KindAccessToken   = "access-token"    // OAuth access token issued (stored as SHA-256)
+	KindClientUsed    = "api-client.used" // Message = client ID; Time = last use (at most hourly)
+	KindEvent         = "event"           // CloudEvent published to subscribers
+	KindWebhook       = "webhook"         // webhook subscription snapshot
+	KindWebhookCursor = "webhook.cursor"  // Message = webhook ID; Seq = last event handled
 )
+
+// MaxEvents is how many recent events replay keeps for SSE resume and
+// webhook catch-up.
+const MaxEvents = 10000
+
+// Bookkeeping reports kinds that only rebuild state; their meaning is
+// carried by audit entries, so audit queries and SIEM export skip them.
+func Bookkeeping(kind string) bool {
+	switch kind {
+	case KindDeployment, KindStepDone, KindOperation, KindIdempotency, KindAPIClient, KindAccessToken, KindClientUsed,
+		KindEvent, KindWebhook, KindWebhookCursor:
+		return true
+	}
+	return false
+}
 
 type Entry struct {
 	Time       time.Time            `json:"time"`
@@ -37,6 +60,13 @@ type Entry struct {
 	Service    string               `json:"service,omitempty"`
 	Deployment *model.Deployment    `json:"deployment,omitempty"`
 	Circuit    *safety.CircuitState `json:"circuit,omitempty"`
+	Operation  *model.Operation     `json:"operation,omitempty"`
+	Idem       *model.IdemRecord    `json:"idempotency,omitempty"`
+	Client     *model.APIClient     `json:"api_client,omitempty"`
+	Token      *model.AccessToken   `json:"access_token,omitempty"`
+	Event      *model.CloudEvent    `json:"event,omitempty"`
+	Webhook    *model.Webhook       `json:"webhook,omitempty"`
+	Seq        int64                `json:"seq,omitempty"`
 	DeployID   string               `json:"deployment_id,omitempty"`
 	Target     string               `json:"target,omitempty"`
 	Step       int                  `json:"step,omitempty"`
@@ -180,7 +210,13 @@ type State struct {
 	Circuit     *safety.CircuitState
 	Rollbacks   map[string][]time.Time    // service -> rollback start times
 	StepsDone   map[string]map[string]int // deployment -> target -> highest completed step index + 1
-	Corrupt     int                       // unparsable lines skipped (e.g. torn final write)
+	Operations  map[string]*model.Operation
+	Idempotency map[string]*model.IdemRecord // by IdemRecord.Key
+	Clients     map[string]*model.APIClient
+	Tokens      map[string]*model.AccessToken // by SHA256
+	Events      []*model.CloudEvent           // the most recent MaxEvents, oldest first
+	Webhooks    map[string]*model.Webhook
+	Corrupt     int // unparsable lines skipped (e.g. torn final write)
 }
 
 // InFlight returns deployments whose rollback had started but not finished.
@@ -239,6 +275,64 @@ func Compact(pruned []Entry, cutoff time.Time) []Entry {
 			}
 		}
 	}
+	// Operations still running, and idempotency records young enough that a
+	// client may still retry.
+	opIDs := make([]string, 0, len(st.Operations))
+	for id := range st.Operations {
+		opIDs = append(opIDs, id)
+	}
+	sort.Strings(opIDs)
+	for _, id := range opIDs {
+		if op := st.Operations[id]; op.Status == model.OpRunning {
+			out = append(out, Entry{Kind: KindOperation, Time: op.CreatedAt, Operation: op})
+		}
+	}
+	// Every API client (revoked ones too, for the record) and unexpired tokens.
+	clientIDs := make([]string, 0, len(st.Clients))
+	for id := range st.Clients {
+		clientIDs = append(clientIDs, id)
+	}
+	sort.Strings(clientIDs)
+	for _, id := range clientIDs {
+		out = append(out, Entry{Kind: KindAPIClient, Time: st.Clients[id].CreatedAt, Client: st.Clients[id]})
+	}
+	toks := make([]string, 0, len(st.Tokens))
+	for h := range st.Tokens {
+		toks = append(toks, h)
+	}
+	sort.Strings(toks)
+	for _, h := range toks {
+		if t := st.Tokens[h]; t.ExpiresAt.After(cutoff) {
+			out = append(out, Entry{Kind: KindAccessToken, Time: cutoff, Token: t})
+		}
+	}
+	// Webhooks (with their cursors), and the last events so sequence numbers
+	// keep increasing and subscribers can still catch up.
+	hookIDs := make([]string, 0, len(st.Webhooks))
+	for id := range st.Webhooks {
+		hookIDs = append(hookIDs, id)
+	}
+	sort.Strings(hookIDs)
+	for _, id := range hookIDs {
+		out = append(out, Entry{Kind: KindWebhook, Time: st.Webhooks[id].UpdatedAt, Webhook: st.Webhooks[id]})
+	}
+	evs := st.Events
+	if len(evs) > 1000 {
+		evs = evs[len(evs)-1000:]
+	}
+	for _, ev := range evs {
+		out = append(out, Entry{Kind: KindEvent, Time: ev.Time, Event: ev})
+	}
+	keys := make([]string, 0, len(st.Idempotency))
+	for k := range st.Idempotency {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if r := st.Idempotency[k]; cutoff.Sub(r.CreatedAt) < model.IdemTTL {
+			out = append(out, Entry{Kind: KindIdempotency, Time: r.CreatedAt, Idem: r})
+		}
+	}
 	return out
 }
 
@@ -248,6 +342,11 @@ func NewState() *State {
 		Deployments: map[string]*model.Deployment{},
 		Rollbacks:   map[string][]time.Time{},
 		StepsDone:   map[string]map[string]int{},
+		Operations:  map[string]*model.Operation{},
+		Idempotency: map[string]*model.IdemRecord{},
+		Clients:     map[string]*model.APIClient{},
+		Tokens:      map[string]*model.AccessToken{},
+		Webhooks:    map[string]*model.Webhook{},
 	}
 }
 
@@ -261,6 +360,46 @@ func (st *State) Apply(e Entry) {
 		}
 	case KindCircuit:
 		st.Circuit = e.Circuit
+	case KindOperation:
+		if e.Operation != nil {
+			st.Operations[e.Operation.ID] = e.Operation
+		}
+	case KindIdempotency:
+		if e.Idem != nil {
+			st.Idempotency[e.Idem.Key] = e.Idem
+		}
+	case KindAPIClient:
+		if e.Client != nil {
+			st.Clients[e.Client.ID] = e.Client
+		}
+	case KindAccessToken:
+		if e.Token != nil {
+			st.Tokens[e.Token.SHA256] = e.Token
+		}
+	case KindEvent:
+		if e.Event != nil {
+			st.Events = append(st.Events, e.Event)
+			if len(st.Events) > 2*MaxEvents {
+				st.Events = append([]*model.CloudEvent(nil), st.Events[len(st.Events)-MaxEvents:]...)
+			}
+		}
+	case KindWebhook:
+		switch {
+		case e.Webhook == nil:
+		case e.Webhook.Deleted:
+			delete(st.Webhooks, e.Webhook.ID)
+		default:
+			st.Webhooks[e.Webhook.ID] = e.Webhook
+		}
+	case KindWebhookCursor:
+		if w := st.Webhooks[e.Message]; w != nil && e.Seq > w.Cursor {
+			w.Cursor = e.Seq
+		}
+	case KindClientUsed:
+		if c := st.Clients[e.Message]; c != nil {
+			t := e.Time
+			c.LastUsedAt = &t
+		}
 	case KindRollbackStart:
 		st.Rollbacks[e.Service] = append(st.Rollbacks[e.Service], e.Time)
 	case KindAnchor:

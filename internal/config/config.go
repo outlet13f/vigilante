@@ -24,11 +24,41 @@ type Config struct {
 	Services    []Service             `yaml:"services"`
 	Safety      Safety                `yaml:"safety"`
 	Notify      []Notifier            `yaml:"notify"`
+	// BaseDir is the directory of the config file (preset_dirs resolve against it).
+	BaseDir string `yaml:"-"`
 	// PresetDirs holds organisation presets (*.yaml), relative to this file.
 	PresetDirs []string `yaml:"preset_dirs"`
 	Auth       Auth     `yaml:"auth"`
 	Audit      Audit    `yaml:"audit"`
 	Secrets    Secrets  `yaml:"secrets"`
+	API        API      `yaml:"api"`
+}
+
+// API configures the public API: per-caller rate limits and OAuth tokens.
+type API struct {
+	// RateLimit applies to every v2 call of one caller (default 20/s, burst 40).
+	RateLimit *RateLimit `yaml:"rate_limit"`
+	// EmergencyRateLimit is a separate bucket for rollbacks, approvals,
+	// abort and the circuit breaker, so a flood of reads never blocks them
+	// (default 1/s, burst 10).
+	EmergencyRateLimit *RateLimit `yaml:"emergency_rate_limit"`
+	// TokenTTL is the lifetime of OAuth access tokens (default 1h).
+	TokenTTL time.Duration `yaml:"token_ttl"`
+	// WebhookSigningKeyRef is the master key (vault:/env:/file: reference)
+	// from which each webhook's signing secret is derived. Webhooks are off
+	// without it. Nothing secret is written to the state store.
+	WebhookSigningKeyRef string `yaml:"webhook_signing_key_ref"`
+	// WebhookAllowedHosts limits webhook URLs to these hosts or domain
+	// suffixes (".example.internal"); empty = any host.
+	WebhookAllowedHosts []string `yaml:"webhook_allowed_hosts"`
+}
+
+// RateLimit is a token bucket: Rate requests per second, bursts up to
+// Burst, at most Daily per UTC day (0 = no daily cap). Rate 0 = unlimited.
+type RateLimit struct {
+	Rate  float64 `yaml:"rate"`
+	Burst int     `yaml:"burst"`
+	Daily int     `yaml:"daily"`
 }
 
 // Audit configures where audit records go besides the journal itself.
@@ -551,6 +581,7 @@ func parse(raw []byte, baseDir string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+	c.BaseDir = baseDir
 	if err := c.expandPresets(baseDir); err != nil {
 		return nil, err
 	}

@@ -18,6 +18,7 @@
 | [docs/03-engine-design.md](docs/03-engine-design.md) | 비동기 수집, 3값 규칙 평가, 실행기 인터페이스, 확장·테스트 |
 | [docs/04-safety-circuit-breaker.md](docs/04-safety-circuit-breaker.md) | 롤백 실패·비상 정지 시나리오 18종, 서킷 상태도, 런북 |
 | [docs/05-roadmap.md](docs/05-roadmap.md) | 엔터프라이즈 제품화 로드맵 M0~M6, 진행 현황, 결정 필요 사항 |
+| [docs/06-api.md](docs/06-api.md) · [api/openapi.yaml](api/openapi.yaml) | 오픈 API v2: 공통 규약, 리소스, 오류 코드, v1 대응 |
 | [examples/config/vigilante.yaml](examples/config/vigilante.yaml) | 3개 서비스 × 전 인프라 유형 참조 설정 |
 | [examples/ci/](examples/ci/) | Jenkins / GitLab CI / GitHub Actions 연동 |
 

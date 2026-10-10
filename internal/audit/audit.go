@@ -111,7 +111,7 @@ func (f Filter) Match(e journal.Entry) bool {
 		if !f.Kinds[e.Kind] {
 			return false
 		}
-	} else if e.Kind == journal.KindDeployment || e.Kind == journal.KindStepDone {
+	} else if journal.Bookkeeping(e.Kind) {
 		return false
 	}
 	if f.Actor != "" && e.Actor != f.Actor {
