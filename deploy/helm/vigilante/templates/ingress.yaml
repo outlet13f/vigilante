@@ -26,5 +26,5 @@ spec:
             backend:
               service:
                 name: {{ include "vigilante.fullname" . }}
-                port: {name: http}
+                port: {name: {{ include "vigilante.scheme" . }}}
 {{- end }}

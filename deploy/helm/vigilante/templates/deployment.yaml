@@ -1,6 +1,9 @@
 {{- if and (gt (int .Values.replicaCount) 1) .Values.persistence.enabled }}
 {{- fail "replicaCount > 1 needs the PostgreSQL state store with HA (see values.yaml): set persistence.enabled=false" }}
 {{- end }}
+{{- include "vigilante.validate" . }}
+{{- $scheme := include "vigilante.scheme" . }}
+{{- $goMemLimit := include "vigilante.goMemLimit" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,16 +46,23 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [server, -c, /etc/vigilante/vigilante.yaml]
           ports:
-            - {name: http, containerPort: 8088, protocol: TCP}
+            - {name: {{ $scheme }}, containerPort: 8088, protocol: TCP}
           env:
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: VIGILANTE_HA_NODE_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: VIGILANTE_HA_ADVERTISE_URL
-              value: "http://$(POD_IP):8088"
+              value: "{{ $scheme }}://$(POD_IP):8088"
             - name: VIGILANTE_LOG_FORMAT
               value: json
+            {{- if $goMemLimit }}
+            - name: GOMEMLIMIT
+              value: {{ $goMemLimit | quote }}
+            {{- else if and (ne (toString .Values.goMemLimit) "off") (include "vigilante.memoryLimit" .) }}
+            - name: GOMEMLIMIT
+              valueFrom: {resourceFieldRef: {containerName: vigilante, resource: limits.memory}}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -61,11 +71,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           livenessProbe:
-            httpGet: {path: /healthz, port: http}
+            httpGet: {path: /healthz, port: {{ $scheme }}, scheme: {{ upper $scheme }}}
             periodSeconds: 10
             failureThreshold: 6
           readinessProbe:
-            httpGet: {path: /readyz, port: http}
+            httpGet: {path: /readyz, port: {{ $scheme }}, scheme: {{ upper $scheme }}}
             periodSeconds: 5
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -75,6 +85,9 @@ spec:
             - {name: config, mountPath: /etc/vigilante, readOnly: true}
             - {name: data, mountPath: /var/lib/vigilante}
             - {name: tmp, mountPath: /tmp}
+            {{- if (default (dict) .Values.tls).secretName }}
+            - {name: tls, mountPath: /etc/vigilante-tls, readOnly: true}
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -88,6 +101,11 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if (default (dict) .Values.tls).secretName }}
+        - name: tls
+          secret:
+            secretName: {{ (default (dict) .Values.tls).secretName }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

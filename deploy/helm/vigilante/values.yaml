@@ -10,11 +10,23 @@ imagePullSecrets: []
 # one needs PostgreSQL and HA in the config:
 #   server: {state: {backend: postgres, dsn_env: VIGILANTE_DSN}, ha: {enabled: true}}
 # Each pod advertises its own address (VIGILANTE_HA_ADVERTISE_URL is set
-# from the pod IP), so ha.advertise_url stays out of the shared config.
+# from the pod IP, https with tls below), so ha.advertise_url stays out of
+# the shared config.
 replicaCount: 1
 
 # vigilante.yaml. Keep secrets out of it: use *_ref (Vault) or *_env with
 # env / envFrom below. Ignored when existingConfigMap is set.
+#
+# It must configure authentication, or the chart refuses to render (see
+# auth.allowAnonymous): at least one of
+#   auth:
+#     service_accounts:   # token hashes from `vigilante token create`
+#       - {name: ci-deploy, token_sha256: <sha256>, roles: [{role: deployer}]}
+#     oidc: {issuer: https://sso.example.internal/realms/ops, audience: vigilante}
+#     role_bindings: [{group: sre-oncall, role: operator}]
+#   server:
+#     auth_token_env: VIGILANTE_ADMIN_TOKEN   # break-glass admin token, from
+#                                             # a Secret in env / envFrom
 config: |
   version: v1
   server:
@@ -22,8 +34,38 @@ config: |
   targets: []
   executors: {}
   services: []
-# A ConfigMap you manage (key vigilante.yaml), e.g. from GitOps.
+# A ConfigMap you manage (key vigilante.yaml), e.g. from GitOps. The chart
+# cannot read it, so it does not check auth and does not detect server.tls:
+# set tls.enabled yourself.
 existingConfigMap: ""
+
+auth:
+  # Without auth every API caller is an anonymous admin, so rendering fails
+  # when `config` has no service account, OIDC issuer or auth_token_env.
+  # true accepts that, for a throwaway development install only.
+  allowAnonymous: false
+
+# HTTPS served by the pod itself (server.tls in the config). Detected from
+# `config` (server.tls.cert_file); set enabled with existingConfigMap. It
+# switches the HA advertise URL, the probes, the port name (https) and the
+# ServiceMonitor scheme to https. An ingress in front then needs to speak
+# HTTPS to the backend (ingress-nginx:
+# nginx.ingress.kubernetes.io/backend-protocol: HTTPS).
+#
+# tls.client_auth: require is refused: kubelet probes and HA followers
+# forwarding to the leader present no client certificate. Use optional.
+#
+# HA followers forward to https://<leader pod IP>:8088 and verify the
+# certificate with the image's trust store: it needs the pod IP as a SAN
+# (e.g. cert-manager csi-driver) and a CA the pod trusts (SSL_CERT_DIR in
+# env can add a private CA directory).
+tls:
+  enabled: false
+  # A kubernetes.io/tls Secret (tls.crt, tls.key, optional ca.crt) mounted
+  # at /etc/vigilante-tls, e.g. issued by cert-manager:
+  #   server:
+  #     tls: {cert_file: /etc/vigilante-tls/tls.crt, key_file: /etc/vigilante-tls/tls.key}
+  secretName: ""
 
 # Extra environment, e.g. secrets for *_env references:
 #   - name: VIGILANTE_DSN
@@ -67,10 +109,26 @@ serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
+  # With TLS on (scheme https), how Prometheus verifies the pod certificate,
+  # e.g. {ca: {secret: {name: vigilante-tls, key: ca.crt}}, serverName: vigilante}.
+  tlsConfig: {}
 
+# Memory grows with the number of probes (targets x probes per target).
+# Measured peak heap (docs/05-roadmap.md, M5-4 load test, 2,000 targets,
+# 100 concurrent deployments): 352 MiB with 3 probes per target (6k probes),
+# 1.1 GiB with 10 (20k probes). Plan about 60 MiB per 1,000 probes plus
+# headroom; the defaults fit up to about 20k probes. Below the limit the Go
+# GC is held to goMemLimit.
 resources:
-  requests: {cpu: 100m, memory: 128Mi}
-  limits: {memory: 512Mi}
+  requests: {cpu: 100m, memory: 512Mi}
+  limits: {memory: 2Gi}
+
+# GOMEMLIMIT for the Go runtime, so the GC works harder before the container
+# reaches its memory limit instead of being OOM-killed. Empty: 90% of
+# resources.limits.memory (whole Mi/Gi/M/G values; other forms get the full
+# limit through resourceFieldRef). "off": not set. Otherwise the value as is
+# (e.g. 1800MiB).
+goMemLimit: ""
 
 podSecurityContext:
   runAsNonRoot: true

@@ -1,3 +1,4 @@
+{{- $scheme := include "vigilante.scheme" . -}}
 Vigilante {{ .Chart.AppVersion }} is starting ({{ .Values.replicaCount }} replica(s)).
 
 API and web console:
@@ -5,13 +6,19 @@ API and web console:
   https://{{ .Values.ingress.host }}/console/
 {{- else }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "vigilante.fullname" . }} 8088:{{ .Values.service.port }}
-  then http://127.0.0.1:8088/console/
+  then {{ $scheme }}://127.0.0.1:8088/console/
 {{- end }}
 
 Check the configuration from the running image:
   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "vigilante.fullname" . }} -- vigilante validate -c /etc/vigilante/vigilante.yaml
-{{- if not (contains "auth:" .Values.config) }}
+{{- if .Values.existingConfigMap }}
 
-WARNING: the config has no auth section, so every API call is accepted as an
-anonymous admin. Configure auth (OIDC, service accounts) before exposing it.
+The chart does not read existingConfigMap {{ .Values.existingConfigMap }}: make sure it
+configures auth (service accounts, OIDC). Without it every API call is accepted
+as an anonymous admin (the server logs a warning at start).
+{{- else if (default (dict) .Values.auth).allowAnonymous }}
+
+WARNING: auth.allowAnonymous is set. If the config has no auth section, every
+API call is accepted as an anonymous admin. Development only: configure auth
+(OIDC, service accounts) before anyone else can reach it.
 {{- end }}

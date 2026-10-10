@@ -16,7 +16,7 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 
 ## 서버
 
-- **인증을 반드시 켭니다.** `auth`가 없으면 모든 호출이 익명 admin이며 서버가 경고를 남깁니다. 패키지 기본 설정은 그래서 `127.0.0.1`에서만 받습니다.
+- **인증을 반드시 켭니다.** `auth`가 없으면 모든 호출이 익명 admin이며 서버가 경고를 남깁니다. 패키지 기본 설정은 그래서 `127.0.0.1`에서만 받고, Helm 차트는 인증 설정이 없으면 렌더링을 거부합니다(개발용 `auth.allowAnonymous: true`로만 허용).
 - **역할은 좁게:** CI는 `deployer@service=<서비스>`, 운영자는 `operator@team=<팀>`, admin은 소수. 승인 모드에서는 `auth.four_eyes: true`로 요청자와 승인자를 분리합니다.
 - **TLS:** `server.tls`로 직접 HTTPS를 켜거나 TLS 프록시·인그레스 뒤에 둡니다. 에이전트는 `client_auth: optional`과 에이전트 인증서로 상호 인증할 수 있습니다(토큰 인증은 그대로 필요).
 - **프로세스:** 패키지의 systemd 유닛은 `vigilante` 계정, `NoNewPrivileges`, `ProtectSystem=strict`(쓰기는 `/var/lib/vigilante`만)로 실행합니다. 컨테이너 이미지는 distroless, non-root, 읽기 전용 루트 파일시스템입니다.
