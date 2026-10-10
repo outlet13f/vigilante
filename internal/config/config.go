@@ -35,6 +35,25 @@ type Config struct {
 	// ChangeFreeze windows refuse new deployments (see freeze.go).
 	ChangeFreeze []Freeze `yaml:"change_freeze"`
 	ITSM         ITSM     `yaml:"itsm"`
+	Console      Console  `yaml:"console"`
+}
+
+// Console is the web operations console served by `vigilante server` at
+// /console/. It signs users in with auth.oidc when redirect_url is set and
+// otherwise asks for an API token.
+type Console struct {
+	Disabled bool `yaml:"disabled"`
+	// RedirectURL is this server's callback as registered with the identity
+	// provider: https://vigilante.example.internal/console/auth/callback.
+	RedirectURL string `yaml:"redirect_url"`
+	// ClientID defaults to auth.oidc.audience.
+	ClientID string `yaml:"client_id"`
+	// ClientSecretRef is for confidential clients; PKCE is always used.
+	ClientSecretRef string `yaml:"client_secret_ref"`
+	// SessionKeyRef encrypts session cookies (at least 32 characters). Share
+	// it between HA nodes; without it sessions end on restart.
+	SessionKeyRef string   `yaml:"session_key_ref"`
+	Scopes        []string `yaml:"scopes"` // default openid, profile, email
 }
 
 // ITSM connects to an IT service management system.

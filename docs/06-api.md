@@ -28,7 +28,8 @@ Vigilante 서버의 공개 계약은 [`api/openapi.yaml`](../api/openapi.yaml)(O
 | OAuth 2.0 client credentials | `POST /v2/oauth/token`으로 받은 `vat_…` (기본 1시간) | 서버 간 연동: 사내 배포 콘솔, 개발자 포털 |
 | API 키 | `vgk_…` 그대로 | 단순 연동: 스크립트, SIEM 수집 |
 | 서비스 계정 토큰 | `vgl_…` (설정 파일 `auth.service_accounts`) | CI, 에이전트 |
-| OIDC 액세스 토큰 | 사내 IdP가 발급한 JWT | 사용자, 콘솔 |
+| OIDC 토큰 | 사내 IdP가 발급한 JWT | 사용자 |
+| 콘솔 세션 쿠키 | `/console/` 로그인 후 (`Authorization` 헤더가 없을 때만) | 웹 콘솔. 변경 요청은 `X-CSRF-Token` 필요 (docs/02 `console`) |
 
 권한은 두 단계로 판단합니다. **역할 grant**(`deployer@team=payments`처럼 역할@범위)가 어느 서비스에서 무엇을 할 수 있는지 정하고, API 클라이언트는 여기에 **스코프**가 더해져 할 수 있는 일의 종류를 좁힙니다. 둘 다 통과해야 허용됩니다.
 
@@ -218,7 +219,7 @@ def verify(secret: str, headers: dict, body: bytes) -> bool:
 토큰이 없거나, 만료됐거나, 검증에 실패함.
 
 ### forbidden
-역할 또는 범위가 부족함, 또는 4-eyes 규칙 위반. 거부된 요청도 감사 기록에 남습니다.
+역할 또는 범위가 부족함, 4-eyes 규칙 위반, 또는 콘솔 세션 쿠키로 보낸 변경 요청에 `X-CSRF-Token`이 없거나 틀림. 거부된 요청도 감사 기록에 남습니다.
 
 ### not_found
 리소스가 없거나, 명세에 없는 경로.

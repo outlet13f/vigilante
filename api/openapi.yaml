@@ -294,6 +294,10 @@ paths:
       description: Cancels a running observation. A rollback already running is not interrupted.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AbortRequest'}
       responses:
         '200':
           description: The deployment after the abort request.
@@ -1619,6 +1623,11 @@ components:
         reason: {type: string, maxLength: 1000}
         executor: {type: string, description: 'Override the primary executor.'}
         targets: {type: array, items: {type: string}, description: 'Override the target set.'}
+    AbortRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: {type: string, maxLength: 1000, description: 'Recorded in the audit trail.'}
     ApprovalRequest:
       type: object
       additionalProperties: false

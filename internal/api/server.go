@@ -43,6 +43,7 @@ import (
 
 	"vigilante/internal/audit"
 	"vigilante/internal/auth"
+	"vigilante/internal/console"
 	"vigilante/internal/events"
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
@@ -67,6 +68,7 @@ type Server struct {
 	inflight map[string]bool // idempotency keys being processed
 	limits   *limiter
 	bus      *events.Bus
+	console  *console.Console
 
 	cancel context.CancelFunc
 	bg     sync.WaitGroup // observations, rollbacks and operations started by requests
@@ -126,6 +128,11 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 		return nil, err
 	}
 	s.Auth = a
+	if !e.Cfg.Console.Disabled {
+		if s.console, err = console.New(ctx, e.Cfg, s.consoleVerify, e.Log); err != nil {
+			return nil, err
+		}
+	}
 	s.bus = s.newBus()
 	s.background(s.sweepApprovals)
 	s.background(s.itsmWorker)
@@ -186,14 +193,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/webhooks/{provider}", s.webhook) // authenticated by signature/token
 	mux.HandleFunc("GET /v1/targets/{target}/metrics", s.authn(s.targetMetrics))
 	s.routesV2(mux)
+	if s.console != nil {
+		s.console.Register(mux)
+	}
 	return s.instrument(s.forwardToLeader(mux))
+}
+
+// consoleVerify accepts a console sign-in only for a user the API itself
+// accepts and who holds at least one role.
+func (s *Server) consoleVerify(ctx context.Context, raw string) error {
+	p, err := s.Auth.AuthenticateToken(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if len(p.Bindings) == 0 {
+		s.E.Audit(journal.Entry{Actor: p.ID, Source: "ui", Action: "denied", Reason: "console sign-in: no role binding"})
+		return fmt.Errorf("signed in as %s, but no auth.role_bindings entry grants a role to this user or their groups", p.ID)
+	}
+	s.E.Audit(journal.Entry{Actor: p.ID, Source: "ui", Action: "console.sign_in"})
+	return nil
 }
 
 // forwardToLeader sends every API call except /healthz, /readyz and /metrics to the HA leader when
 // this node is a follower, so clients may talk to any node.
 func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.HA == nil || s.HA.IsLeader() || local[r.URL.Path] {
+		if s.HA == nil || s.HA.IsLeader() || local[r.URL.Path] || isConsole(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -226,8 +251,20 @@ func (s *Server) forwardToLeader(next http.Handler) http.Handler {
 }
 
 // authn identifies the caller and stores the principal in the request context.
+// Without an Authorization header a console session cookie is accepted;
+// changing requests made with it must carry the CSRF token.
 func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.console != nil && r.Header.Get("Authorization") == "" {
+			if tok, ok, csrfOK := s.console.SessionToken(r); ok {
+				if !csrfOK {
+					s.fail(w, r, http.StatusForbidden, "forbidden", errors.New("console session: missing or wrong "+console.CSRFHeader+" header"))
+					return
+				}
+				r = r.Clone(context.WithValue(r.Context(), uiKey{}, true))
+				r.Header.Set("Authorization", "Bearer "+tok)
+			}
+		}
 		p, err := s.Auth.Authenticate(r)
 		if err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vigilante"`)
@@ -237,6 +274,21 @@ func (s *Server) authn(h http.HandlerFunc) http.HandlerFunc {
 		h(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
 	}
 }
+
+type uiKey struct{}
+
+// source is the audit source of a request: "ui" for the console session,
+// "api" otherwise.
+func source(r *http.Request) string { return sourceOf(r.Context()) }
+
+func sourceOf(ctx context.Context) string {
+	if ui, _ := ctx.Value(uiKey{}).(bool); ui {
+		return "ui"
+	}
+	return "api"
+}
+
+func isConsole(path string) bool { return path == "/console" || strings.HasPrefix(path, "/console/") }
 
 // svc describes a service for authorization (name + owning team).
 func (s *Server) svc(name string) auth.Service {
@@ -288,13 +340,13 @@ func (s *Server) allowAny(w http.ResponseWriter, r *http.Request, a auth.Action,
 // audit records an API action by the caller. X-Change-Ticket, when sent,
 // links the record to a change or incident ticket.
 func (s *Server) audit(r *http.Request, action, service, deployID, reason string) {
-	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: action,
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: source(r), Action: action,
 		Service: service, DeployID: deployID, Reason: reason, Ticket: r.Header.Get("X-Change-Ticket")})
 }
 
 // denied records a refused request; repeated denials are how probing shows up.
 func (s *Server) denied(r *http.Request, service string, err error) {
-	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: "api", Action: "denied",
+	s.E.Audit(journal.Entry{Actor: principalID(auth.FromContext(r.Context())), Source: source(r), Action: "denied",
 		Service: service, DeployID: r.PathValue("id"), Reason: r.Method + " " + r.URL.Path + ": " + err.Error(),
 		Ticket: r.Header.Get("X-Change-Ticket")})
 }
@@ -464,7 +516,7 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	if req.FreezeOverride != "" && !existing {
 		if f := s.E.ActiveFreeze(d.Service, time.Now()); f != nil {
 			s.E.SetFreezeOverride(d, p.ID, req.FreezeOverride)
-			s.E.Audit(journal.Entry{Actor: p.ID, Source: "api", Action: "freeze.override", Service: d.Service, DeployID: d.ID,
+			s.E.Audit(journal.Entry{Actor: p.ID, Source: sourceOf(ctx), Action: "freeze.override", Service: d.Service, DeployID: d.ID,
 				Reason: f.Name + ": " + req.FreezeOverride})
 		}
 	}

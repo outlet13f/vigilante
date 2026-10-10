@@ -324,17 +324,20 @@ services:
     rollback: {executor: x, mode: auto}
 `
 	for tail, want := range map[string]string{
-		"notify: [{type: sms, url: x}]\n":                                                  "type must be webhook, slack, teams, email or pagerduty",
-		"notify: [{type: teams}]\n":                                                        "url, url_env or url_ref required",
-		"notify: [{type: email, smtp: {host: h}}]\n":                                       "smtp.host, smtp.from and smtp.to required",
-		"notify: [{type: pagerduty}]\n":                                                    "routing_key_ref or routing_key_env",
-		"notify: [{type: slack, url: x, min_level: loud}]\n":                               "min_level",
-		"notify: [{type: slack, url: x, services: [nope]}]\n":                              "unknown service",
-		"itsm: {servicenow: {url: u}}\n":                                                   "url and credential required",
-		"itsm: {servicenow: {url: u, credential: key}}\n":                                  "must be of type basic or token",
-		"itsm: {servicenow: {url: u, credential: snow, change_gate: {on_error: maybe}}}\n": "on_error must be open or closed",
-		"itsm: {servicenow: {url: u, credential: snow, incidents: {on: [deploy]}}}\n":      "rollback_failed | circuit_opened",
-		"itsm: {servicenow: {url: u, credential: snow, incidents: {urgency: 9}}}\n":        "urgency and impact must be 1..3",
+		"notify: [{type: sms, url: x}]\n":                                                            "type must be webhook, slack, teams, email or pagerduty",
+		"notify: [{type: teams}]\n":                                                                  "url, url_env or url_ref required",
+		"notify: [{type: email, smtp: {host: h}}]\n":                                                 "smtp.host, smtp.from and smtp.to required",
+		"notify: [{type: pagerduty}]\n":                                                              "routing_key_ref or routing_key_env",
+		"notify: [{type: slack, url: x, min_level: loud}]\n":                                         "min_level",
+		"notify: [{type: slack, url: x, services: [nope]}]\n":                                        "unknown service",
+		"itsm: {servicenow: {url: u}}\n":                                                             "url and credential required",
+		"itsm: {servicenow: {url: u, credential: key}}\n":                                            "must be of type basic or token",
+		"itsm: {servicenow: {url: u, credential: snow, change_gate: {on_error: maybe}}}\n":           "on_error must be open or closed",
+		"itsm: {servicenow: {url: u, credential: snow, incidents: {on: [deploy]}}}\n":                "rollback_failed | circuit_opened",
+		"itsm: {servicenow: {url: u, credential: snow, incidents: {urgency: 9}}}\n":                  "urgency and impact must be 1..3",
+		"console: {redirect_url: https://v.example/console/auth/callback}\n":                         "needs auth.oidc",
+		"auth: {oidc: {issuer: i, audience: a}}\nconsole: {redirect_url: https://v.example/login}\n": "/console/auth/callback",
+		"console: {session_key_ref: plain-text-key}\n":                                               "console.session_key_ref",
 	} {
 		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)

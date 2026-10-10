@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -698,6 +699,14 @@ func (c *Config) Validate() error {
 	c.validateSecrets(bad)
 	c.validateFreezes(bad)
 	c.validateNotify(bad)
+	if cc := c.Console; cc.RedirectURL != "" && !cc.Disabled {
+		if c.Auth.OIDC == nil {
+			bad("console.redirect_url: needs auth.oidc (the console signs users in with it)")
+		}
+		if u, err := url.Parse(cc.RedirectURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "/console/auth/callback" {
+			bad("console.redirect_url: must be http(s)://<this server>/console/auth/callback")
+		}
+	}
 	if sn := c.ITSM.ServiceNow; sn != nil {
 		if sn.URL == "" || sn.Credential == "" {
 			bad("itsm.servicenow: url and credential required")
@@ -943,6 +952,8 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 	}
 	check("server.state.dsn_ref", c.Server.State.DSNRef)
 	check("api.webhook_signing_key_ref", c.API.WebhookSigningKeyRef)
+	check("console.session_key_ref", c.Console.SessionKeyRef)
+	check("console.client_secret_ref", c.Console.ClientSecretRef)
 	for i, n := range c.Notify {
 		check(fmt.Sprintf("notify[%d].url_ref", i), n.URLRef)
 		check(fmt.Sprintf("notify[%d].routing_key_ref", i), n.RoutingKeyRef)
@@ -989,6 +1000,14 @@ func (c *Config) Warnings() []string {
 		if s.Rollback.Mode == "" {
 			out = append(out, fmt.Sprintf("service %q: rollback.mode is not set, so a failing phase rolls back automatically (auto). "+
 				"Set mode: approve to have a person approve each rollback (recommended until the service has passed the pilot), or mode: auto to keep the current behaviour explicitly", s.Name))
+		}
+	}
+	if cc := c.Console; !cc.Disabled && cc.RedirectURL != "" {
+		if cc.SessionKeyRef == "" {
+			out = append(out, "console.session_key_ref is not set: console sign-ins end when the server restarts and do not carry over between HA nodes")
+		}
+		if strings.HasPrefix(cc.RedirectURL, "http://") {
+			out = append(out, "console.redirect_url uses http: session cookies are sent without the Secure flag; serve the console over https")
 		}
 	}
 	return out

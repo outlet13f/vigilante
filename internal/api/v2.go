@@ -723,8 +723,14 @@ func (s *Server) v2Abort(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if !s.decodeStrict(w, r, &req, true) {
+		return
+	}
 	if s.E.Abort(d.ID) {
-		s.audit(r, "deployment.abort", d.Service, d.ID, "")
+		s.audit(r, "deployment.abort", d.Service, d.ID, req.Reason)
 	}
 	dv, _ := s.deploymentV2(d.ID)
 	writeTagged(w, r, 200, dv)

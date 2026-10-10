@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vigilante 콘솔</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">Vigilante</a>
+  <nav>
+    <a href="#/" data-nav="overview">현황</a>
+    <a href="#/deployments" data-nav="deployments">배포</a>
+    <a href="#/services" data-nav="services">서비스</a>
+    <a href="#/freezes" data-nav="freezes">변경 동결</a>
+    <a href="#/audit" data-nav="audit">감사 기록</a>
+  </nav>
+  <div class="who">
+    <span id="live" class="live off" title="실시간 이벤트 연결 상태">●</span>
+    <span id="me"></span>
+    <button id="logout" class="link" hidden>로그아웃</button>
+  </div>
+</header>
+<main id="view" aria-live="polite"></main>
+<dialog id="ask">
+  <form method="dialog">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text"></p>
+    <label for="ask-reason" id="ask-label">사유 (필수, 감사 기록에 남습니다)</label>
+    <textarea id="ask-reason" rows="3" required maxlength="1000"></textarea>
+    <div class="row end">
+      <button value="cancel" formnovalidate class="secondary">취소</button>
+      <button id="ask-ok" value="ok">확인</button>
+    </div>
+  </form>
+</dialog>
+<div id="toast" role="status"></div>
+</body>
+</html>

@@ -515,3 +515,9 @@ itsm:
     credential: snow-integration
     change_gate: {enabled: true, teams: [billing], on_error: closed}
     incidents: {enabled: true, assignment_group: SRE}
+
+# Operations console at /console/. Without auth.oidc it asks for an API
+# token; with auth.oidc, add redirect_url for single sign-on:
+# console:
+#   redirect_url: https://vigilante.example.internal/console/auth/callback
+#   session_key_ref: "vault:secret/prod/vigilante#console_session_key"

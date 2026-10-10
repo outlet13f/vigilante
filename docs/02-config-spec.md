@@ -37,6 +37,7 @@ secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
 change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
 itsm:        {...}   # ServiceNow 변경 티켓 게이트·인시던트·작업 노트
+console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 ```
 
 ## `server`
@@ -507,6 +508,27 @@ api:
 `rate: 0`이고 `daily`가 없으면 한도가 없습니다. API 클라이언트별 한도와 클라이언트 등록은 설정 파일이 아니라 API(`/v2/api-clients`)로 관리하며, 상태 저장소에 남습니다. 자세한 내용은 docs/06-api.md.
 
 웹훅 서명 비밀은 마스터 키와 구독 ID로 계산하므로 상태 저장소에는 비밀이 남지 않습니다. 마스터 키를 바꾸면 모든 구독의 비밀이 바뀌므로, 키 교체 후에는 각 구독에 `POST /v2/webhooks/{id}/secret`로 새 비밀을 받아 수신 측에 전달하십시오.
+
+## `console` — 웹 운영 콘솔
+
+`vigilante server`는 `/console/`에서 운영 콘솔을 제공합니다. 화면은 바이너리에 내장되어 있고 외부 CDN을 쓰지 않으므로 폐쇄망에서도 그대로 동작합니다. 콘솔은 공개 API(v2)만 호출하므로 사용자가 할 수 있는 일은 그 사용자의 역할·범위와 같습니다.
+
+```yaml
+console:
+  redirect_url: https://vigilante.example.internal/console/auth/callback   # IdP에 등록한 콜백. 있으면 SSO 로그인
+  session_key_ref: "vault:secret/prod/vigilante#console_session_key"     # 세션 쿠키 암호화 키(32자 이상). HA 노드가 같은 값을 써야 함
+  client_id: vigilante-console     # 생략 시 auth.oidc.audience
+  client_secret_ref: "vault:secret/prod/vigilante#console_client_secret" # 기밀 클라이언트일 때만. PKCE는 항상 사용
+  scopes: [openid, profile, email] # 기본값. 그룹 클레임이 별도 스코프면 추가
+  # disabled: true                 # 콘솔을 끔
+```
+
+- **SSO 로그인:** `auth.oidc`와 `redirect_url`이 있으면 OIDC authorization code + PKCE로 로그인합니다. 콘솔이 받은 ID 토큰을 API와 같은 방식(`auth.oidc`, `auth.role_bindings`)으로 검증하므로, IdP의 `aud`가 `auth.oidc.audience`와 같아야 합니다. 역할 바인딩이 하나도 없는 사용자는 로그인을 거부하고 감사 기록에 남깁니다.
+- **세션:** ID 토큰을 AES-GCM으로 암호화한 HttpOnly 쿠키(`SameSite=Lax`, https면 `Secure`)에 담습니다. 서버에는 세션 상태가 없어 HA의 어느 노드든 받을 수 있습니다. 세션은 ID 토큰 만료 시각(최대 12시간)에 끝납니다. `session_key_ref`가 없으면 재시작마다 키가 바뀌어 다시 로그인해야 합니다(`validate`가 경고).
+- **CSRF:** 쿠키로 인증한 변경 요청은 `X-CSRF-Token` 헤더에 CSRF 쿠키 값을 담아야 합니다(double-submit). 없으면 `403 forbidden`입니다. `Authorization` 헤더가 있는 요청은 쿠키를 보지 않으므로 API 클라이언트에는 영향이 없습니다.
+- **토큰 로그인:** SSO가 없으면 콘솔이 서비스 계정 토큰이나 API 키를 묻습니다. 토큰은 그 브라우저 탭(sessionStorage)에만 남습니다.
+- **화면:** 현황(서킷·조치 필요·진행 중·최근 배포·실시간 이벤트), 배포 목록·상세(승인·거절, 롤백, 관측 중단, 규칙 위반, 작업, 타임라인), 서비스, 변경 동결(선언·종료), 감사 기록. 모든 조작은 사유를 받아 감사 기록에 남기며(출처 `ui`), 버튼은 역할에 맞는 것만 보입니다. 실시간 갱신은 `GET /v2/events`(SSE)를 씁니다.
+- 보안 헤더: `Content-Security-Policy`(자기 출처만, 인라인 스크립트 없음), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. API 데이터는 모두 텍스트로만 화면에 넣습니다.
 
 ## `secrets` — 비밀값 출처
 
