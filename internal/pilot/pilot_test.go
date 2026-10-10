@@ -103,6 +103,12 @@ func TestGatePasses(t *testing.T) {
 	if !r.GatePassed {
 		t.Fatalf("gate should pass: %+v", r.Gate)
 	}
+	// Lab scenario runs are not production verdicts.
+	labRun := dep("lab-1", "web", false, nil, "OBSERVING: phase canary", "+5s verdict FAIL: injected", "ROLLING_BACK: x", "+5s ROLLED_BACK: restored")
+	labRun.CreatedBy = "lab:F5 VE 17.1"
+	if r := Compute(append(deps, labRun), Options{}); r.Deployments != 31 || len(r.NeedsReview) != 0 {
+		t.Fatalf("lab run counted: %d deployments, review %v", r.Deployments, r.NeedsReview)
+	}
 	// Filters: service and period.
 	if r := Compute(deps, Options{Services: []string{"api"}}); r.Deployments != 0 {
 		t.Fatalf("service filter: %d", r.Deployments)

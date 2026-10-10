@@ -70,13 +70,10 @@ type Local struct {
 func (l *Local) String() string { return "local" }
 
 func (l *Local) command(ctx context.Context, cmd string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "cmd", "/C", cmd)
-	}
-	if l.Sudo {
+	if l.Sudo && runtime.GOOS != "windows" {
 		return exec.CommandContext(ctx, "sudo", "-n", "sh", "-c", cmd)
 	}
-	return exec.CommandContext(ctx, "sh", "-c", cmd)
+	return shellCommand(ctx, cmd)
 }
 
 func (l *Local) Run(ctx context.Context, cmd string, stdin io.Reader) (string, error) {

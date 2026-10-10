@@ -63,6 +63,7 @@ Usage:
   vigilante store    status | migrate [--down-to N --yes]   (PostgreSQL state store schema)
   vigilante feedback --id ID --outcome correct|false_positive|false_negative|unclear [--incident INC] [--note T] [--server URL]
   vigilante pilot    report [--since DATE] [--until DATE] [--service A,B] [--json] [--out F]   (decision quality; exit 4 = gate not met)
+  vigilante lab      run --service S --label EQUIPMENT --inject CMD [--reset CMD] [--repeat 3] | summary FILE...   (M8 lab scenario)
   vigilante support-bundle -c FILE [--server URL] [--log FILE]... [--out F.zip]   (diagnostics, secrets removed)
   vigilante plugins
   vigilante version
@@ -220,6 +221,8 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdFeedback(ctx, args)
 	case "pilot":
 		return cmdPilot(ctx, args)
+	case "lab":
+		return cmdLab(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":

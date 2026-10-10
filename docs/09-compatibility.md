@@ -56,8 +56,18 @@
 
 ## 검증 기록 방법 (M8 랩)
 
-플러그인을 실장비로 확인하면 다음을 함께 바꿉니다.
+랩에서는 조합(서비스 하나 = 실행기 + 트래픽 제어기 + 프로브)마다 `vigilante lab run`으로 실제 시나리오를 돌립니다. 운영 경로(`vigilante watch`와 같은 엔진)를 그대로 쓰므로, 통과하면 그 조합이 실제로 동작한다는 뜻입니다.
+
+```bash
+# 랩 설정: 대상 VM·LB·자격증명을 실제 장비로. 먼저 doctor가 통과해야 시작합니다.
+vigilante lab run -c lab.yaml --service order-os --label "사내 OpenStack 2024.1 (Octavia)" \
+  --inject "ansible-playbook deploy-bad.yml" --reset "ansible-playbook deploy-good.yml" --repeat 3
+vigilante lab summary lab-results.jsonl          # 장비·조합별 실행 수, 통과 수, 탐지·롤백 시간(중앙값), 문제
+```
+
+한 번의 실행은 체크포인트(스냅샷) → 풀 상태 기록 → 불량 버전 배포(`--inject`) → 관측·탐지 → 드레인 → 복원·확인 → 트래픽 복귀이고, 끝나면 이전에 트래픽을 받던 멤버가 모두 다시 켜졌는지 확인합니다(LB가 성공이라고 답해도 멤버가 빠져 있으면 실패). 승인 모드 서비스는 랩이 바로 승인합니다. 결과는 실행마다 한 줄씩 `lab-results.jsonl`에 쌓이며, 랩 실행은 파일럿 판정 품질 보고서에서 제외됩니다. CI의 E2E 데모도 같은 명령을 실제 프로세스에 돌립니다.
+
+플러그인이 랩에서 3회 연속 통과하면 다음을 함께 바꿉니다.
 
 1. `internal/compat/compat.go`의 항목: `Verified`와 검증 대상(제품·버전, 예: `F5 BIG-IP VE 17.1, iControl REST`).
-2. 이 문서의 표: 상태와 검증 대상.
-3. 가능하면 재현 가능한 통합 테스트(랩 전용 빌드 태그)와 그 실행 결과 링크.
+2. 이 문서의 표: 상태와 검증 대상, `vigilante lab summary` 표를 아래에 붙여 근거로 남김.

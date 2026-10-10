@@ -75,6 +75,7 @@ vigilante store status -c vigilante.yaml                               # Postgre
 vigilante support-bundle -c vigilante.yaml --server https://vigilante:8088   # 진단 zip (비밀값 제거)
 vigilante feedback --id $BUILD --outcome false_positive --note "..."       # 판정 평가 (오탐·미탐 측정)
 vigilante pilot report -c vigilante.yaml --since 2026-11-01            # 판정 품질 보고서와 출시 게이트 (미달 시 종료 코드 4)
+vigilante lab run -c lab.yaml --service S --label "F5 VE 17.1" --inject "..."   # 실장비 시나리오 (docs/09)
 ```
 
 설치 패키지(rpm·deb), 컨테이너 이미지, Helm 차트, 폐쇄망 번들은 릴리스마다 나옵니다. [docs/07-install.md](docs/07-install.md)를 보십시오.

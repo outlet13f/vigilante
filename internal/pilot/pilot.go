@@ -157,6 +157,9 @@ func Compute(deps []*model.Deployment, opt Options) *Report {
 	}
 	r := &Report{HoldCauses: map[string]int{}, PerService: map[string]*Verdicts{}, From: opt.Since, To: opt.Until}
 	keep := func(d *model.Deployment) bool {
+		if strings.HasPrefix(d.CreatedBy, "lab:") {
+			return false // lab scenario runs (vigilante lab) are not production verdicts
+		}
 		if len(opt.Services) > 0 && !contains(opt.Services, d.Service) {
 			return false
 		}
