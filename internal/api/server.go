@@ -67,6 +67,35 @@ type Server struct {
 	inflight map[string]bool // idempotency keys being processed
 	limits   *limiter
 	bus      *events.Bus
+
+	cancel context.CancelFunc
+	bg     sync.WaitGroup // observations, rollbacks and operations started by requests
+}
+
+// background runs work that outlives its request; Close waits for it.
+func (s *Server) background(f func()) {
+	s.bg.Add(1)
+	go func() {
+		defer s.bg.Done()
+		f()
+	}()
+}
+
+// Close cancels background work (observations, rollbacks in progress,
+// webhook delivery) and waits up to 30 seconds for it to record its final
+// state. The engine and its store stay open; close them afterwards.
+func (s *Server) Close() {
+	s.cancel()
+	done := make(chan struct{})
+	go func() {
+		s.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		s.E.Log.Warn("background work still running at shutdown")
+	}
 }
 
 // Leadership is what the API needs from the HA elector.
@@ -82,7 +111,8 @@ const forwardedHeader = "X-Vigilante-Forwarded-By"
 // New builds the API server. With auth.oidc configured it contacts the
 // identity provider for its discovery document.
 func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
-	s := &Server{E: e, ctx: ctx, agents: map[string]time.Time{}, proxies: map[string]*httputil.ReverseProxy{}}
+	s := &Server{E: e, agents: map[string]time.Time{}, proxies: map[string]*httputil.ReverseProxy{}}
+	s.ctx, s.cancel = context.WithCancel(ctx)
 	var legacy string
 	if env := e.Cfg.Server.AuthTokenEnv; env != "" {
 		legacy = os.Getenv(env)
@@ -509,12 +539,12 @@ func (s *Server) launch(d *model.Deployment, phase model.Phase) error {
 	if err := checkLaunch(d); err != nil {
 		return err
 	}
-	go func() {
+	s.background(func() {
 		if err := s.E.Watch(s.ctx, d, phase); err != nil {
 			s.E.Log.Error("watch failed", "deployment", d.ID, "err", err)
 			s.E.MarkBlocked(d, err)
 		}
-	}()
+	})
 	return nil
 }
 
@@ -566,7 +596,9 @@ func (s *Server) manualRollback(w http.ResponseWriter, r *http.Request) {
 		reason = "manual rollback via API"
 	}
 	s.audit(r, "rollback.manual", d.Service, d.ID, reason)
-	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
+	s.background(func() {
+		_ = s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
+	})
 	writeJSON(w, 202, map[string]string{"status": "rollback started"})
 }
 
@@ -584,7 +616,9 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "escalation.approve", d.Service, d.ID, "")
-	go s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
+	s.background(func() {
+		_ = s.E.Rollback(s.ctx, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
+	})
 	writeJSON(w, 202, map[string]string{"status": "approved; escalation running"})
 }
 
