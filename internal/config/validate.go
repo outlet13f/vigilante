@@ -351,6 +351,39 @@ func set(xs ...string) map[string]bool {
 
 // Validate checks types and every cross reference so that a bad config is
 // rejected by `vigilante validate` in CI rather than at 3 a.m. mid-rollback.
+// validateRemoteGrep: a log probe filtered on the target has no lines metric.
+func validateRemoteGrep(s Service, bad func(string, ...any)) {
+	filtered := map[string]bool{}
+	for _, p := range s.Probes {
+		if p.Log != nil && p.Log.RemoteGrep != "" {
+			filtered[p.ID] = true
+		}
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	var walk func(n Node)
+	walk = func(n Node) {
+		for _, c := range n.Any {
+			walk(c)
+		}
+		for _, c := range n.All {
+			walk(c)
+		}
+		if n.Not != nil {
+			walk(*n.Not)
+		}
+		for _, m := range []string{n.Metric, n.RatioOf} {
+			if id, metric, ok := strings.Cut(m, "."); ok && filtered[id] && metric == "lines" {
+				bad("service %s: probe %s uses remote_grep, so %s.lines is not available (only matching lines reach Vigilante)", s.Name, id, id)
+			}
+		}
+	}
+	for _, r := range s.Rules {
+		walk(r.When)
+	}
+}
+
 func (c *Config) Validate() error {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -391,6 +424,16 @@ func (c *Config) Validate() error {
 	for _, t := range c.Targets {
 		if t.Connection.Bastion != "" && !targets[t.Connection.Bastion] {
 			bad("target %q: unknown bastion %q", t.Name, t.Connection.Bastion)
+		}
+		switch t.Connection.SudoScope {
+		case "", "all", "changes":
+		default:
+			bad("target %q: connection.sudo_scope must be all or changes", t.Name)
+		}
+		if cn := t.Connection; cn.MaxSessions < 0 || (cn.ReservedSessions != nil && *cn.ReservedSessions < 0) {
+			bad("target %q: max_sessions and reserved_sessions cannot be negative", t.Name)
+		} else if cn.ReservedSessions != nil && cn.MaxSessions > 0 && *cn.ReservedSessions >= cn.MaxSessions {
+			bad("target %q: reserved_sessions (%d) must be below max_sessions (%d), or collection gets no session", t.Name, *cn.ReservedSessions, cn.MaxSessions)
 		}
 	}
 	checkHosts := func(kind, name string, hosts []string) {
@@ -608,6 +651,7 @@ func (c *Config) Validate() error {
 				bad("service %q rule %q: %v", s.Name, r.Name, err)
 			}
 		}
+		validateRemoteGrep(s, bad)
 		// Without a rollback rule nothing can fail, so every deployment would PASS.
 		if len(rollbackRules) == 0 {
 			bad("service %q: at least one rule with action: rollback is required (without one every deployment passes)", s.Name)
@@ -1030,6 +1074,16 @@ func (c *Config) Warnings() []string {
 			out = append(out, fmt.Sprintf("service %q: rollback.mode is not set, so a failing phase rolls back automatically (auto). "+
 				"Set mode: approve to have a person approve each rollback (recommended until the service has passed the pilot), or mode: auto to keep the current behaviour explicitly", s.Name))
 		}
+	}
+	var rootSudo []string
+	for _, t := range c.Targets {
+		if t.Connection.Sudo && t.Connection.SudoScope != "changes" {
+			rootSudo = append(rootSudo, t.Name)
+		}
+	}
+	if len(rootSudo) > 0 {
+		out = append(out, fmt.Sprintf("connection.sudo runs every command as `sudo -n sh -c` on %s, which needs unrestricted sudo (root). "+
+			"Set connection.sudo_scope: changes and install the rules from `vigilante sudoers` (docs/10-security.md)", strings.Join(rootSudo, ", ")))
 	}
 	if cc := c.Console; !cc.Disabled && cc.RedirectURL != "" {
 		if cc.SessionKeyRef == "" {

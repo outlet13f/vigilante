@@ -72,7 +72,9 @@ func (s *symlinkExec) release(rc *RunContext) (link, target string, err error) {
 	return link, path.Join(dir, rel), nil
 }
 
-func (s *symlinkExec) restartCmd(rc *RunContext) (string, error) {
+// restartCmd is the service restart; sudo prefixes the built-in ones (a
+// custom restart_cmd is used as written).
+func (s *symlinkExec) restartCmd(rc *RunContext, sudo string) (string, error) {
 	if s.spec.RestartCmd != "" {
 		return rc.render(s.spec.RestartCmd)
 	}
@@ -82,11 +84,45 @@ func (s *symlinkExec) restartCmd(rc *RunContext) (string, error) {
 	}
 	switch s.spec.Init {
 	case "systemd":
-		return "systemctl restart " + q.ShellQuote(unit), nil
+		return sudo + "systemctl restart " + q.ShellQuote(unit), nil
 	case "sysv":
-		return "/etc/init.d/" + unit + " restart", nil
+		return sudo + "/etc/init.d/" + unit + " restart", nil
 	}
 	return "", nil
+}
+
+// SudoRules: switching the link and restarting the unit.
+func (s *symlinkExec) SudoRules(rc *RunContext) ([]SudoRule, error) {
+	link, err := rc.render(s.spec.Link)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := rc.render(s.spec.ReleasesDir)
+	if err != nil {
+		return nil, err
+	}
+	host := rc.Target.Name
+	var out []SudoRule
+	if s.atomic() {
+		out = append(out,
+			SudoRule{host, "ln", "-sfn " + dir + "/* " + link + ".vigilante-tmp", "point a temporary link at the previous release"},
+			SudoRule{host, "mv", "-Tf " + link + ".vigilante-tmp " + link, "swap the release link atomically"})
+	} else {
+		out = append(out, SudoRule{host, "ln", "-sfn " + dir + "/* " + link, "point the release link at the previous release"})
+	}
+	if s.spec.RestartCmd == "" {
+		unit, err := rc.render(s.spec.Unit)
+		if err != nil {
+			return nil, err
+		}
+		switch s.spec.Init {
+		case "systemd":
+			out = append(out, SudoRule{host, "systemctl", "restart " + unit, "restart the service"})
+		case "sysv":
+			out = append(out, SudoRule{host, "/etc/init.d/" + unit, "restart", "restart the service"})
+		}
+	}
+	return out, nil
 }
 
 func (s *symlinkExec) Rollback(ctx context.Context, rc *RunContext) error {
@@ -99,16 +135,17 @@ func (s *symlinkExec) Rollback(ctx context.Context, rc *RunContext) error {
 		return err
 	}
 	tmp := link + ".vigilante-tmp"
+	sudo := q.Sudo(r)
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	fmt.Fprintf(&b, "test -d %s\n", q.ShellQuote(target))
 	if s.atomic() {
-		fmt.Fprintf(&b, "ln -sfn %s %s\n", q.ShellQuote(target), q.ShellQuote(tmp))
-		fmt.Fprintf(&b, "mv -Tf %s %s\n", q.ShellQuote(tmp), q.ShellQuote(link))
+		fmt.Fprintf(&b, "%sln -sfn %s %s\n", sudo, q.ShellQuote(target), q.ShellQuote(tmp))
+		fmt.Fprintf(&b, "%smv -Tf %s %s\n", sudo, q.ShellQuote(tmp), q.ShellQuote(link))
 	} else { // AIX / Solaris: no mv -T; ln -sfn is the best available
-		fmt.Fprintf(&b, "ln -sfn %s %s\n", q.ShellQuote(target), q.ShellQuote(link))
+		fmt.Fprintf(&b, "%sln -sfn %s %s\n", sudo, q.ShellQuote(target), q.ShellQuote(link))
 	}
-	restart, err := s.restartCmd(rc)
+	restart, err := s.restartCmd(rc, sudo)
 	if err != nil {
 		return err
 	}

@@ -168,9 +168,15 @@ credentials:
     credential: ssh-deploy
     port: 22
     bastion: bastion-dc1     # 다른 target을 점프 호스트로 (다단 가능)
-    sudo: true               # 모든 명령을 sudo -n sh -c 로 감쌈
+    sudo: true               # 변경 명령에 sudo 사용
+    sudo_scope: changes      # changes: 변경 명령만 하나씩 sudo -n (권장) | all(기본): 모든 명령을 sudo -n sh -c 로 감쌈
     timeout: 10s
+    max_sessions: 8          # 이 대상에 동시에 여는 SSH 세션 상한 (sshd MaxSessions 기본 10보다 작게)
+    reserved_sessions: 2     # 그중 롤백·트래픽 변경만 쓰는 몫
 ```
+
+- **`sudo_scope`:** `all`(기존 동작, 기본값)은 모든 명령을 `sudo -n sh -c '...'`로 실행하므로 sudoers에 무제한 권한이 필요하고, `validate`가 경고합니다. `changes`는 읽기(`readlink`, `cat`, `tail`, `systemctl is-active`, `virsh domstate` 등)를 sudo 없이 실행하고, 바꾸는 명령(`ln`, `mv`, `systemctl restart`, `nginx -s reload`, `virsh snapshot-revert` 등)에만 하나씩 `sudo -n`을 붙입니다. 필요한 sudoers 규칙은 `vigilante sudoers`가 대상별로 만들어 주고, `vigilante doctor`가 규칙마다 `sudo -n -l`로 허용 여부를 확인합니다(실행하지 않음). 직접 쓴 명령(`exec` 실행기, `restart_cmd`, 바꾼 `test_cmd`·`reload_cmd`)은 쓴 그대로 실행되므로 필요하면 명령 안에 `sudo -n`을 넣고 규칙을 직접 추가합니다.
+- **SSH 세션 예산:** 로그 스트림은 실행되는 동안 세션을 하나씩 쥡니다. 세션이 모자라 롤백 명령이 막히지 않도록, 수집은 `max_sessions - reserved_sessions`까지만 쓰고 기다리며, 롤백 단계와 트래픽 드레인·복귀만 예약분을 씁니다. 대기는 `vigilante_ssh_session_waits_total{priority}`로 보이고, `doctor`가 로그 스트림 수와 수집 몫을 비교합니다.
 
 ## `services[].probes[]` — 수집 플러그인
 
@@ -183,9 +189,9 @@ credentials:
 | `tcp` | `address` | `up`, `latency_ms`(connect), `consecutive_*` | |
 | `host` | `devices[]`(생략 시 sd*/vd*/xvd*/nvme*/dm-*) | `load1`, `load_per_cpu`, `cpu_busy_pct`, `mem_available_pct`, `mem_available_mb`, `disk_util_pct`(최대 장치), `cpu_count`, `up` | `/proc` 1회 왕복. Linux 전용 |
 | `docker` | `container`, `socket`(기본 `/var/run/docker.sock`) 또는 `host` | `running`, `restart_count`, `restarts`(관측 시작 후 증가분), `oom_killed`, `health_ok`, 이벤트: `oom_events`, `die_events`, `restart_events` | SSH 터널로 원격 소켓 접근. Podman 호환 소켓 지원 |
-| `log` | `path`, `patterns{name: regex}` | 초당: `lines`, `match.<name>` | 원격 `tail -n0 -F`, 로컬은 로테이션(inode/truncate) 감지 |
+| `log` | `path`, `patterns{name: regex}`, `remote_grep`(선택, `grep -E` 식) | 초당: `lines`, `match.<name>` | 원격 `tail -n0 -F`, 로컬은 로테이션(inode/truncate) 감지. `remote_grep`이 있으면 대상에서 `grep --line-buffered -E`로 먼저 걸러 맞는 줄만 SSH로 보냄(대용량 로그). 이때 `lines`는 없으며 이를 쓰는 규칙은 `validate`가 거부. 대상 grep이 식과 `--line-buffered`를 받는지 `doctor`가 확인 |
 | `access_log` | `path`, `format`(combined\|json), `status_field`, `latency_field`, `latency_unit`(s\|ms) | 초당: `requests`, `count_5xx`, `count_4xx`, `error_rate_5xx`(%), 요청별 `latency_ms`(초당 256개 샘플링), `unparsed` | combined 뒤의 `$request_time` 자동 인식 |
-| `db` | `driver`(postgres\|mysql), `dsn` 또는 `dsn_env`, `pool_size`(기본 3), `query`(기본 `SELECT 1`) | `up`, `pool_acquired`, `pool_acquire_ms`, `query_ms`, `consecutive_*` | `pool_size`개 커넥션을 **동시에** 확보 → 풀 고갈/`max_connections` 문제 검출 |
+| `db` | `driver`(postgres\|mysql), `dsn` 또는 `dsn_env`, `pool_size`(기본 3), `query`(기본 `SELECT 1`), `pool_check_interval`(기본 `1m`) | `up`, `query_ms`, `pool_acquired`·`pool_acquire_ms`(전체 점검 때), `consecutive_*` | 매 주기는 열어 둔 커넥션 1개로 쿼리. `pool_check_interval`마다 `pool_size`개 새 커넥션을 **동시에** 확보 → 풀 고갈/`max_connections` 문제 검출. `0s`면 매 주기 전체 점검(이전 동작) |
 
 모든 프로브는 프로세스가 죽거나 시작 실패 시 `<id>.probe_error`를 남기고 지수 백오프로 재시작됩니다.
 

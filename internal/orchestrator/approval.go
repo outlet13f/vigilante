@@ -11,6 +11,7 @@ import (
 	"vigilante/internal/model"
 	"vigilante/internal/notify"
 	"vigilante/internal/telemetry"
+	"vigilante/internal/transport"
 )
 
 // ErrNoPendingRollback means there is no rollback waiting for a decision.
@@ -95,6 +96,7 @@ func (e *Engine) DecideRollback(ctx context.Context, d *model.Deployment, actor 
 
 // restoreTraffic puts drained targets back into rotation.
 func (e *Engine) restoreTraffic(ctx context.Context, d *model.Deployment, svc *config.Service, targets []string) string {
+	ctx = transport.Urgent(ctx)
 	tc, err := e.traffic(svc)
 	if err != nil || tc == nil {
 		return fmt.Sprintf("could not re-enable %v: no traffic controller (%v)", targets, err)

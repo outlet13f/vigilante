@@ -26,6 +26,7 @@ import (
 	"vigilante/internal/executor"
 	"vigilante/internal/probe"
 	"vigilante/internal/secrets"
+	"vigilante/internal/sudoers"
 	"vigilante/internal/tmpl"
 	"vigilante/internal/transport"
 )
@@ -56,10 +57,11 @@ const (
 	ScopeProbe      = "프로브"
 	ScopeExecutor   = "실행기"
 	ScopeTraffic    = "트래픽"
+	ScopeSudo       = "sudo"
 	ScopeCapacity   = "용량"
 )
 
-var scopeOrder = map[string]int{ScopeCredential: 0, ScopeTarget: 1, ScopeProbe: 2, ScopeExecutor: 3, ScopeTraffic: 4, ScopeCapacity: 5}
+var scopeOrder = map[string]int{ScopeCredential: 0, ScopeTarget: 1, ScopeProbe: 2, ScopeExecutor: 3, ScopeTraffic: 4, ScopeSudo: 5, ScopeCapacity: 6}
 
 type Options struct {
 	Service     string // "" = every service
@@ -128,6 +130,9 @@ func Run(ctx context.Context, cfg *config.Config, opt Options) ([]Check, error) 
 		}
 	}
 	jobs = append(jobs, func(context.Context) []Check { return d.capacity(services) })
+	for _, job := range d.sudoJobs(services) {
+		jobs = append(jobs, job)
+	}
 
 	results := make([][]Check, len(jobs))
 	sem := make(chan struct{}, 8)
@@ -440,6 +445,17 @@ func (d *run) logProbe(ctx context.Context, c Check, s *config.Service, t config
 	}
 	if p.AccessLog == nil {
 		c.Status, c.Detail = OK, fmt.Sprintf("읽기 가능, 최근 %d줄", len(lines))
+		if g := p.Log.RemoteGrep; g != "" {
+			if _, isLocal := r.(*transport.Local); !isLocal {
+				// exit 1 = no match (fine); 2 = bad expression or no --line-buffered
+				if _, err := r.Run(ctx, "printf 'vigilante\\n' | grep --line-buffered -E "+transport.ShellQuote(g)+"; test $? -le 1", nil); err != nil {
+					c.Status, c.Detail = Fail, "remote_grep을 대상의 grep이 실행하지 못함: "+err.Error()
+					c.Hint = "grep -E 문법(POSIX ERE)인지, 대상 grep이 --line-buffered를 지원하는지(GNU grep) 확인하십시오"
+				} else {
+					c.Detail += ", remote_grep 확인"
+				}
+			}
+		}
 		return c
 	}
 	if len(lines) == 0 {
@@ -578,6 +594,66 @@ func (d *run) traffic(ctx context.Context, s *config.Service, first bool) []Chec
 	return out
 }
 
+// sudoJobs checks, per host with sudo_scope: changes, that every command
+// Vigilante will run with sudo is allowed (`sudo -n -l`, which runs nothing).
+// Hosts with plain connection.sudo get a warning: that needs unrestricted sudo.
+func (d *run) sudoJobs(services []*config.Service) []func(context.Context) []Check {
+	selected := map[string]bool{}
+	for _, s := range services {
+		selected[s.Name] = true
+	}
+	rules, _ := sudoers.Rules(d.cfg)
+	var mine []sudoers.Rule
+	for _, r := range rules {
+		if selected[r.Service] {
+			mine = append(mine, r)
+		}
+	}
+	var jobs []func(context.Context) []Check
+	for _, h := range sudoers.Group(d.cfg, mine) {
+		h := h
+		if !h.Sudo {
+			continue // commands run as the login user: file permissions decide
+		}
+		if h.Scope != "changes" {
+			jobs = append(jobs, func(context.Context) []Check {
+				return []Check{{Scope: ScopeSudo, Subject: h.Name, Name: "sudo 범위", Status: Warn,
+					Detail: "connection.sudo가 모든 명령을 `sudo -n sh -c`로 실행합니다 (무제한 sudo 필요)",
+					Hint:   "connection.sudo_scope: changes로 바꾸고 `vigilante sudoers --target " + h.Name + "`가 만든 규칙만 허용하십시오"}}
+			})
+			continue
+		}
+		jobs = append(jobs, func(ctx context.Context) []Check {
+			r, err := d.opt.Runners(h.Name)
+			if err != nil {
+				return []Check{{Scope: ScopeSudo, Subject: h.Name, Name: "sudo 규칙", Status: Fail, Detail: err.Error()}}
+			}
+			var out []Check
+			for _, rule := range h.Rules {
+				c := Check{Scope: ScopeSudo, Subject: h.Name, Name: rule.Command + " " + rule.Args}
+				path, found := sudoers.Resolve(ctx, r, rule.Command)
+				args := strings.Fields(sudoers.Example(rule.Args))
+				for i := range args {
+					args[i] = transport.ShellQuote(args[i])
+				}
+				_, err := r.Run(ctx, "sudo -n -l "+transport.ShellQuote(path)+" "+strings.Join(args, " "), nil)
+				switch {
+				case err == nil:
+					c.Status, c.Detail = OK, path+" 허용됨"
+				case !found:
+					c.Status, c.Detail = Fail, rule.Command+"를 찾지 못했습니다 ("+rule.Why+")"
+				default:
+					c.Status, c.Detail = Fail, "sudo가 허용하지 않습니다: "+rule.Why
+					c.Hint = "`vigilante sudoers --target " + h.Name + "`가 만든 규칙을 /etc/sudoers.d에 설치하십시오"
+				}
+				out = append(out, c)
+			}
+			return out
+		})
+	}
+	return jobs
+}
+
 // OpenSSH's default MaxSessions is 10 sessions per connection.
 const sshMaxSessions = 10
 
@@ -608,12 +684,24 @@ func (d *run) capacity(services []*config.Service) []Check {
 		if t.Connection.Type != "ssh" {
 			continue
 		}
-		total := streams[tn] + polls[tn] + 2
+		budget, reserved := t.Connection.MaxSessions, transport.DefaultReservedSessions
+		if budget <= 0 {
+			budget = transport.DefaultMaxSessions
+		}
+		if t.Connection.ReservedSessions != nil {
+			reserved = *t.Connection.ReservedSessions
+		}
+		share := budget - reserved
 		c := Check{Scope: ScopeCapacity, Subject: tn, Name: "SSH 세션 수",
-			Detail: fmt.Sprintf("상시 로그 스트림 %d + 주기 명령 %d + 롤백 여유 2 = %d (OpenSSH 기본 MaxSessions %d)", streams[tn], polls[tn], total, sshMaxSessions)}
-		if total > sshMaxSessions {
-			c.Status, c.Hint = Warn, "sshd_config의 MaxSessions를 늘리거나, 로그가 많은 서버는 에이전트 모드를 쓰십시오. 세션이 모자라면 롤백 명령이 실행되지 못할 수 있습니다"
-		} else {
+			Detail: fmt.Sprintf("상시 로그 스트림 %d + 주기 명령 %d / 수집 몫 %d (세션 한도 %d 중 롤백 예약 %d)", streams[tn], polls[tn], share, budget, reserved)}
+		switch {
+		case streams[tn] >= share:
+			c.Status, c.Hint = Fail, "로그 스트림이 수집 몫을 다 차지해 일부 로그 프로브와 주기 명령이 세션을 얻지 못합니다. 이 서버는 에이전트 모드를 쓰거나, sshd MaxSessions와 함께 connection.max_sessions를 늘리십시오"
+		case streams[tn]+polls[tn] > share:
+			c.Status, c.Hint = Warn, "주기 명령이 세션을 기다리게 되어 수집 간격이 늘어날 수 있습니다(롤백용 예약 세션은 그대로). 에이전트 모드나 더 큰 max_sessions를 고려하십시오"
+		case budget > sshMaxSessions:
+			c.Status, c.Hint = Warn, fmt.Sprintf("max_sessions %d가 OpenSSH 기본 MaxSessions %d보다 큽니다. sshd_config의 MaxSessions도 함께 올리십시오", budget, sshMaxSessions)
+		default:
 			c.Status = OK
 		}
 		out = append(out, c)
@@ -623,9 +711,16 @@ func (d *run) capacity(services []*config.Service) []Check {
 			if p.Type != "db" || p.DB == nil || p.Interval <= 0 {
 				continue
 			}
-			perSec := float64(p.DB.PoolSize) / p.Interval.Seconds() * float64(len(s.Targets))
+			every := probe.DefaultPoolCheckInterval
+			if p.DB.PoolCheckInterval != nil {
+				every = *p.DB.PoolCheckInterval
+			}
+			if every <= 0 || every < p.Interval {
+				every = p.Interval // full check on every interval
+			}
+			perSec := float64(p.DB.PoolSize) / every.Seconds() * float64(len(s.Targets))
 			c := Check{Scope: ScopeCapacity, Subject: s.Name, Name: "DB 프로브 " + p.ID + " 새 커넥션",
-				Detail: fmt.Sprintf("초당 %.1f개 (pool_size %d × 대상 %d / %s)", perSec, p.DB.PoolSize, len(s.Targets), p.Interval)}
+				Detail: fmt.Sprintf("초당 %.1f개 (pool_size %d × 대상 %d / 전체 점검 주기 %s, 그 사이는 연결 1개 재사용)", perSec, p.DB.PoolSize, len(s.Targets), every)}
 			if perSec > 1 {
 				c.Status, c.Hint = Warn, "DB 인증·접속 부하가 됩니다. interval을 늘리거나 pool_size를 줄이십시오"
 			} else {

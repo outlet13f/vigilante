@@ -27,10 +27,11 @@ import (
 // Manager hands out Runners per target and pools SSH connections so that a
 // hundred probes on one host share a single TCP/SSH session.
 type Manager struct {
-	cfg   *config.Config
-	mu    sync.Mutex
-	ssh   map[string]*sshConn
-	certs map[string]*caCert // credential name -> current SSH certificate
+	cfg      *config.Config
+	mu       sync.Mutex
+	ssh      map[string]*sshConn
+	limiters map[string]*sessionLimiter // per target: the SSH session budget
+	certs    map[string]*caCert         // credential name -> current SSH certificate
 }
 
 // caCert is an ephemeral key with a Vault-signed certificate.
@@ -40,7 +41,7 @@ type caCert struct {
 }
 
 func NewManager(cfg *config.Config) *Manager {
-	return &Manager{cfg: cfg, ssh: map[string]*sshConn{}}
+	return &Manager{cfg: cfg, ssh: map[string]*sshConn{}, limiters: map[string]*sessionLimiter{}}
 }
 
 // ForTarget returns the runner for a target name.
@@ -51,7 +52,7 @@ func (m *Manager) ForTarget(name string) (Runner, error) {
 	}
 	switch t.Connection.Type {
 	case "local":
-		return &Local{Sudo: t.Connection.Sudo}, nil
+		return &Local{Sudo: t.Connection.Sudo, Scope: t.Connection.SudoScope}, nil
 	case "ssh":
 		return &SSH{m: m, target: t}, nil
 	}
@@ -283,25 +284,50 @@ type SSH struct {
 func (s *SSH) String() string { return "ssh://" + s.target.Name }
 
 func (s *SSH) wrap(cmd string) string {
-	if s.target.Connection.Sudo {
+	if wrapAll(s.target.Connection) {
 		return "sudo -n sh -c " + ShellQuote(cmd)
 	}
 	return cmd
 }
 
-// session opens a session; the caller must call done() when finished.
+func (s *SSH) SudoPrefix() string { return sudoPrefix(s.target.Connection) }
+
+func (m *Manager) limiter(t *config.Target) *sessionLimiter {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.limiters[t.Name]
+	if !ok {
+		reserved := DefaultReservedSessions
+		if t.Connection.ReservedSessions != nil {
+			reserved = *t.Connection.ReservedSessions
+		}
+		l = newSessionLimiter(t.Connection.MaxSessions, reserved)
+		m.limiters[t.Name] = l
+	}
+	return l
+}
+
+// session opens a session within the target's budget (waiting for a free
+// one); the caller must call done() when finished.
 func (s *SSH) session(ctx context.Context) (sess *ssh.Session, done func(), err error) {
+	l := s.m.limiter(s.target)
+	if err := l.acquire(ctx); err != nil {
+		return nil, nil, fmt.Errorf("waiting for an SSH session on %s (%d in use): %w", s.target.Name, l.used(), err)
+	}
 	cl, err := s.m.client(ctx, s.target)
 	if err != nil {
+		l.release()
 		return nil, nil, err
 	}
 	if sess, err = cl.NewSession(); err != nil {
+		l.release()
 		return nil, nil, err
 	}
 	telemetry.SSHSessions.Add(1)
 	return sess, func() {
 		sess.Close()
 		telemetry.SSHSessions.Add(-1)
+		l.release()
 	}, nil
 }
 

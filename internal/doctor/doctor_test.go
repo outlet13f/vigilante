@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"vigilante/internal/config"
 	"vigilante/internal/secrets"
@@ -127,7 +128,14 @@ func TestDoctorFindsRealProblems(t *testing.T) {
 	if c := find(t, cs, ScopeTraffic, "edge", "풀에 있는지"); c.Status != Fail || !strings.Contains(c.Detail, "app-2(10.0.0.2:8080)") {
 		t.Errorf("app-2 missing from the nginx upstream must fail: %+v", c)
 	}
-	if c := find(t, cs, ScopeCapacity, "order", "DB 프로브"); c.Status != Warn {
+	// The full pool check runs once a minute by default: 5 x 2 / 60s is light.
+	if c := find(t, cs, ScopeCapacity, "order", "DB 프로브"); c.Status != OK || !strings.Contains(c.Detail, "0.2") {
+		t.Errorf("default pool check interval: %+v", c)
+	}
+	full := time.Duration(0) // a full check on every 1s interval
+	cfgFull := testConfig(t, 0)
+	cfgFull.Services[0].Probes[2].DB.PoolCheckInterval = &full
+	if c := find(t, runDoctor(t, cfgFull, "v1"), ScopeCapacity, "order", "DB 프로브"); c.Status != Warn {
 		t.Errorf("5 new connections/s x 2 targets must warn: %+v", c)
 	}
 	// Scopes come out in report order.
@@ -152,9 +160,20 @@ func TestDoctorAccessLogFormatMismatch(t *testing.T) {
 
 func TestDoctorWarnsOnSSHSessionBudget(t *testing.T) {
 	cs := runDoctor(t, testConfig(t, 8), "")
-	// 9 log streams + 1 host poll + 2 reserved = 12 > 10
-	if c := find(t, cs, ScopeCapacity, "app-2", "SSH 세션"); c.Status != Warn || !strings.Contains(c.Detail, "= 12") {
+	// 9 log streams hold sessions for good: more than the 6 collection may use (8 - 2 reserved).
+	if c := find(t, cs, ScopeCapacity, "app-2", "SSH 세션"); c.Status != Fail || !strings.Contains(c.Detail, "스트림 9") || !strings.Contains(c.Detail, "수집 몫 6") {
 		t.Errorf("session budget: %+v", c)
+	}
+	// A budget above sshd's default MaxSessions works only if sshd is raised too.
+	cfg := testConfig(t, 0)
+	for i := range cfg.Targets {
+		cfg.Targets[i].Connection.MaxSessions = 12
+	}
+	if c := find(t, runDoctor(t, cfg, ""), ScopeCapacity, "app-2", "SSH 세션"); c.Status != Warn || !strings.Contains(c.Hint, "MaxSessions") {
+		t.Errorf("max_sessions 12: %+v", c)
+	}
+	if c := find(t, runDoctor(t, testConfig(t, 0), ""), ScopeCapacity, "app-2", "SSH 세션"); c.Status != OK {
+		t.Errorf("default budget with few streams: %+v", c)
 	}
 }
 
@@ -200,5 +219,33 @@ func TestDoctorChecksVaultReferences(t *testing.T) {
 	}
 	if !strings.Contains(got.Hint, "sign/<role>") {
 		t.Fatalf("hint should point at the vault policy: %+v", got)
+	}
+}
+
+func TestDoctorChecksSudoRules(t *testing.T) {
+	cfg := testConfig(t, 0)
+	// app-1 keeps plain sudo (warned); app-2 runs only the changes with sudo.
+	cfg.Targets[1].Connection.Sudo, cfg.Targets[1].Connection.SudoScope = true, "changes"
+	m := runners()
+	m["app-2"].
+		On("command -v 'systemctl'", "/usr/bin/systemctl\n", nil).
+		On("command -v", "/usr/bin/x\n", nil).
+		On("sudo -n -l '/usr/bin/systemctl' 'restart' 'app'", "", errors.New("exit status 1")).
+		On("sudo -n -l", "", nil)
+	cs, err := Run(context.Background(), cfg, Options{Runners: func(n string) (transport.Runner, error) { return m[n], nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := find(t, cs, ScopeSudo, "app-1", "sudo 범위"); c.Status != Warn || !strings.Contains(c.Hint, "sudo_scope: changes") {
+		t.Errorf("plain sudo must warn: %+v", c)
+	}
+	if c := find(t, cs, ScopeSudo, "app-2", "ln -sfn /opt/app/releases/* /opt/app/current.vigilante-tmp"); c.Status != OK {
+		t.Errorf("allowed ln: %+v", c)
+	}
+	if c := find(t, cs, ScopeSudo, "app-2", "systemctl restart app"); c.Status != Fail || !strings.Contains(c.Hint, "vigilante sudoers --target app-2") {
+		t.Errorf("refused restart: %+v", c)
+	}
+	if !strings.Contains(m["app-2"].Joined(), "sudo -n -l '/usr/bin/x' '-sfn' '/opt/app/releases/vigilante-check' '/opt/app/current.vigilante-tmp'") {
+		t.Errorf("wildcards must be checked with a sample value:\n%s", m["app-2"].Joined())
 	}
 }

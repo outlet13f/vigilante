@@ -19,7 +19,11 @@ type Mock struct {
 	Responses []MockResponse
 	Lines     []string // emitted by Stream
 	DialFunc  func(ctx context.Context, network, addr string) (net.Conn, error)
+	// Sudo is returned by SudoPrefix (e.g. "sudo -n " for sudo_scope: changes).
+	Sudo string
 }
+
+func (m *Mock) SudoPrefix() string { return m.Sudo }
 
 type MockResponse struct {
 	Contains string

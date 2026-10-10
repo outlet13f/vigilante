@@ -333,12 +333,22 @@ type Target struct {
 }
 
 type Connection struct {
-	Type       string        `yaml:"type"` // ssh | local | none
-	Credential string        `yaml:"credential"`
-	Port       int           `yaml:"port"`
-	Bastion    string        `yaml:"bastion"` // name of another target used as jump host
-	Sudo       bool          `yaml:"sudo"`
-	Timeout    time.Duration `yaml:"timeout"`
+	Type       string `yaml:"type"` // ssh | local | none
+	Credential string `yaml:"credential"`
+	Port       int    `yaml:"port"`
+	Bastion    string `yaml:"bastion"` // name of another target used as jump host
+	Sudo       bool   `yaml:"sudo"`
+	// SudoScope: "all" (default with sudo: true) runs every command as
+	// `sudo -n sh -c`, which needs unrestricted sudo; "changes" runs reads
+	// without sudo and prefixes only the changing commands, so sudoers can
+	// allow exactly those (`vigilante sudoers` writes the rules).
+	SudoScope string        `yaml:"sudo_scope"`
+	Timeout   time.Duration `yaml:"timeout"`
+	// MaxSessions caps concurrent SSH sessions to this target (default 8,
+	// under sshd's MaxSessions of 10); ReservedSessions of them (default 2)
+	// are kept for rollback steps and traffic changes.
+	MaxSessions      int  `yaml:"max_sessions"`
+	ReservedSessions *int `yaml:"reserved_sessions"`
 }
 
 // Traffic is a traffic control layer (software LB, hardware ADC, cloud LB).
@@ -561,6 +571,10 @@ type DockerProbe struct {
 type LogProbe struct {
 	Path     string            `yaml:"path"`     // template
 	Patterns map[string]string `yaml:"patterns"` // name -> regex
+	// RemoteGrep (grep -E) filters lines on the target before they cross
+	// SSH: for busy logs where only a few lines matter. The patterns still
+	// apply to what arrives; the lines metric is not available.
+	RemoteGrep string `yaml:"remote_grep"`
 }
 
 type AccessLogProbe struct {
@@ -580,6 +594,10 @@ type DBProbe struct {
 	DSNRef   string `yaml:"dsn_ref"` // vault:/env:/file: reference
 	PoolSize int    `yaml:"pool_size"`
 	Query    string `yaml:"query"`
+	// PoolCheckInterval: how often the full-pool check opens pool_size new
+	// connections (default 1m). Every interval in between runs the query on
+	// one reused connection. 0s keeps the full check on every interval.
+	PoolCheckInterval *time.Duration `yaml:"pool_check_interval"`
 }
 
 type Baseline struct {
