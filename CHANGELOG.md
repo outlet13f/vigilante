@@ -33,6 +33,12 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
 - `connection.sudo_scope: changes` (sudo only for changing commands),
   `vigilante sudoers` and doctor checks of each rule.
 - `log.remote_grep`: filter busy logs on the target before they cross SSH.
+- Load harness (`test/load`, weekly workflow) and chaos tests for store and
+  load-balancer outages.
+
+### Fixed (store)
+- State writes that failed while the store was unreachable were dropped;
+  they are now queued in order and written when it returns.
 
 ### Changed
 - DB probe: every interval runs the query on one kept connection; the
