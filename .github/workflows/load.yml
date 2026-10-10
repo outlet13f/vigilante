@@ -44,7 +44,7 @@ jobs:
           ulimit -n 65536
           go test -tags load ./test/load -run TestLoad -count=1 -timeout 20m -v \
             -args -targets 2000 -deployments 100 -failing 10 -probes ${{ matrix.probes }} \
-            -out "load-${{ matrix.probes }}.json" | tee load.log
+            -out "$GITHUB_WORKSPACE/load-${{ matrix.probes }}.json" | tee load.log
       - name: summary
         if: always()
         run: |
