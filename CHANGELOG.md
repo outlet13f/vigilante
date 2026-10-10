@@ -58,6 +58,18 @@ First release candidate content (1.0.0). Nothing to upgrade from yet.
   env/envFrom); set `auth.allowAnonymous=true` for development installs.
   Previously every in-cluster caller was an anonymous admin.
 
+- SIEM export over TLS: `audit.syslog.address: tls://host[:port]` (RFC 5425
+  octet-counted frames, default port 6514) with `audit.syslog.tls`
+  (`ca_file`, `cert_file`/`key_file`, `server_name`, `min_version`).
+  Previously only plaintext tcp/udp.
+- Keyed audit chain: `audit.chain_key_ref` adds an HMAC of each entry's
+  chain hash, so someone with write access to the store but without the key
+  can no longer rewrite entries and recompute the chain. `vigilante audit
+  verify` checks the MACs (`--key REF` to override), reports entries written
+  before the key as unkeyed and where the key starts protecting the chain
+  (`keyed_from`). No schema migration. With a key configured, every command
+  that opens the store needs it (like `dsn_ref`).
+
 ### Fixed (deployment)
 - Helm chart with server TLS: the HA advertise URL, probes, port names,
   Ingress backend port and ServiceMonitor scheme use https (the advertise
