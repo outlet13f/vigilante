@@ -304,8 +304,12 @@ func Write(w io.Writer, extra []Sample) {
 	}
 }
 
-// Version is reported as vigilante_build_info{version}; set by main.
-var Version = "dev"
+// Version and Flavor (full | minimal) are reported as
+// vigilante_build_info{version,flavor}; set by main.
+var (
+	Version = "dev"
+	Flavor  = "full"
+)
 
 // ContentType is the Prometheus text exposition media type.
 const ContentType = "text/plain; version=0.0.4; charset=utf-8"

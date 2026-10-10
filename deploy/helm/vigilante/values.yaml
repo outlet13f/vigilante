@@ -1,0 +1,89 @@
+image:
+  repository: ghcr.io/outlet13f/vigilante
+  # Defaults to the chart's appVersion. Air-gapped: load the image from the
+  # install bundle into your registry and set repository/tag here.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# One replica uses the file state store on a persistent volume. More than
+# one needs PostgreSQL and HA in the config:
+#   server: {state: {backend: postgres, dsn_env: VIGILANTE_DSN}, ha: {enabled: true}}
+# Each pod advertises its own address (VIGILANTE_HA_ADVERTISE_URL is set
+# from the pod IP), so ha.advertise_url stays out of the shared config.
+replicaCount: 1
+
+# vigilante.yaml. Keep secrets out of it: use *_ref (Vault) or *_env with
+# env / envFrom below. Ignored when existingConfigMap is set.
+config: |
+  version: v1
+  server:
+    journal_path: /var/lib/vigilante/journal.jsonl
+  targets: []
+  executors: {}
+  services: []
+# A ConfigMap you manage (key vigilante.yaml), e.g. from GitOps.
+existingConfigMap: ""
+
+# Extra environment, e.g. secrets for *_env references:
+#   - name: VIGILANTE_DSN
+#     valueFrom: {secretKeyRef: {name: vigilante-db, key: dsn}}
+env: []
+envFrom: []
+
+persistence:
+  # The file state store (replicaCount 1). Disable with PostgreSQL.
+  enabled: true
+  size: 2Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+
+service:
+  type: ClusterIP
+  port: 8088
+
+# The web console needs a browser-reachable https URL (console.redirect_url).
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: vigilante.example.internal
+  tls: []
+  #  - secretName: vigilante-tls
+  #    hosts: [vigilante.example.internal]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podDisruptionBudget:
+  # Applied when replicaCount > 1.
+  minAvailable: 1
+
+# Prometheus Operator ServiceMonitor for /metrics (set server.metrics_public
+# in the config, or give the scrape job a viewer@* token).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

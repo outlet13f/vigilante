@@ -1,0 +1,27 @@
+# Changelog
+
+All notable changes are listed here. Versions follow [SemVer](https://semver.org/);
+the compatibility promise and upgrade procedures are in
+[docs/08-upgrade.md](docs/08-upgrade.md). Every release lists, when there are
+any, **Upgrade notes** (steps beyond installing the new package) first.
+
+## [Unreleased]
+
+First release candidate content (1.0.0). Nothing to upgrade from yet.
+
+### Added
+- Rollback engine: probes (HTTP, gRPC, TCP, host, Docker, logs, access logs,
+  databases), composite rules with baselines, phased observation, rollback
+  plans with traffic drain, executors for symlink releases, containers,
+  vSphere, Nutanix, KVM, OpenStack and generic exec/webhook, traffic
+  controllers for Nginx, HAProxy, Envoy, F5, AWS ALB and Octavia.
+- Safety: circuit breaker, blast-radius guard, flapping limit, crash resume.
+- State store (file or PostgreSQL) with HA leader election; OIDC, service
+  accounts and role bindings; Vault secrets; tamper-evident audit trail.
+- Open API v2 (OpenAPI 3.1): OAuth2 client credentials, API keys, scopes,
+  rate limits, idempotency keys, events over SSE and signed webhooks.
+- Approval mode, change freezes, ServiceNow change gate and incidents,
+  Teams / email / PagerDuty alerts, web operations console.
+- Release: minimal build, rpm/deb, container image, Helm chart, SBOMs,
+  signed air-gapped bundles; `vigilante store status|migrate` with a
+  downgrade guard.

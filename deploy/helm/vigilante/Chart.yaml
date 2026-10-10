@@ -1,0 +1,10 @@
+apiVersion: v2
+name: vigilante
+description: Vigilante rollback orchestrator server (API, web console, rollback engine)
+type: application
+# scripts/release.sh sets both to the release version.
+version: 0.0.0
+appVersion: "0.0.0"
+home: https://github.com/outlet13f/vigilante
+sources: [https://github.com/outlet13f/vigilante]
+keywords: [rollback, deployment, canary]

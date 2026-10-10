@@ -1,0 +1,102 @@
+{{- if and (gt (int .Values.replicaCount) 1) .Values.persistence.enabled }}
+{{- fail "replicaCount > 1 needs the PostgreSQL state store with HA (see values.yaml): set persistence.enabled=false" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vigilante.fullname" . }}
+  labels:
+    {{- include "vigilante.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  # One writer of the file journal at a time.
+  strategy: {type: Recreate}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "vigilante.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vigilante.selector" . | nindent 8 }}
+      annotations:
+        {{- if not .Values.existingConfigMap }}
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vigilante.serviceAccount" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Lets a leader finish the current rollback step before it stops.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: vigilante
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [server, -c, /etc/vigilante/vigilante.yaml]
+          ports:
+            - {name: http, containerPort: 8088, protocol: TCP}
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: VIGILANTE_HA_NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: VIGILANTE_HA_ADVERTISE_URL
+              value: "http://$(POD_IP):8088"
+            - name: VIGILANTE_LOG_FORMAT
+              value: json
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/vigilante, readOnly: true}
+            - {name: data, mountPath: /var/lib/vigilante}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vigilante.configMap" . }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vigilante.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -4,12 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
 func (c *Config) applyDefaults() {
+	// Per-node HA settings may come from the environment, so replicas that
+	// share one config file (a Kubernetes ConfigMap) still differ.
+	if v := os.Getenv("VIGILANTE_HA_ADVERTISE_URL"); v != "" {
+		c.Server.HA.AdvertiseURL = v
+	}
+	if v := os.Getenv("VIGILANTE_HA_NODE_ID"); v != "" {
+		c.Server.HA.NodeID = v
+	}
 	if c.API.RateLimit == nil {
 		c.API.RateLimit = &RateLimit{Rate: 20, Burst: 40}
 	}
@@ -689,11 +698,31 @@ func (c *Config) Validate() error {
 			bad("server.ha: requires server.state.backend: postgres (nodes must share state)")
 		}
 		if ha.AdvertiseURL == "" {
-			bad("server.ha: advertise_url required (followers forward API calls to the leader at this URL)")
+			bad("server.ha: advertise_url required, or VIGILANTE_HA_ADVERTISE_URL (followers forward API calls to the leader at this URL)")
 		}
 		if ha.LeaseTTL < 3*time.Second {
 			bad("server.ha.lease_ttl must be at least 3s")
 		}
+	}
+	if t := c.Server.TLS; t != nil {
+		if t.CertFile == "" || t.KeyFile == "" {
+			bad("server.tls: cert_file and key_file required")
+		}
+		switch t.ClientAuth {
+		case "", "none":
+		case "optional", "require":
+			if t.ClientCAFile == "" {
+				bad("server.tls.client_auth %s needs client_ca_file", t.ClientAuth)
+			}
+		default:
+			bad("server.tls.client_auth must be none, optional or require")
+		}
+		if t.MinVersion != "" && t.MinVersion != "1.2" && t.MinVersion != "1.3" {
+			bad("server.tls.min_version must be 1.2 or 1.3")
+		}
+	}
+	if t := c.Agent.TLS; t != nil && (t.CertFile == "") != (t.KeyFile == "") {
+		bad("agent.tls: cert_file and key_file go together")
 	}
 	c.validateAuth(services, bad)
 	c.validateSecrets(bad)

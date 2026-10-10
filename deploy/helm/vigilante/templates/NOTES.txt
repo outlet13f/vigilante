@@ -1,0 +1,17 @@
+Vigilante {{ .Chart.AppVersion }} is starting ({{ .Values.replicaCount }} replica(s)).
+
+API and web console:
+{{- if .Values.ingress.enabled }}
+  https://{{ .Values.ingress.host }}/console/
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "vigilante.fullname" . }} 8088:{{ .Values.service.port }}
+  then http://127.0.0.1:8088/console/
+{{- end }}
+
+Check the configuration from the running image:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "vigilante.fullname" . }} -- vigilante validate -c /etc/vigilante/vigilante.yaml
+{{- if not (contains "auth:" .Values.config) }}
+
+WARNING: the config has no auth section, so every API call is accepted as an
+anonymous admin. Configure auth (OIDC, service accounts) before exposing it.
+{{- end }}

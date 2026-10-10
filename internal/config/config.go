@@ -195,6 +195,27 @@ type Server struct {
 	// MetricsPublic serves /metrics without authentication (scrapers on a
 	// trusted network). Otherwise a viewer token for all services is needed.
 	MetricsPublic bool `yaml:"metrics_public"`
+	// TLS serves HTTPS directly (otherwise plain HTTP, for a TLS-terminating
+	// proxy or ingress in front).
+	TLS *ServerTLS `yaml:"tls"`
+}
+
+// ServerTLS: certificate files are re-read when they change.
+type ServerTLS struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// ClientCAFile verifies client certificates (agents) with ClientAuth
+	// optional (verify when presented) or require (every client).
+	ClientCAFile string `yaml:"client_ca_file"`
+	ClientAuth   string `yaml:"client_auth"` // none (default) | optional | require
+	MinVersion   string `yaml:"min_version"` // 1.2 (default) | 1.3
+}
+
+// AgentTLS: how the agent reaches the server over HTTPS.
+type AgentTLS struct {
+	CAFile   string `yaml:"ca_file"` // private CA of the server certificate
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 // State selects where decisions, rollback progress, circuit state and locks
@@ -205,6 +226,9 @@ type State struct {
 	DSN     string `yaml:"dsn"`     // avoid inline passwords; prefer dsn_env
 	DSNEnv  string `yaml:"dsn_env"`
 	DSNRef  string `yaml:"dsn_ref"` // vault:/env:/file: reference
+	// AutoMigrate applies schema migrations at start (default true). Off:
+	// the server refuses to start until `vigilante store migrate` has run.
+	AutoMigrate *bool `yaml:"auto_migrate"`
 }
 
 // HA runs several `vigilante server` nodes against one postgres state store:
@@ -225,6 +249,7 @@ type Agent struct {
 	// deployment is active on the agent's target, Failsafe policy applies.
 	FailsafeAfter time.Duration `yaml:"failsafe_after"`
 	Failsafe      string        `yaml:"failsafe"` // hold | rollback
+	TLS           *AgentTLS     `yaml:"tls"`
 }
 
 // Credential is resolved lazily; secrets are always read from env vars or files,

@@ -1,3 +1,5 @@
+//go:build !minimal
+
 package probe
 
 import (
@@ -17,6 +19,7 @@ import (
 	"vigilante/internal/tmpl"
 )
 
+// Not in the minimal build (-tags minimal): grpc-go is large.
 func init() { Register("grpc", newGRPC) }
 
 // gRPC probe uses the standard grpc.health.v1 protocol.

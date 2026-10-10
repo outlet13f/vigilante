@@ -73,16 +73,6 @@ func (c *containerExec) Diagnose(ctx context.Context, rc *RunContext) []Finding 
 	return out
 }
 
-func (v *vsphereExec) Diagnose(ctx context.Context, rc *RunContext) []Finding {
-	c, vm, snap, err := v.connect(ctx, rc)
-	if err != nil {
-		return []Finding{finding("vsphere: 로그인·VM 조회", err, "")}
-	}
-	defer c.Logout(ctx)
-	return []Finding{{Name: "vsphere: 로그인·VM 조회", Status: "ok", Detail: vm.InventoryPath},
-		{Name: "vsphere: 스냅샷 권한", Status: "warn", Detail: "생성·복원 권한은 변경 없이 확인할 수 없음 (prepare에서 " + snap + " 생성으로 확인)"}}
-}
-
 func (n *nutanixExec) Diagnose(ctx context.Context, rc *RunContext) []Finding {
 	vm, _, err := n.ids(rc)
 	if err == nil {

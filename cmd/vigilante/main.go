@@ -26,15 +26,15 @@ import (
 	"vigilante/internal/agent"
 	"vigilante/internal/api"
 	"vigilante/internal/audit"
+	"vigilante/internal/compat"
 	"vigilante/internal/config"
-	"vigilante/internal/executor"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
-	"vigilante/internal/probe"
 	"vigilante/internal/safety"
 	"vigilante/internal/secrets"
 	"vigilante/internal/store"
 	"vigilante/internal/telemetry"
+	"vigilante/internal/tlsconf"
 )
 
 var version = "0.1.0-dev"
@@ -60,6 +60,8 @@ Usage:
   vigilante whoami   --server URL
   vigilante audit    verify [--file ARCHIVE] | export --out F | prune --out F (--before DATE | --older-than DUR)
                      | query [--actor A] [--action X] [--service S] [--since DATE]
+  vigilante store    status | migrate [--down-to N --yes]   (PostgreSQL state store schema)
+  vigilante support-bundle -c FILE [--server URL] [--log FILE]... [--out F.zip]   (diagnostics, secrets removed)
   vigilante plugins
   vigilante version
 
@@ -71,7 +73,8 @@ Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=deb
 `
 
 func main() {
-	telemetry.Version = version
+	telemetry.Version, telemetry.Flavor = version, flavor
+	store.BinaryVersion = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -109,6 +112,9 @@ func logger() *slog.Logger {
 func loadConfig(path string) (*config.Config, error) {
 	cfg, err := config.Load(path)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkBuild(cfg); err != nil {
 		return nil, err
 	}
 	if err := secrets.Configure(cfg.Secrets); err != nil {
@@ -154,14 +160,13 @@ func printJSON(v any) {
 func run(ctx context.Context, cmd string, args []string) (int, error) {
 	switch cmd {
 	case "version", "--version":
-		fmt.Println("vigilante", version)
+		fmt.Println(buildInfo())
 		return 0, nil
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0, nil
 	case "plugins":
-		ex, tr := executor.Types()
-		fmt.Printf("probes:    %s\nexecutors: %s\ntraffic:   %s\n", strings.Join(probe.Types(), ", "), strings.Join(ex, ", "), strings.Join(tr, ", "))
+		printPlugins(os.Stdout)
 		return 0, nil
 	case "validate":
 		c := newFlags(cmd)
@@ -174,6 +179,9 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		}
 		fmt.Printf("OK: %d targets, %d services, %d executors, %d traffic controllers\n", len(cfg.Targets), len(cfg.Services), len(cfg.Executors), len(cfg.Traffic))
 		for _, w := range cfg.Warnings() {
+			fmt.Println("WARN: " + w)
+		}
+		if w := compat.Warning(cfg); w != "" {
 			fmt.Println("WARN: " + w)
 		}
 		for _, s := range cfg.Services {
@@ -202,6 +210,10 @@ func run(ctx context.Context, cmd string, args []string) (int, error) {
 		return cmdToken(args)
 	case "audit":
 		return cmdAudit(ctx, args)
+	case "store":
+		return cmdStore(ctx, args)
+	case "support-bundle":
+		return cmdSupportBundle(ctx, args)
 	case "whoami":
 		return cmdWhoami(ctx, args)
 	case "circuit":
@@ -572,6 +584,9 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	if srv.Auth.Disabled() {
 		e.Log.Warn("API authentication disabled: configure auth (service accounts / OIDC) or server.auth_token_env")
 	}
+	if w := compat.Warning(e.Cfg); w != "" {
+		e.Log.Warn(w)
+	}
 	if sl := e.Cfg.Audit.Syslog; sl != nil {
 		x, err := audit.NewExporter(*sl, e.Log)
 		if err != nil {
@@ -592,15 +607,23 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 			}
 		}()
 	}
-	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	tc, err := tlsconf.Server(e.Cfg.Server.TLS)
+	if err != nil {
+		return 1, err
+	}
+	hs := &http.Server{Addr: e.Cfg.Server.Listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, TLSConfig: tc}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = hs.Shutdown(sctx)
 	}()
-	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
-	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	e.Log.Info("vigilante server listening", "addr", e.Cfg.Server.Listen, "tls", tc != nil, "role", role, "store", e.Journal.Describe(), "dry_run", e.DryRun, "circuit", e.Breaker.State().State)
+	serve := hs.ListenAndServe
+	if tc != nil {
+		serve = func() error { return hs.ListenAndServeTLS("", "") } // certificates come from TLSConfig
+	}
+	if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return 1, err
 	}
 	srv.Close() // let in-flight observations and rollbacks record where they stopped
