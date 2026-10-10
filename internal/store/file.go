@@ -24,6 +24,7 @@ type fileStore struct {
 	j    *journal.Journal
 	dir  string
 	mu   sync.Mutex
+	key  []byte // chain key (guarded by mu)
 }
 
 func OpenFile(path string) (Store, error) {
@@ -54,8 +55,14 @@ func (f *fileStore) Append(_ context.Context, e journal.Entry) error {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
-	e.Chain(head)
+	e.Seal(head, f.key)
 	return f.j.Append(e)
+}
+
+func (f *fileStore) SetChainKey(key []byte) {
+	f.mu.Lock()
+	f.key = key
+	f.mu.Unlock()
 }
 
 func (f *fileStore) Load(context.Context) (*journal.State, error) { return journal.Replay(f.path) }

@@ -12,6 +12,7 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 | 나감 | LB·하이퍼바이저·클라우드 API (F5, vCenter, Nutanix, OpenStack, AWS) | 443 | 전용 계정·최소 역할(아래), 인증서 검증(`tls_skip_verify`는 시험용) |
 | 나감 | Vault | 8200 | AppRole·Kubernetes 인증, 읽기 전용 정책 |
 | 나감 | PostgreSQL | 5432 | 전용 계정, `sslmode=verify-full` 권장 |
+| 나감 | SIEM(syslog) | 6514 | `audit.syslog.address: tls://`(RFC 5425, 수집기 인증서 검증, 선택적 클라이언트 인증서). `tcp`·`udp`(514)는 평문 |
 | 나감 | IdP(OIDC), ServiceNow, SMTP, Teams·Slack·PagerDuty, 구독 웹훅 | 443·587 | 비밀값은 `*_ref`, 웹훅 수신 호스트는 `api.webhook_allowed_hosts`로 제한 |
 
 ## 서버
@@ -20,7 +21,8 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 - **역할은 좁게:** CI는 `deployer@service=<서비스>`, 운영자는 `operator@team=<팀>`, admin은 소수. 승인 모드에서는 `auth.four_eyes: true`로 요청자와 승인자를 분리합니다.
 - **TLS:** `server.tls`로 직접 HTTPS를 켜거나 TLS 프록시·인그레스 뒤에 둡니다. 에이전트는 `client_auth: optional`과 에이전트 인증서로 상호 인증할 수 있습니다(토큰 인증은 그대로 필요).
 - **프로세스:** 패키지의 systemd 유닛은 `vigilante` 계정, `NoNewPrivileges`, `ProtectSystem=strict`(쓰기는 `/var/lib/vigilante`만)로 실행합니다. 컨테이너 이미지는 distroless, non-root, 읽기 전용 루트 파일시스템입니다.
-- **감사:** 모든 조작과 거부는 해시 체인으로 묶인 감사 기록에 남습니다. `audit.syslog`로 SIEM에 실시간 전송하고, 주기적으로 `vigilante audit verify`를 실행하십시오.
+- **감사:** 모든 조작과 거부는 해시 체인으로 묶인 감사 기록에 남습니다. `audit.syslog`로 SIEM에 실시간 전송하고(`tls://` 권장), 주기적으로 `vigilante audit verify`를 실행하십시오.
+- **체인 키:** 해시 체인만으로는 저장소(저널 파일·DB)에 쓸 수 있는 사람이 기록을 고치고 체인을 다시 계산하는 것을 막지 못합니다. `audit.chain_key_ref`(Vault 권장)를 설정하면 기록마다 HMAC이 붙어, 키 없이 고친 기록은 `audit verify`에서 검출됩니다. 키는 저장소 쓰기 권한이 있는 계정(DB 관리자, 저널 파일 소유자)이 읽을 수 없는 곳에 두십시오. 키를 처음 설정한 시점의 `keyed_from`을 SIEM이나 변경 티켓에 남겨 두십시오. 누군가 MAC을 모두 지우면 체인은 키 없이 쓴 것처럼 보이며(`audit verify`가 경고), 이때 기록해 둔 위치와 비교해 검출합니다. 키 교체는 아직 지원하지 않습니다. 키를 바꾸면 이전 키로 쓴 기록(앵커 포함)이 MAC 불일치로 보고되므로, 유출이 의심될 때만 바꾸고 바꾸기 전에 `audit export`로 아카이브를 남겨 이전 키로 검증해 두십시오(`audit verify --file F --key REF`).
 - **웹 콘솔:** CSP(자기 출처만), `X-Frame-Options: DENY`, HttpOnly·SameSite 세션 쿠키, CSRF 토큰. HA에서는 `console.session_key_ref`를 공유합니다.
 - **`/metrics`:** 기본은 `viewer@*` 토큰이 필요합니다. `metrics_public`은 스크레이퍼가 신뢰 망에 있을 때만.
 

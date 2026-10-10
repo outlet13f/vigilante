@@ -96,7 +96,7 @@ func TestChaosStoreOutageDuringRollback(t *testing.T) {
 	if got := st.Deployments["d-outage"]; got == nil || got.State != model.StateRolledBack || st.StepsDone["d-outage"]["app-1"] != 5 {
 		t.Fatalf("journal after the outage: %+v steps %v", got, st.StepsDone["d-outage"])
 	}
-	r, err := audit.VerifyFile(path)
+	r, err := audit.VerifyFile(path, nil)
 	if err != nil || !r.OK {
 		t.Fatalf("hash chain after the outage: %+v %v", r, err)
 	}

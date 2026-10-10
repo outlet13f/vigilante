@@ -230,6 +230,50 @@ secrets: {cache_ttl: 2m, vault: {address: https://vault:8200, auth: approle, rol
 	}
 }
 
+func TestAuditValidation(t *testing.T) {
+	base := `
+version: v1
+targets: [{name: a}]
+executors: {x: {type: exec, exec: {rollback: "true"}}}
+services:
+  - name: s
+    targets: [a]
+    probes: [{id: h, type: tcp, tcp: {address: "x:1"}}]
+    rules: [{name: down, when: {metric: h.up, op: "==", value: 0}}]
+    rollback: {executor: x}
+`
+	cases := map[string]string{
+		"audit: {syslog: {address: \"https://siem:6514\"}}\n":                                 "tcp://host:port, udp://host:port or tls://host[:port]",
+		"audit: {syslog: {address: \"tls://:6514\"}}\n":                                       "tls needs a collector host name",
+		"audit: {syslog: {address: \"tcp://siem:514\", tls: {ca_file: ca.pem}}}\n":            "only used with a tls:// address",
+		"audit: {syslog: {address: \"tls://siem\", tls: {cert_file: c.pem}}}\n":               "cert_file and key_file go together",
+		"audit: {syslog: {address: \"tls://siem\", tls: {min_version: \"1.1\"}}}\n":           "1.2 or 1.3",
+		"audit: {syslog: {address: \"tls://siem\", format: leef}}\n":                          "rfc5424 or cef",
+		"audit: {chain_key_ref: \"AUDIT_KEY\"}\n":                                             "audit.chain_key_ref",
+		"audit: {chain_key_ref: \"vault:secret/vigilante/audit#key\"}\n":                      "secrets.vault: required",
+		"audit: {syslog: {address: \"udp://siem\", tls: {server_name: siem.example.test}}}\n": "only used with a tls:// address",
+	}
+	for tail, want := range cases {
+		if _, err := Parse([]byte(base + tail)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v, want %q", strings.TrimSpace(tail), err, want)
+		}
+	}
+	c, err := Parse([]byte(base + `audit:
+  chain_key_ref: env:VIGILANTE_AUDIT_KEY
+  syslog: {address: "tls://siem.example.test", tls: {ca_file: ca.pem, cert_file: c.pem, key_file: c.key, server_name: siem}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sl := c.Audit.Syslog; sl.Address != "tls://siem.example.test:6514" || sl.Format != "rfc5424" || sl.TLS.ServerName != "siem" {
+		t.Fatalf("defaults: %+v %+v", sl, sl.TLS)
+	}
+	c, err = Parse([]byte(base + "audit: {syslog: {address: \"tls://[::1]\"}}\n"))
+	if err != nil || c.Audit.Syslog.Address != "tls://[::1]:6514" {
+		t.Fatalf("IPv6 default port: %v %+v", err, c)
+	}
+}
+
 func TestOpenStackValidation(t *testing.T) {
 	base := `
 version: v1

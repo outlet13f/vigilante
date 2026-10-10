@@ -30,6 +30,7 @@ type pgStore struct {
 	mu         sync.RWMutex
 	fenceKey   string
 	fenceOwner string
+	chainKey   []byte
 }
 
 // OpenPostgres connects, applies pending migrations and returns the store.
@@ -72,6 +73,13 @@ func (p *pgStore) Fence(key, owner string) {
 	p.mu.Unlock()
 }
 
+// SetChainKey: the MAC is part of the JSON body, so the schema is unchanged.
+func (p *pgStore) SetChainKey(key []byte) {
+	p.mu.Lock()
+	p.chainKey = key
+	p.mu.Unlock()
+}
+
 // chainLock serialises appends so every entry links to the one before it,
 // even when several processes write to the same database.
 const chainLock = 72_105_118_106
@@ -85,7 +93,7 @@ func (p *pgStore) Append(ctx context.Context, e journal.Entry) error {
 		e.Time = time.Now()
 	}
 	p.mu.RLock()
-	key, owner := p.fenceKey, p.fenceOwner
+	key, owner, chainKey := p.fenceKey, p.fenceOwner, p.chainKey
 	p.mu.RUnlock()
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -104,7 +112,7 @@ func (p *pgStore) Append(ctx context.Context, e journal.Entry) error {
 	if head != nil {
 		prev = *head
 	}
-	e.Chain(prev)
+	e.Seal(prev, chainKey)
 	body, err := json.Marshal(e)
 	if err != nil {
 		return err
