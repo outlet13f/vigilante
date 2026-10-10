@@ -631,8 +631,13 @@ func cmdAgent(ctx context.Context, args []string) (int, error) {
 // ones (exit code 3, like an open circuit). With an override reason it
 // proceeds and records who overrode which freeze.
 func createGated(e *orchestrator.Engine, c *common, override string) (*model.Deployment, int, error) {
+	var ticket *model.ChangeTicket
 	if c.id == "" || e.Live(c.id) == nil {
 		if err := e.FreezeGate(c.service, override); err != nil {
+			return nil, 3, err
+		}
+		var err error
+		if ticket, err = e.ChangeGate(context.Background(), c.service, c.ticket); err != nil {
 			return nil, 3, err
 		}
 	}
@@ -641,6 +646,7 @@ func createGated(e *orchestrator.Engine, c *common, override string) (*model.Dep
 		return nil, 1, err
 	}
 	e.SetCreatedBy(d, cliActor())
+	e.SetChangeTicket(d, ticket)
 	if f := e.ActiveFreeze(d.Service, time.Now()); f != nil && override != "" && d.FreezeOverride == "" {
 		e.SetFreezeOverride(d, cliActor(), override)
 		cliAudit(e, c, "freeze.override", d.Service, d.ID, f.Name+": "+override)

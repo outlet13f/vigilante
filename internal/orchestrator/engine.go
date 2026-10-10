@@ -21,6 +21,7 @@ import (
 	"vigilante/internal/config"
 	"vigilante/internal/decision"
 	"vigilante/internal/executor"
+	"vigilante/internal/itsm"
 	"vigilante/internal/journal"
 	"vigilante/internal/metrics"
 	"vigilante/internal/model"
@@ -54,6 +55,7 @@ type Engine struct {
 	Breaker *safety.Breaker
 	Guard   *safety.Guard
 	Notify  *notify.Notifier
+	ITSM    *itsm.ServiceNow // nil without itsm.servicenow
 	Log     *slog.Logger
 	DryRun  bool
 
@@ -113,7 +115,7 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		Cfg:       cfg,
 		Store:     metrics.NewStore(30 * time.Minute),
 		Journal:   st,
-		Notify:    notify.New(cfg.Notify, log),
+		Notify:    newNotifier(cfg, log),
 		Log:       log,
 		DryRun:    opt.DryRun || cfg.Server.DryRun,
 		transport: transport.NewManager(cfg),
@@ -122,6 +124,9 @@ func New(cfg *config.Config, opt Options) (*Engine, error) {
 		baselines: map[string]*rules.Snapshot{},
 		cancels:   map[string]context.CancelFunc{},
 		lastEval:  map[string]decision.Evaluation{},
+	}
+	if sn := cfg.ITSM.ServiceNow; sn != nil {
+		e.ITSM = itsm.NewServiceNow(*sn, cfg.Credentials)
 	}
 	if e.owner == "" {
 		host, _ := os.Hostname()
@@ -714,4 +719,15 @@ func (e *Engine) LoadBaselineFile(path string) error {
 func Hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+func newNotifier(cfg *config.Config, log *slog.Logger) *notify.Notifier {
+	n := notify.New(cfg.Notify, log)
+	n.TeamOf = func(service string) string {
+		if sv, ok := cfg.Service(service); ok {
+			return sv.Team
+		}
+		return ""
+	}
+	return n
 }

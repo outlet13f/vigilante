@@ -467,6 +467,7 @@ type createV2 struct {
 	PreviousVersion string `json:"previous_version"`
 	Prepare         bool   `json:"prepare"`
 	FreezeOverride  string `json:"freeze_override"`
+	ChangeTicket    string `json:"change_ticket"`
 }
 
 func (s *Server) v2CreateDeployment(w http.ResponseWriter, r *http.Request) {
@@ -511,11 +512,17 @@ func (s *Server) v2CreateDeployment(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, r, http.StatusForbidden, "forbidden", err.Error())
 		return
 	}
+	if req.ChangeTicket == "" {
+		req.ChangeTicket = r.Header.Get("X-Change-Ticket")
+	}
 	d, err := s.create(r.Context(), p, createReq{ID: req.ID, Service: req.Service, Version: req.Version, PreviousVersion: req.PreviousVersion,
-		Prepare: req.Prepare, FreezeOverride: req.FreezeOverride})
+		Prepare: req.Prepare, FreezeOverride: req.FreezeOverride, ChangeTicket: req.ChangeTicket})
 	if err != nil {
 		if errors.Is(err, orchestrator.ErrBlocked) {
-			s.problem(w, r, http.StatusConflict, gateCode(err), err.Error())
+			if errors.Is(err, orchestrator.ErrITSMUnavailable) {
+				w.Header().Set("Retry-After", "30")
+			}
+			s.problem(w, r, gateStatus(err, http.StatusConflict), gateCode(err), err.Error())
 		} else if d == nil {
 			s.problem(w, r, http.StatusConflict, "conflict", err.Error())
 		} else {
@@ -571,7 +578,7 @@ func (s *Server) v2StartObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.E.Gate(d); err != nil {
-		s.problem(w, r, http.StatusConflict, gateCode(err), err.Error())
+		s.problem(w, r, gateStatus(err, http.StatusConflict), gateCode(err), err.Error())
 		return
 	}
 	op := s.E.StartOperation(model.OpObservation, d.Service, d, phase, p.ID)

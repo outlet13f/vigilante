@@ -20,6 +20,8 @@ import (
 
 	"vigilante/internal/auth"
 	"vigilante/internal/config"
+	"vigilante/internal/itsm"
+	"vigilante/internal/itsm/snowtest"
 	"vigilante/internal/orchestrator"
 )
 
@@ -522,4 +524,91 @@ func TestV2ChangeFreeze(t *testing.T) {
 		t.Fatalf("after the freeze: %d %s", r.StatusCode, r.Body)
 	}
 	wantProblem(t, admin.do("DELETE", "/v2/freezes/nope", "", nil), 404, "not_found")
+}
+
+func TestV2ServiceNowGateIncidentsAndNotes(t *testing.T) {
+	snow := snowtest.New(t)
+	now := time.Now().UTC()
+	snow.AddChange("CHG100", "sys100", "-1", "approved", now.Add(-time.Hour).Format("2006-01-02 15:04:05"), now.Add(time.Hour).Format("2006-01-02 15:04:05"))
+	snow.AddChange("CHG200", "sys200", "-3", "requested", now.Add(-time.Hour).Format("2006-01-02 15:04:05"), now.Add(time.Hour).Format("2006-01-02 15:04:05"))
+	t.Setenv("VGL_SNOW_PW", "snow-pass")
+	s, base := newV2Server(t, `credentials: {snow: {type: basic, user: vigilante, password_ref: "env:VGL_SNOW_PW"}}
+itsm:
+  servicenow:
+    url: `+snow.Srv.URL+`
+    credential: snow
+    change_gate: {enabled: true, services: [svc]}
+    incidents: {enabled: true, assignment_group: SRE}
+`)
+	c := &v2Client{t: t, base: base, token: "tok"}
+	c.do("PUT", "/v2/services/svc/last-good", `{"version":"v1"}`, nil)
+
+	r := c.do("POST", "/v2/deployments", `{"service":"svc","version":"v2"}`, nil)
+	wantProblem(t, r, 409, "change_ticket_invalid")
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v2","change_ticket":"CHG200"}`, nil)
+	wantProblem(t, r, 409, "change_ticket_invalid")
+	if !strings.Contains(r.JSON["detail"].(string), "not approved") {
+		t.Fatalf("detail: %s", r.Body)
+	}
+	// Services outside the gate need no ticket.
+	c.do("PUT", "/v2/services/zeta/last-good", `{"version":"z1"}`, nil)
+	if r := c.do("POST", "/v2/deployments", `{"service":"zeta","version":"z2"}`, nil); r.StatusCode != 201 {
+		t.Fatalf("ungated service: %d %s", r.StatusCode, r.Body)
+	}
+
+	r = c.do("POST", "/v2/deployments", `{"id":"chg-1","service":"svc","version":"v2"}`, map[string]string{"X-Change-Ticket": "CHG100"})
+	if r.StatusCode != 201 || r.JSON["change_ticket"].(map[string]any)["sys_id"] != "sys100" {
+		t.Fatalf("valid ticket: %d %s", r.StatusCode, r.Body)
+	}
+	// The canary fails and is rolled back; the ticket gets the story.
+	op := c.do("POST", "/v2/deployments/chg-1/observations", `{"phase":"canary"}`, nil)
+	waitOp(t, c, op.JSON["id"].(string))
+	deadline := time.Now().Add(10 * time.Second)
+	var notes []string
+	for time.Now().Before(deadline) {
+		_, wn := snow.Snapshot()
+		if notes = wn["sys100"]; len(notes) >= 4 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	joined := strings.Join(notes, "\n")
+	for _, want := range []string{"observation started", "phase FAILED", "rollback started", "rollback completed"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("work notes lack %q:\n%s", want, joined)
+		}
+	}
+
+	// ServiceNow down: fail closed by default (503 + Retry-After).
+	snow.SetDown(true)
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","change_ticket":"CHG100"}`, nil)
+	wantProblem(t, r, 503, "itsm_unavailable")
+	if r.Header.Get("Retry-After") == "" {
+		t.Fatal("Retry-After missing")
+	}
+	// fail open: proceeds, marked unverified
+	s.E.ITSM = itsm.NewServiceNow(func() config.ServiceNow {
+		sn := *s.E.Cfg.ITSM.ServiceNow
+		sn.ChangeGate.OnError = "open"
+		return sn
+	}(), s.E.Cfg.Credentials)
+	r = c.do("POST", "/v2/deployments", `{"service":"svc","version":"v3","change_ticket":"CHG100"}`, nil)
+	if r.StatusCode != 201 || r.JSON["change_ticket"].(map[string]any)["unverified"] != true {
+		t.Fatalf("fail open: %d %s", r.StatusCode, r.Body)
+	}
+	snow.SetDown(false)
+
+	// An open circuit raises one incident.
+	c.do("POST", "/v2/circuit/trip", `{"reason":"two failed rollbacks"}`, nil)
+	deadline = time.Now().Add(10 * time.Second)
+	var inc []map[string]any
+	for time.Now().Before(deadline) {
+		if inc, _ = snow.Snapshot(); len(inc) == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(inc) != 1 || !strings.Contains(inc[0]["short_description"].(string), "circuit breaker OPEN") || inc[0]["assignment_group"] != "SRE" {
+		t.Fatalf("incident: %v", inc)
+	}
 }

@@ -36,6 +36,7 @@ audit:       {...}   # SIEM 전송(syslog)과 보존 기간
 secrets:     {...}   # *_ref 비밀값 출처(HashiCorp Vault)와 캐시
 api:         {...}   # 오픈 API 호출 한도와 OAuth 토큰 수명
 change_freeze: [...] # 변경 동결 기간 (새 배포 거부)
+itsm:        {...}   # ServiceNow 변경 티켓 게이트·인시던트·작업 노트
 ```
 
 ## `server`
@@ -541,6 +542,49 @@ path "ssh-client-signer/sign/vigilante" { capabilities = ["update"] }
 
 | 키 | 설명 |
 |---|---|
-| `type` | `slack`(incoming webhook 텍스트) \| `webhook`(배포 JSON 전체) |
-| `url` / `url_env` | 대상 URL |
+| `type` | `slack`(incoming webhook 텍스트) \| `teams`(Teams Workflows 웹훅, Adaptive Card) \| `email`(SMTP) \| `pagerduty`(Events v2) \| `webhook`(배포 JSON 전체) |
+| `url` / `url_env` / `url_ref` | slack·teams·webhook 대상 URL. URL에 비밀이 들어가므로 `url_ref`(Vault) 권장 |
 | `min_level` | `info` \| `warning` \| `critical` |
+| `services` / `teams` | 이 채널로 보낼 서비스·팀. 생략하면 전부. 서비스가 없는 알림(서킷 등)은 모든 채널로 갑니다 |
+| `smtp` | email: `host`, `port`(기본 587 STARTTLS, 465는 TLS), `from`, `to[]`, `username`, `password_ref`, `implicit_tls`, `no_starttls`(신뢰 망 릴레이만) |
+| `routing_key_ref` / `routing_key_env` | pagerduty: 서비스 integration key. 경고·치명 알림을 `dedup_key`(배포·제목)로 묶어 트리거 |
+
+같은 배포의 같은 알림은 채널마다 10분에 한 번만 보냅니다. 알림 실패는 기록만 하고 롤백을 막지 않습니다.
+
+```yaml
+notify:
+  - {type: teams, url_ref: "vault:secret/prod/teams#payments_webhook", teams: [payments], min_level: warning}
+  - type: email
+    min_level: critical
+    smtp: {host: smtp.example.internal, from: vigilante@example.internal, to: [sre@example.internal], username: vigilante, password_ref: "vault:secret/prod/smtp#password"}
+  - {type: pagerduty, routing_key_ref: "vault:secret/prod/pagerduty#sre", min_level: critical}
+```
+
+## `itsm` — ServiceNow
+
+```yaml
+itsm:
+  servicenow:
+    url: https://company.service-now.com
+    credential: snow-integration           # type basic(통합 사용자) 또는 token(OAuth bearer)
+    change_gate:
+      enabled: true
+      teams: [payments]                     # services/teams 생략 시 전 서비스
+      allowed_states: ["-2", "-1"]          # Scheduled, Implement (기본)
+      check_window: true                    # 계획된 시작·종료 시각 안이어야 함 (기본)
+      on_error: closed                      # ServiceNow 장애 시 closed(거부, 기본) | open(진행, 미검증 표시)
+    incidents:
+      enabled: true
+      on: [rollback_failed, circuit_opened] # 기본 둘 다
+      assignment_group: SRE
+      urgency: 1
+      impact: 2
+    work_notes: true                        # 변경 티켓에 진행 결과 기록 (기본 true)
+```
+
+- **변경 티켓 게이트:** 게이트가 적용되는 서비스의 새 배포는 변경 번호가 있어야 합니다. API는 `X-Change-Ticket` 헤더나 v2 `change_ticket`, CLI는 `--ticket`입니다. 티켓은 승인(`approval: approved`)되어 있고, 허용 상태이며, 지금이 계획된 작업 시간 안이어야 합니다. 등록할 때 확인하고 단계를 시작할 때마다 다시 확인합니다(작업 시간이 끝났을 수 있으므로). 거부되면 API `409 change_ticket_invalid`, CLI 종료 코드 3입니다.
+- **ServiceNow 장애:** `on_error: closed`면 `503 itsm_unavailable`(Retry-After)로 새 배포를 받지 않고, `open`이면 진행하되 배포의 `change_ticket.unverified: true`와 이벤트에 남깁니다. **롤백은 어느 경우에도 ServiceNow를 기다리지 않습니다.**
+- **인시던트:** 롤백 실패와 서킷 열림 때 인시던트를 엽니다. `correlation_id`로 같은 사건을 한 번만 만들고(재시도·리더 교체에도 중복 없음), 감사 기록(`itsm.incident`)과 배포 타임라인에 번호를 남깁니다.
+- **작업 노트:** 검증된 티켓이 있는 배포는 관측 시작·판정·롤백 시작·완료·실패·승인 요청·결정을 변경 티켓의 work notes에 남깁니다.
+- 인시던트와 작업 노트는 서버(리더)가 이벤트를 따라가며 처리합니다. CI 단발 실행(`vigilante watch`)만 쓰는 구성에서는 게이트만 동작합니다.
+- 필요한 ServiceNow 권한: `change_request` 읽기·쓰기(work notes), `incident` 읽기·생성. 지표: `vigilante_itsm_calls_total{kind,result}`.

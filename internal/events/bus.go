@@ -64,7 +64,12 @@ type Bus struct {
 	history   map[string][]Delivery
 	ctx       context.Context
 	cancelAll context.CancelFunc
+	workersWG sync.WaitGroup
 }
+
+// Wait blocks until every delivery worker has stopped (after the context
+// given to Start is cancelled).
+func (b *Bus) Wait() { b.workersWG.Wait() }
 
 // Delivery is one webhook attempt, kept in memory for the deliveries API.
 type Delivery struct {

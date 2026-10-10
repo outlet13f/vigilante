@@ -57,6 +57,10 @@ credentials:
   deploy-console:
     type: token
     token_env: DEPLOY_CONSOLE_TOKEN
+  snow-integration:
+    type: basic
+    user: svc-vigilante
+    password_ref: "vault:secret/prod/servicenow#password"
   openstack-prod:
     type: openstack
     auth_url: https://keystone.example.internal:5000/v3
@@ -492,6 +496,22 @@ notify:
   - type: slack
     url_env: SLACK_WEBHOOK_URL
     min_level: warning
-  - type: webhook
-    url_env: PAGER_WEBHOOK_URL
+  - type: teams
+    url_ref: "vault:secret/prod/teams#billing_webhook"
+    teams: [billing]                 # routed: only billing's services
+    min_level: warning
+  - type: pagerduty
+    routing_key_ref: "vault:secret/prod/pagerduty#sre"
     min_level: critical
+  - type: email
+    min_level: critical
+    smtp: {host: smtp.example.internal, from: vigilante@example.internal, to: [sre@example.internal]}
+
+# ServiceNow: billing deployments need an approved change in its window;
+# failed rollbacks and an open circuit raise incidents.
+itsm:
+  servicenow:
+    url: https://example.service-now.com
+    credential: snow-integration
+    change_gate: {enabled: true, teams: [billing], on_error: closed}
+    incidents: {enabled: true, assignment_group: SRE}

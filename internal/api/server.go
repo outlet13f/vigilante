@@ -89,6 +89,7 @@ func (s *Server) Close() {
 	done := make(chan struct{})
 	go func() {
 		s.bg.Wait()
+		s.bus.Wait()
 		close(done)
 	}()
 	select {
@@ -127,6 +128,7 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 	s.Auth = a
 	s.bus = s.newBus()
 	s.background(s.sweepApprovals)
+	s.background(s.itsmWorker)
 	return s, nil
 }
 
@@ -404,6 +406,8 @@ type createReq struct {
 	// FreezeOverride (admins only, checked by the caller) lets a new
 	// deployment proceed during a change freeze; it is the reason.
 	FreezeOverride string `json:"-"`
+	// ChangeTicket is checked against ITSM when a change gate applies.
+	ChangeTicket string `json:"-"`
 }
 
 func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -416,6 +420,7 @@ func (s *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
 	d, err := s.create(r.Context(), p, req)
 	if err != nil {
 		writeErr(w, gateStatus(err, 400), err)
@@ -430,8 +435,13 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 		return nil, errors.New("service and version are required")
 	}
 	existing := req.ID != "" && s.E.Live(req.ID) != nil
+	var ticket *model.ChangeTicket
 	if !existing {
 		if err := s.E.FreezeGate(req.Service, req.FreezeOverride); err != nil {
+			return nil, err
+		}
+		var err error
+		if ticket, err = s.E.ChangeGate(ctx, req.Service, req.ChangeTicket); err != nil {
 			return nil, err
 		}
 	}
@@ -450,6 +460,7 @@ func (s *Server) create(ctx context.Context, p *auth.Principal, req createReq) (
 	if note != "" {
 		s.E.Annotate(d, "input", note)
 	}
+	s.E.SetChangeTicket(d, ticket)
 	if req.FreezeOverride != "" && !existing {
 		if f := s.E.ActiveFreeze(d.Service, time.Now()); f != nil {
 			s.E.SetFreezeOverride(d, p.ID, req.FreezeOverride)
@@ -774,6 +785,7 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, fmt.Errorf("forbidden: %s needs role deployer on %s", p.ID, describe(s.svc(req.Service))))
 		return
 	}
+	req.ChangeTicket = r.Header.Get("X-Change-Ticket")
 	d, err := s.create(r.Context(), p, *req)
 	if err != nil {
 		writeErr(w, gateStatus(err, 400), err)
@@ -895,6 +907,9 @@ func firstNonEmpty(vs ...string) string {
 // gateStatus maps a closed deployment gate (circuit open, change freeze) to
 // 409 Conflict and anything else to def.
 func gateStatus(err error, def int) int {
+	if errors.Is(err, orchestrator.ErrITSMUnavailable) {
+		return http.StatusServiceUnavailable
+	}
 	if errors.Is(err, orchestrator.ErrBlocked) {
 		return http.StatusConflict
 	}
@@ -903,8 +918,13 @@ func gateStatus(err error, def int) int {
 
 // gateCode is the problem code for a closed gate.
 func gateCode(err error) string {
-	if errors.Is(err, orchestrator.ErrFrozen) {
+	switch {
+	case errors.Is(err, orchestrator.ErrFrozen):
 		return "change_frozen"
+	case errors.Is(err, orchestrator.ErrITSMUnavailable):
+		return "itsm_unavailable"
+	case errors.Is(err, orchestrator.ErrChangeTicket):
+		return "change_ticket_invalid"
 	}
 	return "circuit_open"
 }

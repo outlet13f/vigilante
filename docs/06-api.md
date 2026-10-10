@@ -229,6 +229,12 @@ def verify(secret: str, headers: dict, body: bytes) -> bool:
 ### change_frozen
 변경 동결 기간이라 새 배포·단계 시작을 받지 않음. `detail`에 동결 이름, 이유, 끝나는 시각이 있습니다. 긴급하면 admin이 `freeze_override`로 이유를 남기고 진행합니다.
 
+### change_ticket_invalid
+변경 티켓 게이트가 적용되는 서비스인데 티켓이 없거나, 승인되지 않았거나, 허용 상태가 아니거나, 계획된 작업 시간 밖임. `detail`에 이유가 있습니다.
+
+### itsm_unavailable
+ServiceNow에 닿지 않아 티켓을 확인할 수 없고 게이트가 fail-closed로 설정됨. `Retry-After` 후 재시도하십시오.
+
 ### circuit_open
 서킷브레이커가 열려 있어 새 단계를 시작하지 않음. 원인을 조사한 뒤 admin이 `POST /v2/circuit/reset`으로 닫습니다.
 

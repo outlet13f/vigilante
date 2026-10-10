@@ -29,6 +29,8 @@ var (
 	APILatency  = NewHistogram("vigilante_api_request_seconds", "API request latency (excluding long-poll waits is up to the client).",
 		[]float64{.001, .005, .01, .05, .1, .5, 1, 5, 30, 120, 600}, "route")
 
+	ITSMCalls = NewCounter("vigilante_itsm_calls_total", "ServiceNow calls (incidents, work notes) by result.", "kind", "result")
+
 	AuditExported = NewCounter("vigilante_audit_exported_total", "Audit records sent to the SIEM.")
 	AuditDropped  = NewCounter("vigilante_audit_export_dropped_total", "Audit records not sent to the SIEM (queue full or send failure).")
 )

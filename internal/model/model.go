@@ -107,10 +107,12 @@ type Deployment struct {
 	PendingRollback *PendingRollback `json:"pending_rollback,omitempty"`
 	// FreezeOverride records why this deployment may proceed during a
 	// change freeze, and who allowed it.
-	FreezeOverride string    `json:"freeze_override,omitempty"`
-	Events         []Event   `json:"events,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	FreezeOverride string `json:"freeze_override,omitempty"`
+	// ChangeTicket is the ITSM change this deployment runs under.
+	ChangeTicket *ChangeTicket `json:"change_ticket,omitempty"`
+	Events       []Event       `json:"events,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 // AddEvent appends a timeline entry.
@@ -165,4 +167,15 @@ type Freeze struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	EndedBy       string     `json:"ended_by,omitempty"`
 	EndedAt       *time.Time `json:"ended_at,omitempty"` // ended early
+}
+
+// ChangeTicket is a verified ITSM change request.
+type ChangeTicket struct {
+	Number    string    `json:"number"`
+	SysID     string    `json:"sys_id,omitempty"`
+	State     string    `json:"state,omitempty"`
+	Approval  string    `json:"approval,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+	// Unverified: ServiceNow was unreachable and the gate fails open.
+	Unverified bool `json:"unverified,omitempty"`
 }

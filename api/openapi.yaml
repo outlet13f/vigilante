@@ -118,7 +118,11 @@ paths:
         `previous_version` is omitted the service's last good version is used;
         without one the request is rejected, because a rollback target is required.
         During a change freeze new deployments get `409` with code
-        `change_frozen`, unless an admin sends `freeze_override`.
+        `change_frozen`, unless an admin sends `freeze_override`. Where a
+        ServiceNow change gate applies, `change_ticket` must name an approved
+        change in an allowed state and inside its planned window
+        (`409 change_ticket_invalid`); if ServiceNow cannot be reached and the
+        gate fails closed, the answer is `503 itsm_unavailable`.
       parameters:
         - {$ref: '#/components/parameters/IdempotencyKey'}
       requestBody:
@@ -149,6 +153,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/ITSMUnavailable'}
 
   /v2/deployments/{id}:
     parameters:
@@ -207,6 +212,7 @@ paths:
         '409': {$ref: '#/components/responses/Conflict'}
         '412': {$ref: '#/components/responses/PreconditionFailed'}
         '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/ITSMUnavailable'}
 
   /v2/deployments/{id}/rollbacks:
     parameters:
@@ -1409,6 +1415,14 @@ components:
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
+    ITSMUnavailable:
+      description: The change ticket could not be verified because the ITSM system is unreachable, and the change gate fails closed.
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
     RateLimited:
       description: |
         Too many requests from this caller. Rollbacks, approvals, abort and the
@@ -1447,7 +1461,8 @@ components:
             an unknown code like the generic error for its HTTP status.
           x-extensible-enum: [bad_request, validation_failed, unauthenticated, forbidden, not_found, conflict,
                  precondition_failed, idempotency_key_reused, idempotency_key_in_flight,
-                 not_leader, rate_limited, internal, change_frozen, circuit_open]
+                 not_leader, rate_limited, internal, change_frozen, circuit_open,
+                 change_ticket_invalid, itsm_unavailable]
         request_id: {type: string}
         errors:
           type: array
@@ -1504,6 +1519,10 @@ components:
           type: string
           maxLength: 1000
           description: Admins only. The reason this deployment may proceed during a change freeze; recorded in the audit trail.
+        change_ticket:
+          type: string
+          maxLength: 64
+          description: 'ITSM change number (e.g. CHG0012345), required where a change gate applies. The X-Change-Ticket header works too.' 
 
     Deployment:
       type: object
@@ -1528,6 +1547,17 @@ components:
         rollback_requested_by: {type: string}
         approved_by: {type: string}
         freeze_override: {type: string, description: 'Why, and by whom, this deployment may proceed during a change freeze.'}
+        change_ticket:
+          type: object
+          description: The ITSM change this deployment runs under.
+          required: [number, checked_at]
+          properties:
+            number: {type: string}
+            sys_id: {type: string}
+            state: {type: string}
+            approval: {type: string}
+            checked_at: {type: string, format: date-time}
+            unverified: {type: boolean, description: 'ITSM was unreachable and the gate fails open.'}
         pending_rollback:
           type: object
           description: The rollback prepared for a failed phase, waiting for a decision (approve mode).

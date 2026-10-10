@@ -34,6 +34,48 @@ type Config struct {
 	API        API      `yaml:"api"`
 	// ChangeFreeze windows refuse new deployments (see freeze.go).
 	ChangeFreeze []Freeze `yaml:"change_freeze"`
+	ITSM         ITSM     `yaml:"itsm"`
+}
+
+// ITSM connects to an IT service management system.
+type ITSM struct {
+	ServiceNow *ServiceNow `yaml:"servicenow"`
+}
+
+// ServiceNow (Table API).
+type ServiceNow struct {
+	URL        string `yaml:"url"`        // https://company.service-now.com
+	Credential string `yaml:"credential"` // basic (integration user) or token (OAuth bearer)
+	// ChangeGate requires an approved change ticket for new deployments.
+	ChangeGate ChangeGate `yaml:"change_gate"`
+	// Incidents are opened for failed rollbacks and an open circuit.
+	Incidents IncidentPolicy `yaml:"incidents"`
+	// WorkNotes writes phase and rollback outcomes to the change ticket (default true).
+	WorkNotes     *bool `yaml:"work_notes"`
+	TLSSkipVerify bool  `yaml:"tls_skip_verify"`
+}
+
+type ChangeGate struct {
+	Enabled  bool     `yaml:"enabled"`
+	Services []string `yaml:"services"` // empty with no teams = every service
+	Teams    []string `yaml:"teams"`
+	// AllowedStates of change_request (default -2 Scheduled, -1 Implement).
+	AllowedStates []string `yaml:"allowed_states"`
+	// CheckWindow requires now to be inside the planned start/end (default true).
+	CheckWindow *bool `yaml:"check_window"`
+	// OnError when ServiceNow cannot be reached: closed (default, refuse)
+	// or open (proceed and record that the ticket was not verified).
+	OnError string `yaml:"on_error"`
+}
+
+type IncidentPolicy struct {
+	Enabled bool `yaml:"enabled"`
+	// On lists triggers: rollback_failed, circuit_opened (default both).
+	On              []string `yaml:"on"`
+	AssignmentGroup string   `yaml:"assignment_group"` // sys_id or name
+	CallerID        string   `yaml:"caller_id"`
+	Urgency         int      `yaml:"urgency"` // default 1
+	Impact          int      `yaml:"impact"`  // default 2
 }
 
 // API configures the public API: per-caller rate limits and OAuth tokens.
@@ -625,10 +667,33 @@ type Flapping struct {
 }
 
 type Notifier struct {
-	Type     string `yaml:"type"` // webhook | slack
+	Type     string `yaml:"type"` // webhook | slack | teams | email | pagerduty
 	URL      string `yaml:"url"`
 	URLEnv   string `yaml:"url_env"`
+	URLRef   string `yaml:"url_ref"`   // vault:/env:/file: reference (webhook URLs embed secrets)
 	MinLevel string `yaml:"min_level"` // info | warning | critical
+	// Services / Teams route the channel to these services (empty = all).
+	Services []string `yaml:"services"`
+	Teams    []string `yaml:"teams"`
+	// email
+	SMTP *SMTP `yaml:"smtp"`
+	// pagerduty: an Events v2 integration (routing) key
+	RoutingKeyRef string `yaml:"routing_key_ref"`
+	RoutingKeyEnv string `yaml:"routing_key_env"`
+}
+
+// SMTP is a mail relay for email notifications.
+type SMTP struct {
+	Host          string   `yaml:"host"`
+	Port          int      `yaml:"port"` // default 587 (STARTTLS); 465 = implicit TLS
+	From          string   `yaml:"from"`
+	To            []string `yaml:"to"`
+	Username      string   `yaml:"username"`
+	PasswordRef   string   `yaml:"password_ref"`
+	PasswordEnv   string   `yaml:"password_env"`
+	ImplicitTLS   bool     `yaml:"implicit_tls"`
+	NoStartTLS    bool     `yaml:"no_starttls"` // relays inside a trusted network only
+	TLSSkipVerify bool     `yaml:"tls_skip_verify"`
 }
 
 // Load reads, decodes (strictly), defaults and validates a config file.

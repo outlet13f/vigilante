@@ -193,7 +193,6 @@ func (e *Engine) ResolveClientCredential(raw string) (*model.APIClient, []string
 	sha := auth.HashSecret(raw)
 	now := time.Now()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	var c *model.APIClient
 	var scopes []string
 	if t, ok := e.tokens[sha]; ok && now.Before(t.ExpiresAt) {
@@ -214,16 +213,19 @@ func (e *Engine) ResolveClientCredential(raw string) (*model.APIClient, []string
 		}
 	}
 	if c == nil || !c.Active(now) {
+		e.mu.Unlock()
 		return nil, nil, auth.ErrInvalidToken
 	}
+	var used *time.Time
 	if c.LastUsedAt == nil || now.Sub(*c.LastUsedAt) > lastUsedEvery {
 		t := now.UTC()
-		c.LastUsedAt = &t
-		go e.record(journal.Entry{Kind: journal.KindClientUsed, Message: c.ID, Time: t})
+		c.LastUsedAt, used = &t, &t
 	}
 	cp := *c
-	if scopes == nil {
-		scopes = []string{} // a client is always scope-limited, even to nothing
+	scopes = append([]string{}, scopes...) // never nil: a client is always scope-limited, even to nothing
+	e.mu.Unlock()
+	if used != nil { // at most hourly per client; written before answering so nothing outlives the request
+		e.record(journal.Entry{Kind: journal.KindClientUsed, Message: cp.ID, Time: *used})
 	}
-	return &cp, append([]string{}, scopes...), nil
+	return &cp, scopes, nil
 }

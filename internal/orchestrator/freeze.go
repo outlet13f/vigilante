@@ -75,7 +75,10 @@ func (e *Engine) Gate(d *model.Deployment) error {
 	if st := e.Breaker.State(); st.State == safety.Open {
 		return fmt.Errorf("%w: %w (%s); reset with `vigilante circuit reset` after investigation", ErrBlocked, safety.ErrCircuitOpen, st.Reason)
 	}
-	return e.FreezeGate(d.Service, d.FreezeOverride)
+	if err := e.FreezeGate(d.Service, d.FreezeOverride); err != nil {
+		return err
+	}
+	return e.recheckChange(d)
 }
 
 // FreezeGate refuses new work on a frozen service unless override is set.
