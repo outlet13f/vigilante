@@ -1,0 +1,31 @@
+[Unit]
+Description=Vigilante push agent
+Documentation=https://github.com/outlet13f/vigilante
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# The agent tails logs and reads /proc; run it as a user that can read the
+# application logs (add vigilante to the log group, or override User=).
+User=vigilante
+Group=vigilante
+# Must set VIGILANTE_SERVER and VIGILANTE_TOKEN (an agent service-account
+# token); VIGILANTE_TARGET defaults to the host name.
+EnvironmentFile=/etc/vigilante/agent.env
+ExecStart=/bin/sh -c 'exec /usr/bin/vigilante agent -c /etc/vigilante/vigilante.yaml --server "$VIGILANTE_SERVER" --target "${VIGILANTE_TARGET:-$(hostname)}"'
+WorkingDirectory=/var/lib/vigilante
+Restart=always
+RestartSec=5s
+
+# With agent.failsafe: rollback the agent rolls back locally: allow the
+# paths and commands it needs in a drop-in (systemctl edit vigilante-agent),
+# e.g. ReadWritePaths=/opt/app and NoNewPrivileges=no for sudo.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/vigilante
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

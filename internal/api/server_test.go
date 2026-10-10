@@ -376,7 +376,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		`vigilante_deployments{state="PENDING"} 1`,
 		"vigilante_leader 1\n",
 		"vigilante_engine_active 1\n",
-		`vigilante_build_info{go_version="`,
+		`vigilante_build_info{flavor="full",go_version="`,
 		"# TYPE vigilante_store_append_seconds histogram",
 		`vigilante_store_append_seconds_count{backend="file"}`,
 	} {

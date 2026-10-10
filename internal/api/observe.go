@@ -83,7 +83,7 @@ func (s *Server) scrapeSamples() []telemetry.Sample {
 	}
 	leader := s.HA == nil || s.HA.IsLeader()
 	out := []telemetry.Sample{
-		{Name: "vigilante_build_info", Help: "Build information.", Labels: map[string]string{"version": telemetry.Version, "go_version": runtime.Version()}, Value: 1},
+		{Name: "vigilante_build_info", Help: "Build information.", Labels: map[string]string{"version": telemetry.Version, "flavor": telemetry.Flavor, "go_version": runtime.Version()}, Value: 1},
 		{Name: "vigilante_leader", Help: "1 if this node is the HA leader (always 1 without HA).", Value: b2f(leader)},
 		{Name: "vigilante_engine_active", Help: "1 if this node may judge and roll back (leader, not fenced).", Value: b2f(s.E.Active())},
 		{Name: "vigilante_dry_run", Help: "1 if changing actions are only logged.", Value: b2f(s.E.DryRun)},

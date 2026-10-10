@@ -1,0 +1,28 @@
+# Vigilante server configuration. Reference of every key:
+# /usr/share/doc/vigilante (docs/02-config-spec.md), full example:
+# /usr/share/doc/vigilante/examples/vigilante.yaml
+#
+# Check changes with:  vigilante validate -c /etc/vigilante/vigilante.yaml
+#                      vigilante doctor   -c /etc/vigilante/vigilante.yaml
+# then:                systemctl restart vigilante-server
+version: v1
+
+server:
+  # Loopback only until auth is configured below; then ":8088".
+  listen: "127.0.0.1:8088"
+  journal_path: /var/lib/vigilante/journal.jsonl
+  # Several servers sharing PostgreSQL (see the install guide, HA):
+  # state: {backend: postgres, dsn_env: VIGILANTE_DSN}
+  # ha: {enabled: true, advertise_url: "https://vigilante-1.example.internal:8088"}
+
+# Without auth.* every API call is anonymous admin: set it before exposing
+# the server. Service-account tokens: vigilante token create --name ci --role deployer
+# auth:
+#   oidc: {issuer: https://sso.example.internal/realms/corp, audience: vigilante}
+#   role_bindings:
+#     - {group: sre, role: operator}
+#   service_accounts: []
+
+targets: []
+executors: {}
+services: []

@@ -130,6 +130,18 @@ server:
 	if err != nil || c.Server.HA.LeaseTTL != 15*time.Second {
 		t.Fatalf("valid HA config: %v %+v", err, c)
 	}
+
+	// Replicas sharing one config (a ConfigMap) take their own address and
+	// node ID from the environment.
+	t.Setenv("VIGILANTE_HA_ADVERTISE_URL", "http://10.0.0.7:8088")
+	t.Setenv("VIGILANTE_HA_NODE_ID", "vigilante-0")
+	c, err = Parse([]byte(base + "  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true, advertise_url: http://ignored:8088}\n"))
+	if err != nil || c.Server.HA.AdvertiseURL != "http://10.0.0.7:8088" || c.Server.HA.NodeID != "vigilante-0" {
+		t.Fatalf("environment overrides: %v %+v", err, c.Server.HA)
+	}
+	if _, err := Parse([]byte(base + "  state: {backend: postgres, dsn_env: PG}\n  ha: {enabled: true}\n")); err != nil {
+		t.Fatalf("advertise_url from the environment alone: %v", err)
+	}
 }
 
 func TestAuthValidation(t *testing.T) {

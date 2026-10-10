@@ -1,0 +1,36 @@
+[Unit]
+Description=Vigilante rollback orchestrator (server)
+Documentation=https://github.com/outlet13f/vigilante
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=vigilante
+Group=vigilante
+# Secrets for *_env references (VAULT_TOKEN, DSNs, ...): mode 0640 root:vigilante.
+EnvironmentFile=-/etc/vigilante/vigilante.env
+ExecStart=/usr/bin/vigilante server -c /etc/vigilante/vigilante.yaml
+WorkingDirectory=/var/lib/vigilante
+Restart=on-failure
+RestartSec=5s
+# Give in-flight rollbacks time to reach a safe step on stop.
+TimeoutStopSec=60s
+LimitNOFILE=65536
+
+# Hardening. Executors reach targets over SSH and HTTP APIs; the local
+# connection type (commands on this host) needs the paths it changes added
+# to ReadWritePaths.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vigilante
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

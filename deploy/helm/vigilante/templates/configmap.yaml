@@ -1,0 +1,11 @@
+{{- if not .Values.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vigilante.fullname" . }}
+  labels:
+    {{- include "vigilante.labels" . | nindent 4 }}
+data:
+  vigilante.yaml: |
+    {{- .Values.config | nindent 4 }}
+{{- end }}

@@ -71,7 +71,7 @@ Environment: VIGILANTE_TOKEN (API token for --server / agent), VIGILANTE_LOG=deb
 `
 
 func main() {
-	telemetry.Version = version
+	telemetry.Version, telemetry.Flavor = version, flavor
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -109,6 +109,9 @@ func logger() *slog.Logger {
 func loadConfig(path string) (*config.Config, error) {
 	cfg, err := config.Load(path)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkBuild(cfg); err != nil {
 		return nil, err
 	}
 	if err := secrets.Configure(cfg.Secrets); err != nil {
@@ -154,7 +157,7 @@ func printJSON(v any) {
 func run(ctx context.Context, cmd string, args []string) (int, error) {
 	switch cmd {
 	case "version", "--version":
-		fmt.Println("vigilante", version)
+		fmt.Println(buildInfo())
 		return 0, nil
 	case "help", "-h", "--help":
 		fmt.Print(usage)

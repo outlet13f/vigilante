@@ -1,0 +1,47 @@
+# rpm and deb packages (nfpm). scripts/release.sh sets the environment:
+#   VERSION  release version without the leading v
+#   ARCH     Go architecture (amd64, arm64, ppc64le); nfpm maps it per format
+# and stages the linux binary at dist/.pkg/vigilante (nfpm does not expand
+# variables in content paths).
+name: vigilante
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: admin
+priority: optional
+maintainer: Vigilante maintainers <noreply@users.noreply.github.com>
+description: |
+  Unified rollback orchestrator: measures a deployment itself, decides
+  with composite rules and rolls back automatically across bare metal,
+  VMs, containers and load balancers.
+homepage: https://github.com/outlet13f/vigilante
+license: Proprietary
+
+contents:
+  - src: dist/.pkg/vigilante
+    dst: /usr/bin/vigilante
+    file_info: {mode: 0755}
+  - src: packaging/systemd/vigilante-server.service
+    dst: /usr/lib/systemd/system/vigilante-server.service
+  - src: packaging/systemd/vigilante-agent.service
+    dst: /usr/lib/systemd/system/vigilante-agent.service
+  - src: packaging/etc/vigilante.yaml
+    dst: /etc/vigilante/vigilante.yaml
+    type: config|noreplace
+    file_info: {mode: 0640, owner: root, group: vigilante}
+  - src: packaging/etc/agent.env
+    dst: /etc/vigilante/agent.env
+    type: config|noreplace
+    file_info: {mode: 0640, owner: root, group: vigilante}
+  - src: examples/config/vigilante.yaml
+    dst: /usr/share/doc/vigilante/examples/vigilante.yaml
+  - dst: /var/lib/vigilante
+    type: dir
+    file_info: {mode: 0750, owner: vigilante, group: vigilante}
+
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh

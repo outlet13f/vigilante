@@ -52,8 +52,8 @@ console:     {...}   # 웹 운영 콘솔 로그인(OIDC)과 세션
 | `state.backend` | `file` | `file`(단일 노드·CI) \| `postgres`(여러 노드가 공유, HA 전제) |
 | `state.dsn_ref` / `state.dsn_env` / `state.dsn` | — | PostgreSQL 접속 문자열. 비밀번호가 들어가므로 `dsn_ref`(Vault) 또는 `dsn_env` 권장. 스키마는 시작 시 자동 마이그레이션 |
 | `ha.enabled` | `false` | 여러 `vigilante server` 노드 중 하나만 리더로 동작. `postgres` 필수 |
-| `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달 |
-| `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름 |
+| `ha.advertise_url` | — | 다른 노드가 이 노드 API에 접근할 주소. 팔로워는 모든 API 요청을 리더의 이 주소로 전달. 환경변수 `VIGILANTE_HA_ADVERTISE_URL`이 있으면 그 값을 씀(여러 노드가 설정 파일 하나를 공유할 때, 예: Helm 차트) |
+| `ha.node_id` | 호스트명 | 리스 기록에 남는 노드 이름. 환경변수 `VIGILANTE_HA_NODE_ID`가 우선 |
 | `ha.lease_ttl` | `15s` | 리더 리스 유효시간(최소 3s). TTL/3마다 갱신. 리더가 죽으면 대략 TTL 안에 다른 노드가 이어받음 |
 | `metrics_public` | `false` | `/metrics`를 인증 없이 제공. 기본은 전체 범위 viewer 토큰(`viewer@*`) 필요 |
 

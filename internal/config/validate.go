@@ -4,12 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
 func (c *Config) applyDefaults() {
+	// Per-node HA settings may come from the environment, so replicas that
+	// share one config file (a Kubernetes ConfigMap) still differ.
+	if v := os.Getenv("VIGILANTE_HA_ADVERTISE_URL"); v != "" {
+		c.Server.HA.AdvertiseURL = v
+	}
+	if v := os.Getenv("VIGILANTE_HA_NODE_ID"); v != "" {
+		c.Server.HA.NodeID = v
+	}
 	if c.API.RateLimit == nil {
 		c.API.RateLimit = &RateLimit{Rate: 20, Burst: 40}
 	}
@@ -689,7 +698,7 @@ func (c *Config) Validate() error {
 			bad("server.ha: requires server.state.backend: postgres (nodes must share state)")
 		}
 		if ha.AdvertiseURL == "" {
-			bad("server.ha: advertise_url required (followers forward API calls to the leader at this URL)")
+			bad("server.ha: advertise_url required, or VIGILANTE_HA_ADVERTISE_URL (followers forward API calls to the leader at this URL)")
 		}
 		if ha.LeaseTTL < 3*time.Second {
 			bad("server.ha.lease_ttl must be at least 3s")
