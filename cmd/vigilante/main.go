@@ -4,7 +4,8 @@
 // Exit codes (watch / rollback):
 //
 //	0 PASS (phase promoted)   1 error   2 FAIL -> rolled back
-//	3 rollback failed / circuit open / approval needed   4 HOLD / inconclusive
+//	3 rollback failed / circuit open / approval needed / gate closed (freeze, change ticket)
+//	4 HOLD / inconclusive
 package main
 
 import (
