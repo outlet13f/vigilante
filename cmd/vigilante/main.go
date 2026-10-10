@@ -585,6 +585,7 @@ func cmdServer(ctx context.Context, args []string) (int, error) {
 	if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return 1, err
 	}
+	srv.Close() // let in-flight observations and rollbacks record where they stopped
 	return 0, nil
 }
 

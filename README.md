@@ -81,4 +81,4 @@ vigilante rollback -c vigilante.yaml --id $BUILD [--executor vm-snapshot] [--app
 - `host` 프로브는 Linux `/proc` 전용입니다. AIX/Solaris/HP-UX는 `exec` 기반 프로브 추가가 필요합니다.
 - Azure Load Balancer / Application Gateway, Citrix ADC 등은 `TrafficController` 구현 추가가 필요합니다 (현재는 `exec`/`webhook`으로 우회).
 - 바이너리 크기 약 35MB (govmomi·AWS SDK·gRPC 포함). 플러그인별 빌드 태그 분리는 아직 구현하지 않았습니다.
-- Race detector(`go test -race`)는 이 개발 환경에 cgo 툴체인이 없어 실행하지 못했습니다.
+- CI(`.github/workflows/ci.yml`)가 PR마다 `go test -race`, 명세 린트, API 하위호환 검사, govulncheck, E2E 데모를 실행합니다.

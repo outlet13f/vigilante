@@ -559,7 +559,7 @@ func (s *Server) v2StartObservation(w http.ResponseWriter, r *http.Request) {
 	}
 	op := s.E.StartOperation(model.OpObservation, d.Service, d, phase, p.ID)
 	s.audit(r, "phase.start", d.Service, d.ID, string(phase))
-	go func() {
+	s.background(func() {
 		err := s.E.Watch(s.ctx, d, phase)
 		if err != nil {
 			s.E.Log.Error("watch failed", "deployment", d.ID, "err", err)
@@ -573,7 +573,7 @@ func (s *Server) v2StartObservation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.E.FinishOperation(op.ID, model.OpCompleted, model.ResultOf(cp), "")
-	}()
+	})
 	s.accepted(w, op)
 }
 
@@ -629,7 +629,9 @@ func (s *Server) v2StartRollback(w http.ResponseWriter, r *http.Request) {
 	s.E.Abort(d.ID)
 	op := s.E.StartOperation(model.OpRollback, d.Service, d, "", p.ID)
 	s.audit(r, "rollback.manual", d.Service, d.ID, reason)
-	go s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
+	s.background(func() {
+		s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: reason, Manual: true, Executor: req.Executor, Targets: req.Targets, Actor: p.ID})
+	})
 	s.accepted(w, op)
 }
 
@@ -656,7 +658,9 @@ func (s *Server) v2Approve(w http.ResponseWriter, r *http.Request) {
 	}
 	op := s.E.StartOperation(model.OpApproval, d.Service, d, "", p.ID)
 	s.audit(r, "escalation.approve", d.Service, d.ID, req.Comment)
-	go s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
+	s.background(func() {
+		s.runRollbackOp(op, d, orchestrator.RollbackOptions{Reason: "approved escalation", Manual: true, Approved: true, Actor: p.ID})
+	})
 	s.accepted(w, op)
 }
 
@@ -822,7 +826,7 @@ func (s *Server) v2CaptureBaseline(w http.ResponseWriter, r *http.Request) {
 	}
 	op := s.E.StartOperation(model.OpBaseline, sv.Name, nil, "", p.ID)
 	s.audit(r, "baseline.capture", sv.Name, "", window.String())
-	go func() {
+	s.background(func() {
 		snap, err := s.E.CaptureBaseline(s.ctx, sv.Name, window)
 		res := &model.OperationResult{}
 		if snap != nil {
@@ -833,7 +837,7 @@ func (s *Server) v2CaptureBaseline(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.E.FinishOperation(op.ID, model.OpCompleted, res, "")
-	}()
+	})
 	s.accepted(w, op)
 }
 

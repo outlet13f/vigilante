@@ -169,19 +169,8 @@ services:
 	hs := httptest.NewServer(s.Handler())
 	t.Cleanup(func() {
 		hs.Close()
+		s.Close() // waits for observations and operations to record their end
 		cancel()
-		// let background operations settle before the journal's dir is removed
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			running := false
-			for _, op := range e.Operations() {
-				running = running || op.Status == "running"
-			}
-			if !running {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
 		e.Close()
 	})
 	return s, hs.URL

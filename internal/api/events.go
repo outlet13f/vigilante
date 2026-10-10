@@ -54,7 +54,7 @@ func (s *Server) newBus() *events.Bus {
 	e.AddReloadHook(b.Reload)
 	e.AddRecordHook(b.Observe)
 	b.Start(s.ctx)
-	go s.watchAgents()
+	s.background(s.watchAgents)
 	return b
 }
 

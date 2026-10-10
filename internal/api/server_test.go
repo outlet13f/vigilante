@@ -55,6 +55,7 @@ services:
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close) // before the engine closes and the temp dir goes
 	if s.Auth, err = auth.New(context.Background(), cfg.Auth, "tok"); err != nil {
 		t.Fatal(err)
 	}
