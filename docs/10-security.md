@@ -21,7 +21,7 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 - **TLS:** `server.tls`로 직접 HTTPS를 켜거나 TLS 프록시·인그레스 뒤에 둡니다. 에이전트는 `client_auth: optional`과 에이전트 인증서로 상호 인증할 수 있습니다(토큰 인증은 그대로 필요).
 - **프로세스:** 패키지의 systemd 유닛은 `vigilante` 계정, `NoNewPrivileges`, `ProtectSystem=strict`(쓰기는 `/var/lib/vigilante`만)로 실행합니다. 컨테이너 이미지는 distroless, non-root, 읽기 전용 루트 파일시스템입니다.
 - **감사:** 모든 조작과 거부는 해시 체인으로 묶인 감사 기록에 남습니다. `audit.syslog`로 SIEM에 실시간 전송하고, 주기적으로 `vigilante audit verify`를 실행하십시오.
-- **웹 콘솔:** CSP(자기 출처만), `X-Frame-Options: DENY`, HttpOnly·SameSite 세션 쿠키, CSRF 토큰. HA에서는 `console.session_key_ref`를 공유합니다.
+- **웹 콘솔:** CSP(자기 출처만), `X-Frame-Options: DENY`, HttpOnly·SameSite 세션 쿠키, CSRF 토큰. HTTPS(`server.tls` 또는 `https://` `console.redirect_url`)면 HSTS(`max-age=31536000`, `includeSubDomains` 없음)를 보냅니다. 같은 도메인의 다른 호스트까지 HTTPS로 묶으려면 프록시에서 `includeSubDomains`를 더하십시오. HA에서는 `console.session_key_ref`를 공유합니다.
 - **`/metrics`:** 기본은 `viewer@*` 토큰이 필요합니다. `metrics_public`은 스크레이퍼가 신뢰 망에 있을 때만.
 
 ## 비밀값

@@ -57,7 +57,7 @@ var EventTypes = []struct{ Type, Description string }{
 	{EvRollbackCompleted, "Every target is back on the previous version."},
 	{EvRollbackFailed, "The rollback failed or was blocked; targets may be isolated. Human required."},
 	{EvApprovalRequested, "An escalation step (e.g. VM snapshot restore) waits for approval."},
-	{EvApprovalDecided, "An escalation was approved."},
+	{EvApprovalDecided, "A rollback or escalation waiting for approval was approved or rejected."},
 	{EvCircuitOpened, "The circuit breaker opened: automatic actions are frozen."},
 	{EvCircuitHalfOpened, "The circuit breaker allows one trial action."},
 	{EvCircuitClosed, "The circuit breaker closed: automation resumed."},

@@ -296,7 +296,7 @@ func cmdWatch(ctx context.Context, args []string) (int, error) {
 		return 1, err
 	}
 	if c.srv != "" {
-		return watchRemote(ctx, c, *phase)
+		return watchRemote(ctx, c, *phase, *override)
 	}
 	e, err := c.engine()
 	if err != nil {
@@ -357,21 +357,32 @@ func apiCall(ctx context.Context, server, method, path string, body any, out any
 	return nil
 }
 
-func watchRemote(ctx context.Context, c *common, phase string) (int, error) {
+// watchRemote registers the deployment on the server and polls it to a
+// verdict. --ticket and --freeze-override go with the request; a refusal by
+// a closed gate (circuit, freeze, change ticket) exits 3, as in local mode.
+func watchRemote(ctx context.Context, c *common, phase, override string) (int, error) {
 	autoFill(c, nil)
-	var d model.Deployment
-	err := apiCall(ctx, c.srv, http.MethodPost, "/v1/deployments", map[string]any{
+	body := map[string]any{
 		"id": c.id, "service": c.service, "version": c.ver, "previous_version": c.prev, "phase": phase,
-	}, &d)
-	if err != nil {
-		return 1, err
+	}
+	if override != "" {
+		body["freeze_override"] = override
+	}
+	var hdr http.Header
+	if c.ticket != "" {
+		body["change_ticket"] = c.ticket
+		hdr = http.Header{"X-Change-Ticket": {c.ticket}} // servers before change_ticket in v1 read the header
+	}
+	var d model.Deployment
+	if err := apiRequest(ctx, c.srv, http.MethodPost, "/v1/deployments", hdr, body, &d); err != nil {
+		return remoteExitCode(err), err
 	}
 	fmt.Fprintf(os.Stderr, "deployment %s: observing %s via %s\n", d.ID, phase, c.srv)
 	for {
 		select {
 		case <-ctx.Done():
 			return 1, ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(remotePoll):
 		}
 		var st struct {
 			Deployment model.Deployment `json:"deployment"`

@@ -53,18 +53,69 @@ type ErrInvalidChange struct{ Reason string }
 
 func (e *ErrInvalidChange) Error() string { return e.Reason }
 
+// StatusError is a non-2xx answer from ServiceNow.
+type StatusError struct {
+	Method, Path string
+	Code         int
+	Body         string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("servicenow %s %s: %d %s", e.Method, e.Path, e.Code, e.Body)
+}
+
+// Retryable reports whether a failed call may succeed when repeated:
+// transport errors, timeouts, 429 and 5xx. Other 4xx answers (bad
+// credentials, a field ServiceNow rejects) will not get better.
+func Retryable(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code == http.StatusTooManyRequests || se.Code >= 500
+	}
+	var invalid *ErrInvalidChange
+	return err != nil && !errors.As(err, &invalid)
+}
+
+// DefaultBackoff is the wait before each retry: three retries after the
+// first attempt.
+var DefaultBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+
 // ServiceNow is a Table API client.
 type ServiceNow struct {
 	cfg   config.ServiceNow
 	creds map[string]config.Credential
 	http  *http.Client
 	Now   func() time.Time
+	// Backoff is the wait before each retry in Retry (DefaultBackoff).
+	Backoff []time.Duration
 }
 
 func NewServiceNow(cfg config.ServiceNow, creds map[string]config.Credential) *ServiceNow {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: cfg.TLSSkipVerify, MinVersion: tls.VersionTLS12} //nolint:gosec // opt-in
-	return &ServiceNow{cfg: cfg, creds: creds, http: &http.Client{Transport: tr, Timeout: 15 * time.Second}, Now: time.Now}
+	return &ServiceNow{cfg: cfg, creds: creds, http: &http.Client{Transport: tr, Timeout: 15 * time.Second}, Now: time.Now,
+		Backoff: DefaultBackoff}
+}
+
+// Retry runs fn until it succeeds, fails with an error that will not get
+// better (see Retryable), the backoff runs out or ctx ends. It returns the
+// number of attempts made. Each attempt is bounded by the HTTP client's
+// timeout; fn must be safe to repeat (EnsureIncident is, through its
+// correlation ID).
+func (s *ServiceNow) Retry(ctx context.Context, fn func(context.Context) error) (attempts int, err error) {
+	for {
+		attempts++
+		if err = fn(ctx); err == nil || !Retryable(err) || attempts > len(s.Backoff) {
+			return attempts, err
+		}
+		t := time.NewTimer(s.Backoff[attempts-1])
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return attempts, fmt.Errorf("%w (gave up after %d attempts: %w)", err, attempts, ctx.Err())
+		case <-t.C:
+		}
+	}
 }
 
 // Config returns the client's configuration.
@@ -115,7 +166,7 @@ func (s *ServiceNow) call(ctx context.Context, method, path string, body, out an
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("servicenow %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return &StatusError{Method: method, Path: path, Code: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
 	if out != nil {
 		return json.Unmarshal(raw, out)
