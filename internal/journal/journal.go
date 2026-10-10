@@ -34,13 +34,21 @@ const (
 	KindAPIClient     = "api-client"      // API client snapshot (secret stored as SHA-256)
 	KindAccessToken   = "access-token"    // OAuth access token issued (stored as SHA-256)
 	KindClientUsed    = "api-client.used" // Message = client ID; Time = last use (at most hourly)
+	KindEvent         = "event"           // CloudEvent published to subscribers
+	KindWebhook       = "webhook"         // webhook subscription snapshot
+	KindWebhookCursor = "webhook.cursor"  // Message = webhook ID; Seq = last event handled
 )
+
+// MaxEvents is how many recent events replay keeps for SSE resume and
+// webhook catch-up.
+const MaxEvents = 10000
 
 // Bookkeeping reports kinds that only rebuild state; their meaning is
 // carried by audit entries, so audit queries and SIEM export skip them.
 func Bookkeeping(kind string) bool {
 	switch kind {
-	case KindDeployment, KindStepDone, KindOperation, KindIdempotency, KindAPIClient, KindAccessToken, KindClientUsed:
+	case KindDeployment, KindStepDone, KindOperation, KindIdempotency, KindAPIClient, KindAccessToken, KindClientUsed,
+		KindEvent, KindWebhook, KindWebhookCursor:
 		return true
 	}
 	return false
@@ -56,6 +64,9 @@ type Entry struct {
 	Idem       *model.IdemRecord    `json:"idempotency,omitempty"`
 	Client     *model.APIClient     `json:"api_client,omitempty"`
 	Token      *model.AccessToken   `json:"access_token,omitempty"`
+	Event      *model.CloudEvent    `json:"event,omitempty"`
+	Webhook    *model.Webhook       `json:"webhook,omitempty"`
+	Seq        int64                `json:"seq,omitempty"`
 	DeployID   string               `json:"deployment_id,omitempty"`
 	Target     string               `json:"target,omitempty"`
 	Step       int                  `json:"step,omitempty"`
@@ -203,7 +214,9 @@ type State struct {
 	Idempotency map[string]*model.IdemRecord // by IdemRecord.Key
 	Clients     map[string]*model.APIClient
 	Tokens      map[string]*model.AccessToken // by SHA256
-	Corrupt     int                           // unparsable lines skipped (e.g. torn final write)
+	Events      []*model.CloudEvent           // the most recent MaxEvents, oldest first
+	Webhooks    map[string]*model.Webhook
+	Corrupt     int // unparsable lines skipped (e.g. torn final write)
 }
 
 // InFlight returns deployments whose rollback had started but not finished.
@@ -293,6 +306,23 @@ func Compact(pruned []Entry, cutoff time.Time) []Entry {
 			out = append(out, Entry{Kind: KindAccessToken, Time: cutoff, Token: t})
 		}
 	}
+	// Webhooks (with their cursors), and the last events so sequence numbers
+	// keep increasing and subscribers can still catch up.
+	hookIDs := make([]string, 0, len(st.Webhooks))
+	for id := range st.Webhooks {
+		hookIDs = append(hookIDs, id)
+	}
+	sort.Strings(hookIDs)
+	for _, id := range hookIDs {
+		out = append(out, Entry{Kind: KindWebhook, Time: st.Webhooks[id].UpdatedAt, Webhook: st.Webhooks[id]})
+	}
+	evs := st.Events
+	if len(evs) > 1000 {
+		evs = evs[len(evs)-1000:]
+	}
+	for _, ev := range evs {
+		out = append(out, Entry{Kind: KindEvent, Time: ev.Time, Event: ev})
+	}
 	keys := make([]string, 0, len(st.Idempotency))
 	for k := range st.Idempotency {
 		keys = append(keys, k)
@@ -316,6 +346,7 @@ func NewState() *State {
 		Idempotency: map[string]*model.IdemRecord{},
 		Clients:     map[string]*model.APIClient{},
 		Tokens:      map[string]*model.AccessToken{},
+		Webhooks:    map[string]*model.Webhook{},
 	}
 }
 
@@ -344,6 +375,25 @@ func (st *State) Apply(e Entry) {
 	case KindAccessToken:
 		if e.Token != nil {
 			st.Tokens[e.Token.SHA256] = e.Token
+		}
+	case KindEvent:
+		if e.Event != nil {
+			st.Events = append(st.Events, e.Event)
+			if len(st.Events) > 2*MaxEvents {
+				st.Events = append([]*model.CloudEvent(nil), st.Events[len(st.Events)-MaxEvents:]...)
+			}
+		}
+	case KindWebhook:
+		switch {
+		case e.Webhook == nil:
+		case e.Webhook.Deleted:
+			delete(st.Webhooks, e.Webhook.ID)
+		default:
+			st.Webhooks[e.Webhook.ID] = e.Webhook
+		}
+	case KindWebhookCursor:
+		if w := st.Webhooks[e.Message]; w != nil && e.Seq > w.Cursor {
+			w.Cursor = e.Seq
 		}
 	case KindClientUsed:
 		if c := st.Clients[e.Message]; c != nil {

@@ -53,7 +53,8 @@ func NewExporter(cfg config.SyslogExport, log *slog.Logger) (*Exporter, error) {
 // Send queues an entry if it is audit-relevant.
 func (x *Exporter) Send(e journal.Entry) {
 	switch e.Kind {
-	case journal.KindStepDone, journal.KindIdempotency, journal.KindOperation, journal.KindAPIClient, journal.KindAccessToken, journal.KindClientUsed:
+	case journal.KindStepDone, journal.KindIdempotency, journal.KindOperation, journal.KindAPIClient, journal.KindAccessToken, journal.KindClientUsed,
+		journal.KindEvent, journal.KindWebhook, journal.KindWebhookCursor:
 		return // bookkeeping: the matching audit and deployment entries carry the story
 	case journal.KindDeployment:
 		if e.Deployment == nil {

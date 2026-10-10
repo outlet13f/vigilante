@@ -59,6 +59,12 @@ type Engine struct {
 
 	// OnRecord sees every entry after it is durably stored (SIEM export).
 	OnRecord func(journal.Entry)
+	// hooks also see every stored entry (event bus); reloadHooks see the
+	// state after every Reload (HA election).
+	hookMu      sync.RWMutex
+	hooks       []func(journal.Entry)
+	reloadHooks []func(*journal.State)
+	loaded      *journal.State
 
 	transport   *transport.Manager
 	runners     func(string) (transport.Runner, error)
@@ -158,8 +164,38 @@ func (e *Engine) Reload(ctx context.Context) error {
 	e.clients, e.tokens = st.Clients, st.Tokens
 	e.Breaker, e.Guard = breaker, guard
 	e.mu.Unlock()
+	e.hookMu.Lock()
+	e.loaded = st
+	reload := e.reloadHooks
+	e.hookMu.Unlock()
+	for _, h := range reload {
+		h(st)
+	}
 	return nil
 }
+
+// AddRecordHook registers fn to see every entry after it is stored.
+func (e *Engine) AddRecordHook(fn func(journal.Entry)) {
+	e.hookMu.Lock()
+	e.hooks = append(e.hooks, fn)
+	e.hookMu.Unlock()
+}
+
+// AddReloadHook registers fn to receive the replayed state after every
+// Reload; it is also called at once with the current state.
+func (e *Engine) AddReloadHook(fn func(*journal.State)) {
+	e.hookMu.Lock()
+	e.reloadHooks = append(e.reloadHooks, fn)
+	st := e.loaded
+	e.hookMu.Unlock()
+	if st != nil {
+		fn(st)
+	}
+}
+
+// Record stores an entry (for components outside the engine, such as the
+// event bus). Fenced writes stand the node down like any other.
+func (e *Engine) Record(en journal.Entry) { e.record(en) }
 
 // SetActive switches this node between acting (leader / single node) and
 // standing by (HA follower or demoted). Deactivating cancels observations.
@@ -205,8 +241,16 @@ func (e *Engine) record(en journal.Entry) {
 	started := time.Now()
 	err := e.Journal.Append(context.Background(), en)
 	telemetry.StoreAppend.Since(started, backend)
-	if err == nil && e.OnRecord != nil {
-		e.OnRecord(en)
+	if err == nil {
+		if e.OnRecord != nil {
+			e.OnRecord(en)
+		}
+		e.hookMu.RLock()
+		hooks := e.hooks
+		e.hookMu.RUnlock()
+		for _, h := range hooks {
+			h(en)
+		}
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrFenced) {
@@ -390,14 +434,21 @@ func (e *Engine) MarkGood(service, version, reason string) (*model.Deployment, e
 	if version == "" {
 		return nil, errors.New("version is required")
 	}
-	d, err := e.Create(fmt.Sprintf("mark-good-%s-%s-%d", service, version, time.Now().Unix()), service, version, "")
-	if err != nil {
-		return nil, err
+	if _, ok := e.Cfg.Service(service); !ok {
+		return nil, fmt.Errorf("unknown service %q", service)
 	}
 	if reason == "" {
 		reason = "marked as known-good manually"
 	}
-	e.setState(d, model.StateSucceeded, reason)
+	// One record, already SUCCEEDED: it is a reference point, not a deployment
+	// that was created and then observed.
+	now := time.Now()
+	d := &model.Deployment{ID: fmt.Sprintf("mark-good-%s-%s-%d", service, version, now.UnixNano()), Service: service, Version: version,
+		State: model.StateSucceeded, Verdict: model.VerdictPending, Reason: reason, CreatedAt: now, UpdatedAt: now,
+		Checkpoints: map[string]map[string]string{}}
+	d.AddEvent("state", string(model.StateSucceeded)+": "+reason)
+	e.persist(d)
+	e.Log.Info("deployment state", "deployment", d.ID, "state", d.State, "reason", reason)
 	return d, nil
 }
 

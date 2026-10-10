@@ -44,6 +44,13 @@ type API struct {
 	EmergencyRateLimit *RateLimit `yaml:"emergency_rate_limit"`
 	// TokenTTL is the lifetime of OAuth access tokens (default 1h).
 	TokenTTL time.Duration `yaml:"token_ttl"`
+	// WebhookSigningKeyRef is the master key (vault:/env:/file: reference)
+	// from which each webhook's signing secret is derived. Webhooks are off
+	// without it. Nothing secret is written to the state store.
+	WebhookSigningKeyRef string `yaml:"webhook_signing_key_ref"`
+	// WebhookAllowedHosts limits webhook URLs to these hosts or domain
+	// suffixes (".example.internal"); empty = any host.
+	WebhookAllowedHosts []string `yaml:"webhook_allowed_hosts"`
 }
 
 // RateLimit is a token bucket: Rate requests per second, bursts up to

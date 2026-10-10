@@ -104,6 +104,9 @@ curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials "$API/v2/oa
 | `GET /v2/audit-events` | viewer@`*` + `audit:read` | 감사 기록, 오래된 순. `since`, `until`, `actor`, `action`, `service` |
 | `POST /v2/oauth/token` | 클라이언트 인증 | OAuth 토큰 발급 |
 | `/v2/api-clients…` | admin + `config:write` | API 클라이언트 관리 |
+| `GET /v2/events` | viewer | 이벤트 스트림(SSE) |
+| `GET /v2/event-types` | 인증만 | 이벤트 카탈로그 |
+| `/v2/webhooks…` | 다루는 범위의 viewer + `config:write` | 웹훅 구독, 재전송, 테스트, 전달 이력 |
 
 `Operation.result`에는 작업이 끝났을 때의 배포 상태, 판정, CI 종료 코드(`exit_code`)가 들어 있습니다. `status`는 작업이 실행됐으면 `completed`(롤백이 실패했어도 결과는 `result`에), 실행 자체를 못 했으면 `failed`(`error`에 이유)입니다. 리더가 바뀌어도 작업은 이어지고, 새 리더는 배포 상태를 보고 작업 완료 여부를 판단합니다.
 
@@ -128,6 +131,62 @@ exit "$(jq -r '.result.exit_code // 1' <<<"$R")"   # 0 통과, 2 롤백됨, 3 �
 ```
 
 재시도할 때 같은 `Idempotency-Key`를 쓰면 관측이 두 번 시작되지 않습니다.
+
+## 이벤트
+
+배포 상태 변화, 서킷, 승인, 에이전트 상실을 [CloudEvents 1.0](https://cloudevents.io) 형식으로 내보냅니다. 받는 방법은 두 가지입니다.
+
+| 방법 | 쓰는 곳 | 특징 |
+|---|---|---|
+| `GET /v2/events` (SSE) | 콘솔, 대시보드, 실시간 도구 | 연결을 유지하는 동안 받음. 끊기면 `Last-Event-ID`로 빠진 구간부터 다시 받음 |
+| 웹훅 구독 `POST /v2/webhooks` | 사내 시스템(ITSM, 메신저 봇, 배포 콘솔) | 서버가 등록된 URL로 POST. 재시도, 순서 보장, 서명 |
+
+| 이벤트 | 뜻 |
+|---|---|
+| `vigilante.deployment.created`, `.marked_good` | 배포 등록, 정상 버전 등록 |
+| `vigilante.observation.started`, `.passed`, `.failed`, `.held`, `.aborted` | 단계 관측 시작과 판정 |
+| `vigilante.rollback.started`, `.completed`, `.failed` | 롤백 시작·완료·실패(사람 필요) |
+| `vigilante.approval.requested`, `.decided` | 상위 전략 승인 요청·승인 |
+| `vigilante.circuit.opened`, `.half_opened`, `.closed` | 서킷 상태 |
+| `vigilante.agent.lost` | 에이전트 하트비트 끊김 |
+| `vigilante.webhook.disabled` | 실패가 이어져 웹훅 구독이 꺼짐 |
+| `vigilante.ping` | 테스트 이벤트 (해당 구독에만) |
+
+- **순번:** 이벤트마다 클러스터 전체에서 증가하는 `sequence`가 있고, `id`·SSE `id`·`webhook-id`가 모두 이 값입니다. 리더가 바뀌어도 이어집니다.
+- **범위:** 서비스 이벤트는 그 서비스를 읽을 수 있는 호출자에게만, 서비스가 없는 이벤트(서킷, 에이전트)는 viewer 누구에게나 갑니다.
+- **보관:** 최근 10,000건을 보관합니다. 더 오래 끊겨 있었다면 보관된 가장 오래된 이벤트부터 받습니다.
+
+### 웹훅
+
+```bash
+curl -X POST "$API/v2/webhooks" -H "$H" -d '{
+  "url": "https://incident-bot.example.internal/vigilante",
+  "types": ["vigilante.rollback.failed", "vigilante.circuit.opened"],
+  "teams": ["payments"]
+}'
+# 응답의 secret(whsec_…)은 이때 한 번만 보입니다. 서버는 저장하지 않고 필요할 때 계산합니다.
+```
+
+- **전달:** 구독마다 순서대로 한 건씩 보냅니다. 2xx(10초 안)면 성공입니다. 실패하면 1초, 5초, 30초, 2분, 10분, 30분 뒤 재시도하고, 그래도 실패하면 dead-letter 목록에 남기고 다음 이벤트로 넘어갑니다. 연속 5건이 dead-letter가 되면 구독을 끄고 운영 알림을 보냅니다. `PATCH {"active": true}`로 다시 켜면 남은 이벤트부터 이어서 보냅니다.
+- **최소 한 번:** 리더 교체나 응답 유실로 같은 이벤트가 두 번 갈 수 있습니다. `webhook-id`로 중복을 거르십시오.
+- **재전송·점검:** `POST …/redeliveries {"sequence": N}`(dead-letter 재전송), `POST …/pings`(테스트 이벤트), `GET …/deliveries`(최근 시도 100건).
+- **권한:** 구독이 다루는 서비스·팀 전부에 viewer가 있어야 합니다(필터가 없으면 `*`). 자기가 만든 구독만 보고 바꿀 수 있고, admin은 전부 다룹니다.
+- **서버 설정:** `api.webhook_signing_key_ref`(서명 마스터 키)가 있어야 웹훅을 쓸 수 있습니다. `api.webhook_allowed_hosts`로 보낼 수 있는 호스트를 제한할 수 있습니다. 리디렉션은 따라가지 않습니다.
+
+서명 검증([Standard Webhooks](https://www.standardwebhooks.com) 형식). 표준 라이브러리로 충분합니다.
+
+```python
+import base64, hashlib, hmac, time
+
+def verify(secret: str, headers: dict, body: bytes) -> bool:
+    msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
+    if abs(time.time() - int(ts)) > 300:        # 5분 넘은 요청은 재전송 공격으로 보고 거부
+        return False
+    key = base64.b64decode(secret.removeprefix("whsec_"))
+    mac = hmac.new(key, f"{msg_id}.{ts}.".encode() + body, hashlib.sha256).digest()
+    expected = "v1," + base64.b64encode(mac).decode()
+    return any(hmac.compare_digest(expected, s) for s in headers["webhook-signature"].split())
+```
 
 ## v1 → v2 대응
 

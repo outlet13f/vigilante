@@ -43,6 +43,7 @@ import (
 
 	"vigilante/internal/audit"
 	"vigilante/internal/auth"
+	"vigilante/internal/events"
 	"vigilante/internal/journal"
 	"vigilante/internal/model"
 	"vigilante/internal/orchestrator"
@@ -65,6 +66,7 @@ type Server struct {
 	proxies  map[string]*httputil.ReverseProxy
 	inflight map[string]bool // idempotency keys being processed
 	limits   *limiter
+	bus      *events.Bus
 }
 
 // Leadership is what the API needs from the HA elector.
@@ -93,6 +95,7 @@ func New(ctx context.Context, e *orchestrator.Engine) (*Server, error) {
 		return nil, err
 	}
 	s.Auth = a
+	s.bus = s.newBus()
 	return s, nil
 }
 

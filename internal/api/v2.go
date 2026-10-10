@@ -70,6 +70,17 @@ func (s *Server) v2Routes() []route {
 		{pattern: "PATCH /v2/api-clients/{id}", handler: s.v2UpdateClient, write: true},
 		{pattern: "DELETE /v2/api-clients/{id}", handler: s.v2RevokeClient, write: true},
 		{pattern: "POST /v2/api-clients/{id}/secret", handler: s.v2RotateClient},
+		{pattern: "GET /v2/events", handler: s.v2Events},
+		{pattern: "GET /v2/event-types", handler: s.v2EventTypes},
+		{pattern: "GET /v2/webhooks", handler: s.v2ListWebhooks},
+		{pattern: "POST /v2/webhooks", handler: s.v2CreateWebhook},
+		{pattern: "GET /v2/webhooks/{id}", handler: s.v2GetWebhook},
+		{pattern: "PATCH /v2/webhooks/{id}", handler: s.v2UpdateWebhook, write: true},
+		{pattern: "DELETE /v2/webhooks/{id}", handler: s.v2DeleteWebhook, write: true},
+		{pattern: "POST /v2/webhooks/{id}/secret", handler: s.v2RotateWebhookSecret},
+		{pattern: "GET /v2/webhooks/{id}/deliveries", handler: s.v2WebhookDeliveries},
+		{pattern: "POST /v2/webhooks/{id}/redeliveries", handler: s.v2Redeliver, write: true},
+		{pattern: "POST /v2/webhooks/{id}/pings", handler: s.v2PingWebhook, write: true},
 	}
 }
 

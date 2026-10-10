@@ -423,9 +423,13 @@ api:
   rate_limit: {rate: 20, burst: 40}            # 호출자별 v2 호출 한도 (daily: 일일 상한, 선택)
   emergency_rate_limit: {rate: 1, burst: 10}   # 롤백·승인·중단·서킷 전용 버킷
   token_ttl: 1h                                # OAuth 액세스 토큰 수명 (최대 24h)
+  webhook_signing_key_ref: "vault:secret/vigilante/webhooks#key"   # 웹훅 서명 마스터 키. 없으면 웹훅 비활성
+  webhook_allowed_hosts: [".example.internal"]                     # 웹훅 URL 허용 호스트(접미사). 비우면 제한 없음
 ```
 
 `rate: 0`이고 `daily`가 없으면 한도가 없습니다. API 클라이언트별 한도와 클라이언트 등록은 설정 파일이 아니라 API(`/v2/api-clients`)로 관리하며, 상태 저장소에 남습니다. 자세한 내용은 docs/06-api.md.
+
+웹훅 서명 비밀은 마스터 키와 구독 ID로 계산하므로 상태 저장소에는 비밀이 남지 않습니다. 마스터 키를 바꾸면 모든 구독의 비밀이 바뀌므로, 키 교체 후에는 각 구독에 `POST /v2/webhooks/{id}/secret`로 새 비밀을 받아 수신 측에 전달하십시오.
 
 ## `secrets` — 비밀값 출처
 

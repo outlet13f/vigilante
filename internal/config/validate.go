@@ -800,6 +800,7 @@ func (c *Config) validateSecrets(bad func(string, ...any)) {
 		}
 	}
 	check("server.state.dsn_ref", c.Server.State.DSNRef)
+	check("api.webhook_signing_key_ref", c.API.WebhookSigningKeyRef)
 	for _, s := range c.Services {
 		for _, p := range s.Probes {
 			if p.DB != nil {

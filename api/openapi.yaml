@@ -29,6 +29,13 @@ info:
     `cursor` until it is null. Cursors are opaque.
 
     **Time and IDs.** Timestamps are RFC 3339 in UTC. IDs are opaque strings.
+
+    **Events.** State changes are published as CloudEvents 1.0 with a
+    cluster-wide `sequence`: stream them from `/v2/events` (SSE, resumable with
+    `Last-Event-ID`) or subscribe a URL with `/v2/webhooks`. Deliveries are at
+    least once and in order per subscription, signed per Standard Webhooks
+    (`webhook-id`, `webhook-timestamp`, `webhook-signature: v1,<base64 HMAC-SHA256
+    of "id.timestamp.body">`); deduplicate by `webhook-id`.
   contact:
     name: Vigilante maintainers
     url: https://github.com/outlet13f/vigilante
@@ -50,6 +57,8 @@ tags:
     description: Services, their targets and presets (read from configuration).
   - name: safety
     description: The global circuit breaker (emergency stop).
+  - name: events
+    description: Event catalog, live stream (SSE) and webhook subscriptions.
   - name: audit
     description: Who did what, with a tamper-evident hash chain.
   - name: identity
@@ -785,6 +794,287 @@ paths:
         '409': {$ref: '#/components/responses/Conflict'}
         '429': {$ref: '#/components/responses/RateLimited'}
 
+  /v2/events:
+    get:
+      tags: [events]
+      operationId: streamEvents
+      summary: Stream events (Server-Sent Events)
+      description: |
+        `text/event-stream`: each message has `id` (the event sequence), `event`
+        (the type) and `data` (the CloudEvent as JSON). Reconnect with
+        `Last-Event-ID` (browsers do this automatically) to receive every event
+        missed while disconnected that is still kept (the last 10,000), then the
+        live stream. Without it the stream starts with new events. Only events of
+        services the caller may read are sent; events of no service (circuit,
+        agents) need viewer on any service. A keep-alive comment is sent every 15s.
+      security: [{bearerAuth: []}, {oauth2: [deployments:read]}]
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          schema: {type: string, pattern: '^[0-9]+$'}
+        - name: after
+          in: query
+          description: Same as Last-Event-ID, for clients that cannot set headers.
+          schema: {type: integer, minimum: 0}
+        - name: types
+          in: query
+          description: Comma-separated event types.
+          schema: {type: string}
+        - name: service
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: The event stream.
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/event-types:
+    get:
+      tags: [events]
+      operationId: listEventTypes
+      summary: Event catalog
+      responses:
+        '200':
+          description: Every event type with its meaning.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [type, description]
+                      properties:
+                        type: {type: string}
+                        description: {type: string}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks:
+    get:
+      tags: [events]
+      operationId: listWebhooks
+      summary: List webhook subscriptions
+      description: The caller's own subscriptions; admins see all.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page of subscriptions, oldest first.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WebhookPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [events]
+      operationId: createWebhook
+      summary: Subscribe to events
+      description: |
+        Deliveries start with the next event. The caller needs viewer on every
+        service and team the subscription covers (on `*` when unfiltered). The
+        response carries the signing secret once; it is derived from the server
+        key and never stored. Not replayable with Idempotency-Key (the stored
+        response would contain the secret).
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WebhookCreate'}
+      responses:
+        '201':
+          description: Subscribed; store the secret now.
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WebhookSecret'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/WebhookID'}
+    get:
+      tags: [events]
+      operationId: getWebhook
+      summary: Get a subscription (with its dead letters)
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      responses:
+        '200':
+          description: The subscription.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Webhook'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [events]
+      operationId: updateWebhook
+      summary: Change or re-enable a subscription
+      description: Setting `active` to true after an automatic disable clears the failure count; delivery resumes from the cursor.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WebhookUpdate'}
+      responses:
+        '200':
+          description: The updated subscription.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Webhook'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [events]
+      operationId: deleteWebhook
+      summary: Unsubscribe
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '204': {description: Deleted.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks/{id}/secret:
+    parameters:
+      - {$ref: '#/components/parameters/WebhookID'}
+    post:
+      tags: [events]
+      operationId: rotateWebhookSecret
+      summary: Rotate the signing secret
+      description: Deliveries are signed with the new secret from now on.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      responses:
+        '200':
+          description: The new secret, shown once.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WebhookSecret'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks/{id}/deliveries:
+    parameters:
+      - {$ref: '#/components/parameters/WebhookID'}
+    get:
+      tags: [events]
+      operationId: listWebhookDeliveries
+      summary: Recent delivery attempts
+      description: The last 100 attempts on this node, newest first.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      responses:
+        '200':
+          description: Attempts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Delivery'}}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks/{id}/redeliveries:
+    parameters:
+      - {$ref: '#/components/parameters/WebhookID'}
+    post:
+      tags: [events]
+      operationId: redeliverEvent
+      summary: Send a kept event again
+      description: Typically for an entry of the dead-letter list, which it removes from the list.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sequence]
+              additionalProperties: false
+              properties:
+                sequence: {type: integer, minimum: 1}
+      responses:
+        '202':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queued, sequence]
+                properties:
+                  queued: {type: boolean}
+                  sequence: {type: integer}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+
+  /v2/webhooks/{id}/pings:
+    parameters:
+      - {$ref: '#/components/parameters/WebhookID'}
+    post:
+      tags: [events]
+      operationId: pingWebhook
+      summary: Send a test event
+      description: Publishes a `vigilante.ping` event that only this subscription receives.
+      security: [{bearerAuth: []}, {oauth2: [config:write]}]
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '202':
+          description: The test event, queued for delivery.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CloudEvent'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503':
+          description: This node cannot publish right now (not the leader).
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
   /healthz:
     get:
       tags: [system]
@@ -877,6 +1167,40 @@ paths:
     parameters: [{name: target, in: path, required: true, schema: {type: string}}]
     get: {tags: [v1], operationId: v1TargetMetrics, summary: Recent samples of a target, responses: {'200': {description: OK}}}
 
+webhooks:
+  event:
+    post:
+      summary: Event delivery to a subscribed URL
+      description: |
+        One event per request. Answer 2xx within 10 seconds to acknowledge.
+        Anything else is retried after 1s, 5s, 30s, 2m, 10m and 30m; after the
+        last retry the event goes to the subscription's dead-letter list. Five
+        dead letters in a row disable the subscription and alert operators.
+        Redirects are not followed.
+      parameters:
+        - name: webhook-id
+          in: header
+          required: true
+          description: Event sequence; the same on every retry. Deduplicate by it.
+          schema: {type: string}
+        - name: webhook-timestamp
+          in: header
+          required: true
+          description: Unix seconds; reject old ones to stop replays.
+          schema: {type: string}
+        - name: webhook-signature
+          in: header
+          required: true
+          description: 'v1,<base64 HMAC-SHA256 over "webhook-id.webhook-timestamp.body">, keyed with the base64-decoded part of the whsec_ secret.'
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/cloudevents+json:
+            schema: {$ref: '#/components/schemas/CloudEvent'}
+      responses:
+        '200': {description: Acknowledged (any 2xx).}
+
 components:
   securitySchemes:
     bearerAuth:
@@ -938,6 +1262,11 @@ components:
       name: If-Match
       in: header
       description: Act only if the deployment still has this ETag.
+      schema: {type: string}
+    WebhookID:
+      name: id
+      in: path
+      required: true
       schema: {type: string}
     IfNoneMatch:
       name: If-None-Match
@@ -1381,6 +1710,108 @@ components:
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/ApiClient'}}
         next_cursor: {type: [string, 'null']}
+
+    CloudEvent:
+      type: object
+      description: CloudEvents 1.0, structured JSON mode.
+      required: [specversion, id, source, type, time, datacontenttype, sequence, data]
+      properties:
+        specversion: {type: string, enum: ['1.0']}
+        id: {type: string, description: 'The sequence as a string; unique per cluster.'}
+        source: {type: string}
+        type:
+          type: string
+          enum: [vigilante.deployment.created, vigilante.deployment.marked_good, vigilante.observation.started,
+                 vigilante.observation.passed, vigilante.observation.failed, vigilante.observation.held,
+                 vigilante.observation.aborted, vigilante.rollback.started, vigilante.rollback.completed,
+                 vigilante.rollback.failed, vigilante.approval.requested, vigilante.approval.decided,
+                 vigilante.circuit.opened, vigilante.circuit.half_opened, vigilante.circuit.closed,
+                 vigilante.agent.lost, vigilante.webhook.disabled, vigilante.ping]
+        subject: {type: string, description: 'Deployment ID, "circuit", target or webhook ID.'}
+        time: {type: string, format: date-time}
+        datacontenttype: {type: string, enum: [application/json]}
+        sequence: {type: integer, description: 'Extension: cluster-wide order; the SSE id and Last-Event-ID.'}
+        service: {type: string, description: 'Extension: the service, for filtering.'}
+        team: {type: string, description: 'Extension: the owning team.'}
+        data:
+          type: object
+          description: |
+            Deployment events: deployment_id, service, version, previous_version,
+            phase, state, verdict, reason, exit_code, targets, breaches.
+            Circuit events: state, reason. approval.decided: deployment_id,
+            approved_by, comment. agent.lost: target, last_seen, services.
+    Webhook:
+      type: object
+      required: [id, url, types, services, teams, active, cursor, consecutive_failures, dead_letters, created_at, updated_at]
+      properties:
+        id: {type: string}
+        url: {type: string}
+        description: {type: string}
+        types: {type: array, items: {type: string}, description: 'Empty = every type.'}
+        services: {type: array, items: {type: string}}
+        teams: {type: array, items: {type: string}}
+        active: {type: boolean}
+        disabled_reason: {type: string}
+        cursor: {type: integer, description: 'Last event sequence handled.'}
+        consecutive_failures: {type: integer}
+        dead_letters:
+          type: array
+          items:
+            type: object
+            required: [sequence, type, at, attempts, error]
+            properties:
+              sequence: {type: integer}
+              type: {type: string}
+              at: {type: string, format: date-time}
+              attempts: {type: integer}
+              error: {type: string}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    WebhookCreate:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url: {type: string, description: 'http(s) URL; limited by api.webhook_allowed_hosts when set.'}
+        description: {type: string}
+        types: {type: array, items: {type: string}}
+        services: {type: array, items: {type: string}}
+        teams: {type: array, items: {type: string}}
+    WebhookUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        url: {type: string}
+        description: {type: string}
+        types: {type: array, items: {type: string}}
+        services: {type: array, items: {type: string}}
+        teams: {type: array, items: {type: string}}
+        active: {type: boolean}
+    WebhookSecret:
+      type: object
+      required: [webhook, secret]
+      properties:
+        webhook: {$ref: '#/components/schemas/Webhook'}
+        secret: {type: string, description: 'whsec_… (Standard Webhooks). Shown once.'}
+    WebhookPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Webhook'}}
+        next_cursor: {type: [string, 'null']}
+    Delivery:
+      type: object
+      required: [sequence, type, attempt, at, duration_ms, outcome]
+      properties:
+        sequence: {type: integer}
+        type: {type: string}
+        attempt: {type: integer}
+        at: {type: string, format: date-time}
+        status_code: {type: integer}
+        error: {type: string}
+        duration_ms: {type: integer}
+        outcome: {type: string, enum: [delivered, retrying, dead]}
 
     Readiness:
       type: object
