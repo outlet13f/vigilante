@@ -161,3 +161,25 @@ cd test/podman-lab
 - `doctor -c lab.yaml`: 실패 0, 경고 2(SSH 세션 예산, 의도된 값), exit 0.
 - **L1 3회:** `app-nginx` 3/3 PASS, `ROLLED_BACK`, 탐지 중앙값 3초, 롤백 2초. 끝난 뒤 `nginx -T`의 upstream에 `down` 없음, LB :8080 200, app1 링크 v1. 확인용 1회 추가 실행도 PASS.
 
+
+### 2026-11-04 재시험 (커밋 e03416f, PR #17)
+
+- 단위 테스트: gofmt·vet 통과, `go test ./...` 2회 연속 전부 통과.
+- `doctor -c lab.yaml`: 실패 0, 경고 2(SSH 세션 예산), exit 0.
+- **L1~L5 각 3회, 15/15 PASS** (`.run/retest-results.jsonl`):
+
+| ID | 서비스 | 결과 | 탐지 중앙값 | 롤백 중앙값 |
+|---|---|---|---|---|
+| L1 | app-nginx | 3/3 | 4초 | 2초 |
+| L2 | app-haproxy | 3/3 | 4초 | 2초 |
+| L3 | app-haproxy-ssh | 3/3 | 4초 | 4초 |
+| L4 | app-envoy | 3/3 | 3초 | 2초 |
+| L5 | app-container | 3/3 | 5초 | 0초 |
+
+- 끝난 뒤 상태: Nginx upstream에 `down` 없음, HAProxy app1·app2 admin 0(ready)·op 2(running), Envoy EDS에 `DRAINING` 없음·`/clusters` 둘 다 healthy, app1 링크 v1, vgl-app3는 `localhost/vgl-app:v1`·IP 10.89.50.13 유지.
+
+**시험 중 관찰**
+
+- **랩 절차:** 서비스를 연달아 돌리면, 앞 서비스의 마지막 `--reset`이 fakeapp를 재시작하는 동안 다음 `lab run`의 사전 doctor가 app1 헬스 `connection refused`로 실패해 시작하지 않습니다(L2·L4 첫 시도). 제품 결함이 아니라 절차 문제이므로, 서비스 사이에 app1 헬스가 200이 될 때까지 기다린 뒤 실행합니다.
+- **Podman VM 정지:** 재실행 도중 podman-machine-default가 `stopped`가 되어 컨테이너 7개가 함께 멈췄습니다(원인 미상, 디스크 여유 27 GiB·VM 메모리 여유 충분). `podman machine start` 후 `podman start vgl-*`로 복구했고, 이후 실행은 정상.
+- **O1 (문서화 필요):** container 실행기는 롤백 때 불량 컨테이너를 지우지 않고 `<이름>-failed-<시각>`으로 바꿔 남깁니다(`internal/executor/container.go:107`, 사후 분석용으로 보임). L5 3회 뒤 `vgl-app3-failed-*` 3개가 쌓였습니다. 운영자 매뉴얼에 이 동작과 정리 방법이 없습니다.
