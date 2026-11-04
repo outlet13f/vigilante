@@ -1,14 +1,15 @@
 ---
 title: 보안 점검표 응답서
 doc_id: VGL-BD-02
-version: 1.2
-date: 2026-10-11
+version: 1.3
+date: 2026-11-04
 author: Vigilante 개발팀
 status: 검토본
 history:
   - 1.0 | 2026-10-11 | 최초 작성
   - 1.1 | 2026-10-11 | 코드 대조 검증 반영
   - 1.2 | 2026-10-11 | 결함 수정(PR #13) 반영, PR #12 병합 반영, PR #14 반영
+  - 1.3 | 2026-11-04 | Go 툴체인 go1.27.3 갱신(GO-2026-6809) 반영
 ---
 
 # 1. 문서 개요
@@ -232,7 +233,7 @@ Vigilante는 운영 서버를 재시작하고, 로드밸런서에서 대상을 �
 | SC-01 | 소프트웨어 구성 명세(SBOM) | 충족 | 바이너리별 CycloneDX SBOM(cyclonedx-gomod), 폐쇄망 번들에 포함. scripts/release.sh, docs/07 "배포 형태" | 정식 릴리스 전이므로 CI에서 생성만 확인 |
 | SC-02 | 배포물 서명 | 부분 충족 | 모든 파일의 `SHA256SUMS`를 cosign 키로 서명, 이미지도 cosign 서명, openssl만으로 확인 가능. CI가 PR마다 임시 키로 `SHA256SUMS` 서명·검증(이미지 서명은 릴리스 워크플로우에서만 하며 아직 실행된 적 없음). docs/07 "서명 확인", .github/workflows/release.yml | **릴리스 서명 키를 아직 만들지 않음**(`packaging/cosign.pub` 없음). 키가 없으면 릴리스 워크플로우는 실패하도록 되어 있음. 서명된 정식 릴리스는 아직 없음 |
 | SC-03 | 공개 투명성 로그(Rekor) 기록 | 해당 없음 | 설계상 사용하지 않음(`--tlog-upload=false`). 사내 릴리스이고 폐쇄망에서 확인해야 하기 때문. docs/07, docs/05 M6 구현 결과 | 검증 시 `--insecure-ignore-tlog=true` 필요. 신뢰 기준은 저장소의 공개 키 또는 사내 배포 사본 |
-| SC-04 | 의존성 취약점 점검 | 충족 | 모든 PR과 master push에서 govulncheck(v1.8.0) 실행, 발견 시 CI 실패. 표준 라이브러리 취약점 11건과 `golang.org/x/net` 취약점을 찾아 툴체인 go1.27.2 고정, x/net v0.60.0으로 갱신(docs/05 M8 구현 결과) | govulncheck는 코드에서 도달 가능한 Go 모듈 취약점만 다룸 |
+| SC-04 | 의존성 취약점 점검 | 충족 | 모든 PR과 master push에서 govulncheck(v1.8.0) 실행, 발견 시 CI 실패. 표준 라이브러리 취약점 11건과 `golang.org/x/net` 취약점을 찾아 툴체인 go1.27.2 고정, x/net v0.60.0으로 갱신(docs/05 M8 구현 결과). 이후 `crypto/x509` 취약점 GO-2026-6809(SIEM TLS 전송 경로에서 도달)가 CI에서 검출되어 go1.27.3으로 올림(PR #15) | govulncheck는 코드에서 도달 가능한 Go 모듈 취약점만 다룸 |
 | SC-05 | 정적 분석 | 부분 충족 | gofmt, `go vet`, race detector(`go test -race`)를 CI에서 실행 | 보안 전용 정적 분석 도구(SAST)는 사용하지 않음 |
 | SC-06 | 컨테이너 이미지 취약점 점검 | 부분 충족 | 기반 이미지는 셸·패키지 관리자가 없는 distroless static | 이미지 취약점 스캐너는 CI에 없음 |
 | SC-07 | 의존성 최소화 | 충족 | 최소 빌드가 vSphere·AWS SDK·gRPC·MySQL 의존성을 제외(38MB에서 18MB). OpenStack·F5·Nutanix 클라이언트는 표준 라이브러리로 구현. docs/05 M6·M7 구현 결과 | — |

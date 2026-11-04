@@ -1,14 +1,15 @@
 ---
 title: 호환성·검증 현황
 doc_id: VGL-BD-03
-version: 1.2
-date: 2026-10-11
+version: 1.3
+date: 2026-11-04
 author: Vigilante 개발팀
 status: 검토본
 history:
   - 1.0 | 2026-10-11 | 최초 작성
   - 1.1 | 2026-10-11 | 코드 대조 검증 반영
   - 1.2 | 2026-10-11 | 결함 수정(PR #13) 반영, PR #12 병합 반영, PR #14 반영
+  - 1.3 | 2026-11-04 | Go 툴체인 go1.27.3 갱신(GO-2026-6809) 반영
 ---
 
 # 1. 문서 개요
@@ -111,7 +112,7 @@ history:
 | Linux ppc64le | 정적 바이너리, 패키지, 이미지 | CI에서 교차 빌드만 확인 (실행 테스트 없음) |
 | Windows amd64 | 정적 바이너리 (CLI·CI 용도) | CI에서 교차 빌드만 확인. Windows 서비스 래퍼·설치 패키지 없음 |
 
-모든 바이너리는 `CGO_ENABLED=0` 정적 빌드이며, Go 툴체인은 go1.27.2로 고정되어 있습니다(go.mod, ci.yml). 개발 중 Windows에서 로컬 명령의 따옴표 인자가 깨지는 버그를 찾아 고쳤지만(CHANGELOG.md "Fixed"), Windows 실행 테스트는 CI에 없습니다.
+모든 바이너리는 `CGO_ENABLED=0` 정적 빌드이며, Go 툴체인은 go1.27.3으로 고정되어 있습니다(go.mod, ci.yml). 개발 중 Windows에서 로컬 명령의 따옴표 인자가 깨지는 버그를 찾아 고쳤지만(CHANGELOG.md "Fixed"), Windows 실행 테스트는 CI에 없습니다.
 
 ## 4.2 설치 패키지
 
