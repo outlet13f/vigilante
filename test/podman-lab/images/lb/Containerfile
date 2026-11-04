@@ -1,0 +1,28 @@
+# Load-balancer host reached over SSH: Nginx (:8080), HAProxy (:8081, runtime
+# API on :9999 and /run/haproxy/admin.sock) and Envoy (:8082, file-based EDS,
+# admin :9901), each balancing app1 and app2.
+FROM docker.io/envoyproxy/envoy:v1.32-latest AS envoy
+
+FROM docker.io/library/debian:12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nginx haproxy openssh-server sudo procps curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash deploy \
+ && usermod -aG haproxy deploy \
+ && echo 'deploy ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-lab && chmod 440 /etc/sudoers.d/90-lab \
+ && mkdir -p /run/sshd /run/haproxy /home/deploy/.ssh /etc/nginx/upstream /etc/envoy/eds \
+ && rm -f /etc/nginx/sites-enabled/default \
+ && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+COPY --from=envoy /usr/local/bin/envoy /usr/local/bin/envoy
+COPY .run/id_ed25519.pub /home/deploy/.ssh/authorized_keys
+COPY images/lb/nginx-lab.conf /etc/nginx/conf.d/lab.conf
+COPY images/lb/upstream-app.conf /etc/nginx/upstream/app.conf
+COPY images/lb/haproxy.cfg /etc/haproxy/haproxy.cfg
+COPY images/lb/envoy.yaml /etc/envoy/envoy.yaml
+COPY images/lb/eds.json /etc/envoy/eds/eds.json
+COPY images/lb/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 700 /home/deploy/.ssh && chmod 600 /home/deploy/.ssh/authorized_keys \
+ && chown -R deploy:deploy /home/deploy/.ssh \
+ && chmod 755 /usr/local/bin/entrypoint.sh
+EXPOSE 22 8080 8081 8082 9901 9999
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

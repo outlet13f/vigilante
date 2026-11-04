@@ -1,0 +1,17 @@
+{
+  "version_info": "1",
+  "resources": [
+    {
+      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+      "cluster_name": "app_cluster",
+      "endpoints": [
+        {
+          "lb_endpoints": [
+            {"endpoint": {"address": {"socket_address": {"address": "10.89.50.11", "port_value": 18080}}}},
+            {"endpoint": {"address": {"socket_address": {"address": "10.89.50.12", "port_value": 18080}}}}
+          ]
+        }
+      ]
+    }
+  ]
+}

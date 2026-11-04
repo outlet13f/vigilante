@@ -3,3 +3,4 @@
 examples/demo/run/
 *.jsonl
 vigilante-*.lock
+test/podman-lab/.run/

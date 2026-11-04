@@ -1,0 +1,10 @@
+# The fake service as a container image, one tag per version, for the
+# container executor (image switch through the Podman Docker-compatible API).
+#   podman build --build-arg VERSION=v2 -t localhost/vgl-app:v2 ...
+FROM docker.io/library/debian:12-slim
+ARG VERSION=v1
+ENV VERSION=${VERSION}
+COPY .run/bin/fakeapp /usr/local/bin/fakeapp
+RUN mkdir -p /var/log/app
+EXPOSE 18080
+ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/fakeapp -addr 0.0.0.0:18080 -version \"$VERSION\" -bad v2 -access-log /var/log/app/access.log -app-log /var/log/app/app.log"]
