@@ -1,14 +1,15 @@
 ---
 title: 아키텍처 설계서
 doc_id: VGL-SI-02
-version: 1.2
-date: 2026-10-11
+version: 1.3
+date: 2026-11-04
 author: Vigilante 개발팀
 status: 검토본
 history:
   - 1.0 | 2026-10-11 | 최초 작성
   - 1.1 | 2026-10-11 | 코드 대조 검증 반영
   - 1.2 | 2026-10-11 | 결함 수정(PR #13) 반영, PR #12 병합 반영, PR #14 반영
+  - 1.3 | 2026-11-04 | Go 툴체인 go1.27.3 갱신(GO-2026-6809) 반영
 ---
 
 # 1. 개요
@@ -443,7 +444,7 @@ M5-4 부하 시험 중 과부하된 Windows 개발 PC에서 관측 쪽 프로브
 
 | 항목 | 값 | 출처 |
 |---|---|---|
-| 언어 | Go 1.27.0(모듈), 툴체인 go1.27.2 고정 | go.mod |
+| 언어 | Go 1.27.0(모듈), 툴체인 go1.27.3 고정 | go.mod |
 | 빌드 | `CGO_ENABLED=0` 정적 바이너리 | README |
 | 대상 플랫폼 | linux/amd64, linux/arm64, linux/ppc64le, windows/amd64 | README, docs/09 |
 | 상태 저장소 | 파일(JSONL), PostgreSQL 16(CI 확인) | docs/09 |

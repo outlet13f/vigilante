@@ -1,14 +1,15 @@
 ---
 title: 테스트 계획·결과서
 doc_id: VGL-SI-06
-version: 1.2
-date: 2026-10-11
+version: 1.3
+date: 2026-11-04
 author: Vigilante 개발팀
 status: 검토본
 history:
   - 1.0 | 2026-10-11 | 최초 작성
   - 1.1 | 2026-10-11 | 코드 대조 검증 반영
   - 1.2 | 2026-10-11 | 결함 수정(PR #13) 반영, PR #12 병합 반영, PR #14 반영
+  - 1.3 | 2026-11-04 | Go 툴체인 go1.27.3 갱신(GO-2026-6809) 반영
 ---
 
 # 1. 개요
@@ -76,7 +77,7 @@ history:
 | 구분 | 로컬 개발 환경 (본 측정) | CI (GitHub Actions) |
 |---|---|---|
 | OS | Windows 11 Home 10.0.26200 (`ver`: 10.0.26200.9457) | `ubuntu-latest` |
-| Go | go1.27.2 windows/amd64 | `GO_VERSION: "1.27.2"`(go.mod `toolchain go1.27.2`와 일치 검사) |
+| Go | go1.27.2 windows/amd64 | `GO_VERSION: "1.27.3"`(go.mod `toolchain go1.27.3`와 일치 검사). 본 측정 이후 GO-2026-6809 수정을 위해 go1.27.2에서 올림 |
 | cgo | `CGO_ENABLED=0` (cgo 없음) | 기본(cgo 사용 가능) |
 | PostgreSQL | 임베디드 PostgreSQL 18.3.0 (`embedded-postgres` v1.34.0 기본값, 캐시 `embedded-postgres-binaries-windows-amd64-18.3.0.txz`). 테스트 바이너리마다 1회 기동, 테스트마다 새 DB | 서비스 컨테이너 `postgres:16`, `VIGILANTE_TEST_PG_DSN=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable` |
 | 셸 | Git Bash | bash |
