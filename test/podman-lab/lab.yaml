@@ -1,0 +1,151 @@
+# Vigilante configuration for the local Podman lab (test plan: README.md).
+# Every path is as seen from the controller container vgl-ctl, which runs
+# vigilante with the working directory /lab (this folder):
+#   ./lab.sh vig doctor -c lab.yaml
+# Addresses are fixed on the vgl-lab network (10.89.50.0/24) because Envoy's
+# file-based EDS takes IP addresses only.
+version: v1
+server:
+  journal_path: /lab/.run/journal.jsonl
+
+credentials:
+  lab-ssh:
+    type: ssh
+    user: deploy
+    private_key_file: /root/.ssh/id_ed25519
+    insecure_ignore_host_key: true    # lab images get new host keys on every build
+
+targets:
+  - name: lb
+    kind: vm
+    address: 10.89.50.10
+    connection: {type: ssh, credential: lab-ssh, sudo: true, sudo_scope: changes}
+  - name: app1
+    kind: vm
+    address: 10.89.50.11
+    # The four symlink services share this host; sshd allows MaxSessions 20.
+    connection: {type: ssh, credential: lab-ssh, sudo: true, sudo_scope: changes, max_sessions: 16}
+  - name: app2
+    kind: vm
+    address: 10.89.50.12
+    # The four symlink services share this host; sshd allows MaxSessions 20.
+    connection: {type: ssh, credential: lab-ssh, sudo: true, sudo_scope: changes, max_sessions: 16}
+  # The container service: probes and the image switch go through the Podman
+  # socket mounted in the controller.
+  - name: app3
+    kind: container_host
+    address: 10.89.50.13
+    connection: {type: local}
+
+traffic:
+  nginx-lab:
+    type: nginx
+    drain_wait: 2s
+    nginx:
+      hosts: [lb]
+      upstream_file: /etc/nginx/upstream/app.conf
+      member_format: "{{.Address}}:18080"
+  haproxy-lab:                        # runtime API over TCP
+    type: haproxy
+    drain_wait: 2s
+    haproxy:
+      address: 10.89.50.10:9999
+      backend: app_backend
+      server_name: "{{.Name}}"
+  haproxy-lab-ssh:                    # the same API through the unix socket, over SSH
+    type: haproxy
+    drain_wait: 2s
+    haproxy:
+      hosts: [lb]
+      socket: /run/haproxy/admin.sock
+      backend: app_backend
+      server_name: "{{.Name}}"
+      drain_to_maint: true
+  envoy-lab:
+    type: envoy
+    drain_wait: 2s
+    envoy:
+      hosts: [lb]
+      eds_file: /etc/envoy/eds/eds.json
+      member_format: "{{.Address}}:18080"
+
+executors:
+  app-symlink:
+    type: symlink
+    symlink:
+      link: /opt/app/current
+      releases_dir: /opt/app/releases
+      release: "{{.PreviousVersion}}"
+      init: none
+      restart_cmd: pkill -x fakeapp   # the target's restart loop starts the linked release
+  app-container:
+    type: container
+    container:
+      socket: /var/run/docker.sock
+      name: vgl-app3
+      image_repo: localhost/vgl-app
+      tag: "{{.PreviousVersion}}"
+      pull: false
+      stop_timeout_sec: 2
+
+services:
+  # Symlink releases on app1/app2 behind each software load balancer. The
+  # services share targets, so run their lab scenarios one at a time.
+  - &symlink-service
+    name: app-nginx
+    targets: [app1, app2]
+    preset: java-web@1
+    overrides:
+      health_url: "http://{{.Address}}:18080/health"
+      access_log: /var/log/app/access.log
+      app_log: /var/log/app/app.log
+      window: 10s
+      latency_window: 10s
+      p99_min_ms: 15                  # the fake app answers in single-digit milliseconds
+    probes:
+      - id: health
+        type: http
+        interval: 500ms
+        timeout: 1s
+        http: {url: "http://{{.Address}}:18080/health", json_path: status, json_expect: UP}
+    baseline: {window: 10s, min_samples: 20}
+    phases:
+      canary: {targets: [app1], observation_window: 30s, warmup: 3s, eval_interval: 1s, min_samples: 20}
+    rollback: &symlink-rollback
+      mode: auto
+      executor: app-symlink
+      traffic: nginx-lab
+      step_timeout: 30s
+      retry: {attempts: 2, backoff: 1s}
+  - <<: *symlink-service
+    name: app-haproxy
+    rollback: {<<: *symlink-rollback, traffic: haproxy-lab}
+  - <<: *symlink-service
+    name: app-haproxy-ssh
+    rollback: {<<: *symlink-rollback, traffic: haproxy-lab-ssh}
+  - <<: *symlink-service
+    name: app-envoy
+    rollback: {<<: *symlink-rollback, traffic: envoy-lab}
+
+  # One container replaced by image tag through the Podman API.
+  - name: app-container
+    targets: [app3]
+    preset: container-api@1
+    overrides:
+      container: vgl-app3
+      health_url: "http://{{.Address}}:18080/health"
+      window: 10s
+      latency_window: 10s
+      p99_min_ms: 15
+    baseline: {window: 10s, min_samples: 20}
+    phases:
+      canary: {observation_window: 30s, warmup: 3s, eval_interval: 1s, min_samples: 20}
+    rollback:
+      mode: auto
+      executor: app-container
+      step_timeout: 60s
+      retry: {attempts: 2, backoff: 1s}
+
+safety:
+  circuit_breaker: {failure_threshold: 3, window: 1h, open_duration: 0s}
+  flapping: {max_rollbacks_per_hour: 30}

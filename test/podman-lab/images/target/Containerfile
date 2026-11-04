@@ -1,0 +1,27 @@
+# Application host reached over SSH: the fake service runs from
+# /opt/app/current (a symlink into /opt/app/releases), with the access and
+# application logs Vigilante tails. No systemd: a shell loop restarts the
+# service whenever it exits, so `pkill -x fakeapp` is the restart command.
+FROM docker.io/library/debian:12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server sudo procps grep curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash deploy \
+ && echo 'deploy ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-lab && chmod 440 /etc/sudoers.d/90-lab \
+ && mkdir -p /run/sshd /home/deploy/.ssh /var/log/app \
+ && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config\
+ && echo 'MaxSessions 20' >> /etc/ssh/sshd_config
+COPY .run/bin/fakeapp /usr/local/bin/fakeapp
+COPY .run/id_ed25519.pub /home/deploy/.ssh/authorized_keys
+COPY images/target/entrypoint.sh images/target/deploy.sh /usr/local/bin/
+RUN for v in v1 v1.1 v2; do \
+      mkdir -p /opt/app/releases/$v; \
+      printf '#!/bin/sh\nexec /usr/local/bin/fakeapp -addr 0.0.0.0:18080 -version %s -bad v2 -access-log /var/log/app/access.log -app-log /var/log/app/app.log\n' "$v" > /opt/app/releases/$v/run.sh; \
+      chmod 755 /opt/app/releases/$v/run.sh; \
+    done \
+ && ln -s /opt/app/releases/v1 /opt/app/current \
+ && chmod 700 /home/deploy/.ssh && chmod 600 /home/deploy/.ssh/authorized_keys \
+ && chown -R deploy:deploy /home/deploy/.ssh /opt/app /var/log/app \
+ && chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/deploy.sh
+EXPOSE 22 18080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

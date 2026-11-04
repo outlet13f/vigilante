@@ -73,3 +73,39 @@ func TestNginxSudoChangesOnly(t *testing.T) {
 		t.Fatalf("rules %+v", rules)
 	}
 }
+
+// Diagnose must check the way Drain changes things: with sudo_scope: changes
+// the login user need not own the upstream file, and nginx -t runs via sudo.
+func TestNginxDiagnoseSudoChanges(t *testing.T) {
+	for _, tc := range []struct {
+		sudo        string
+		want, avoid []string
+	}{
+		{"sudo -n ", []string{"test -f '/etc/nginx/up.conf'", "sudo -n nginx -t 2>&1"}, []string{"test -w"}},
+		{"", []string{"test -w '/etc/nginx/up.conf'", "\nnginx -t 2>&1"}, []string{"sudo"}},
+	} {
+		lb := &transport.Mock{Sudo: tc.sudo}
+		spec := config.Traffic{Type: "nginx", Nginx: &config.NginxTraffic{
+			Hosts: []string{"lb"}, UpstreamFile: "/etc/nginx/up.conf", MemberFormat: "{{.Address}}:8080", TestCmd: "nginx -t", ReloadCmd: "nginx -s reload"}}
+		ctl, _ := NewTraffic("n", spec, TrafficEnv{Runners: func(string) (transport.Runner, error) { return lb, nil }, Log: testLog})
+		fs := ctl.(interface {
+			Diagnose(context.Context, []Member) []Finding
+		}).Diagnose(context.Background(), nil)
+		for _, f := range fs {
+			if f.Status != "ok" {
+				t.Errorf("sudo %q: %+v", tc.sudo, f)
+			}
+		}
+		cmds := "\n" + lb.Joined()
+		for _, w := range tc.want {
+			if !strings.Contains(cmds, w) {
+				t.Errorf("sudo %q: missing %q in:%s", tc.sudo, w, cmds)
+			}
+		}
+		for _, a := range tc.avoid {
+			if strings.Contains(cmds, a) {
+				t.Errorf("sudo %q: unexpected %q in:%s", tc.sudo, a, cmds)
+			}
+		}
+	}
+}

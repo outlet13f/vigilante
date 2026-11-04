@@ -55,7 +55,7 @@ func labRun(ctx context.Context, args []string) (int, error) {
 	defer e.Close()
 	if !*skipDoctor {
 		mgr := transport.NewManager(e.Cfg)
-		checks, err := doctor.Run(ctx, e.Cfg, doctor.Options{Service: c.service, Timeout: 15 * time.Second, Runners: mgr.ForTarget, Log: logger()})
+		checks, err := doctor.Run(ctx, e.Cfg, doctor.Options{Service: c.service, Version: c.ver, Previous: c.prev, Timeout: 15 * time.Second, Runners: mgr.ForTarget, Log: logger()})
 		mgr.Close()
 		if err != nil {
 			return 1, err

@@ -1,0 +1,13 @@
+# Controller: the Linux vigilante binary inside the lab network, with the
+# Podman socket mounted at /var/run/docker.sock and the lab folder at /lab.
+FROM docker.io/library/debian:12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client curl ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /root/.ssh && chmod 700 /root/.ssh \
+ && printf 'Host 10.89.50.*\n  User deploy\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' > /root/.ssh/config
+COPY .run/bin/vigilante /usr/local/bin/vigilante
+COPY .run/id_ed25519 /root/.ssh/id_ed25519
+RUN chmod 600 /root/.ssh/id_ed25519
+WORKDIR /lab
+ENTRYPOINT ["sleep", "infinity"]

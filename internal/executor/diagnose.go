@@ -100,10 +100,23 @@ func (n *nginxTraffic) Diagnose(ctx context.Context, _ []Member) []Finding {
 			out = append(out, finding("nginx: "+host+" 접속", err, ""))
 			continue
 		}
-		_, err = r.Run(ctx, "test -w "+q.ShellQuote(n.spec.UpstreamFile), nil)
-		out = append(out, finding(fmt.Sprintf("nginx: %s 파일 쓰기 권한", host), err, n.spec.UpstreamFile))
-		_, err = r.Run(ctx, n.spec.TestCmd+" 2>&1", nil)
-		out = append(out, finding(fmt.Sprintf("nginx: %s 설정 검사", host), err, n.spec.TestCmd))
+		// Check the same way set() changes things: with sudo_scope: changes
+		// the file is written through sudo, so the login user's own write
+		// permission does not matter; the sudo rules check covers it.
+		sudo := q.Sudo(r)
+		if sudo == "" {
+			_, err = r.Run(ctx, "test -w "+q.ShellQuote(n.spec.UpstreamFile), nil)
+			out = append(out, finding(fmt.Sprintf("nginx: %s 파일 쓰기 권한", host), err, n.spec.UpstreamFile))
+		} else {
+			_, err = r.Run(ctx, "test -f "+q.ShellQuote(n.spec.UpstreamFile), nil)
+			out = append(out, finding(fmt.Sprintf("nginx: %s 파일", host), err, n.spec.UpstreamFile+" (sudo로 변경, sudo 규칙 점검 참조)"))
+		}
+		test := n.spec.TestCmd
+		if test == defaultNginxTest {
+			test = sudo + test
+		}
+		_, err = r.Run(ctx, test+" 2>&1", nil)
+		out = append(out, finding(fmt.Sprintf("nginx: %s 설정 검사", host), err, test))
 	}
 	return out
 }

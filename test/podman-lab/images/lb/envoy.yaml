@@ -1,0 +1,29 @@
+node: {id: vgl-lb, cluster: lab}
+admin:
+  address: {socket_address: {address: 0.0.0.0, port_value: 9901}}
+static_resources:
+  listeners:
+    - name: ingress
+      address: {socket_address: {address: 0.0.0.0, port_value: 8082}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                route_config:
+                  virtual_hosts:
+                    - {name: app, domains: ["*"], routes: [{match: {prefix: "/"}, route: {cluster: app_cluster}}]}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config: {"@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router}
+  clusters:
+    - name: app_cluster
+      type: EDS
+      connect_timeout: 1s
+      eds_cluster_config:
+        eds_config:
+          resource_api_version: V3
+          path_config_source:
+            path: /etc/envoy/eds/eds.json
+            watched_directory: {path: /etc/envoy/eds}
